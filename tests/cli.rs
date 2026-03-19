@@ -2574,6 +2574,114 @@ fn update_checks_git_upstream_and_records_a_safe_apply_plan() {
 }
 
 #[test]
+fn update_uses_the_active_pinned_branch_instead_of_remote_head() {
+    let workspace = TestWorkspace::new();
+    workspace.write_skill_source("git-source", "release-notes");
+    workspace.init_git_repo("git-source");
+    let repo_url = workspace.git_repo_url("git-source");
+    let repo_path = workspace.path().join("git-source");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            repo_url.as_str(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    workspace.run_git(&repo_path, &["checkout", "--quiet", "-b", "feature"]);
+    workspace.write_skill_source_at(
+        "git-source",
+        ".agents/skills/release-notes",
+        "release-notes",
+        "Feature branch release notes helper.",
+    );
+    workspace.commit_all("git-source", "create feature branch version");
+    let pinned_feature_commit = workspace.git_head("git-source");
+
+    let pin_assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--json", "pin", "release-notes", "feature"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+    let pin_body: Value =
+        serde_json::from_slice(&pin_assert.get_output().stdout).expect("stdout is valid json");
+    assert_eq!(pin_body["data"]["requested_reference"], "feature");
+    assert_eq!(pin_body["data"]["resolved_revision"], pinned_feature_commit);
+
+    workspace.write_skill_source_at(
+        "git-source",
+        ".agents/skills/release-notes",
+        "release-notes",
+        "Updated feature branch release notes helper.",
+    );
+    workspace.commit_all("git-source", "update feature release notes");
+    let latest_feature_commit = workspace.git_head("git-source");
+
+    workspace.run_git(&repo_path, &["checkout", "--quiet", "main"]);
+    workspace.write_skill_source_at(
+        "git-source",
+        ".agents/skills/release-notes",
+        "release-notes",
+        "Updated main branch release notes helper.",
+    );
+    workspace.commit_all("git-source", "update main release notes");
+    let latest_main_commit = workspace.git_head("git-source");
+    assert_ne!(latest_feature_commit, latest_main_commit);
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--json", "update", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let body: Value = serde_json::from_slice(&assert.get_output().stdout).expect("stdout is json");
+    let plan = &body["data"]["plans"][0];
+    assert_eq!(body["command"], "update");
+    assert_eq!(body["ok"], true);
+    assert_eq!(plan["outcome"], "update-available");
+    assert_eq!(plan["pinned_revision"], pinned_feature_commit);
+    assert_eq!(plan["latest_revision"], latest_feature_commit);
+    assert_ne!(plan["latest_revision"], latest_main_commit);
+
+    let connection = Connection::open(workspace.home_path().join(".skillctl/state.db"))
+        .expect("state database opens");
+    let pin_row: (String, String) = connection
+        .query_row(
+            "SELECT requested_reference, resolved_revision FROM pins WHERE skill_id = ?1",
+            params!["release-notes"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("pin record exists");
+    assert_eq!(pin_row.0, "feature");
+    assert_eq!(pin_row.1, pinned_feature_commit);
+
+    let update_row: (String, String) = connection
+        .query_row(
+            "SELECT outcome, latest_revision \
+             FROM update_checks WHERE skill_id = ?1 ORDER BY checked_at DESC, id DESC LIMIT 1",
+            params!["release-notes"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("update check exists");
+    assert_eq!(update_row.0, "update-available");
+    assert_eq!(update_row.1, latest_feature_commit);
+}
+
+#[test]
 fn update_emits_remote_telemetry_for_verified_public_https_git_sources() {
     let workspace = TestWorkspace::new();
     workspace.write_skill_source("git-source", "release-notes");

@@ -583,7 +583,7 @@ pub fn handle_pin(context: &AppContext, request: PinRequest) -> Result<AppRespon
         );
         let timestamp = current_timestamp();
 
-        manifest.imports[import_index].ref_spec = checked_out.resolved_revision.clone();
+        manifest.imports[import_index].ref_spec = request.reference.clone();
         lockfile_entry.revision.resolved = checked_out.resolved_revision.clone();
         lockfile_entry.revision.upstream = Some(checked_out.resolved_revision.clone());
         lockfile_entry.timestamps.fetched_at = LockfileTimestamp::new(timestamp.clone());
@@ -728,7 +728,7 @@ pub fn handle_rollback(
         }
 
         let timestamp = current_timestamp();
-        manifest.imports[import_index].ref_spec = checked_out.resolved_revision.clone();
+        manifest.imports[import_index].ref_spec = request.version_or_commit.clone();
         lockfile_entry.revision.resolved = checked_out.resolved_revision.clone();
         lockfile_entry.revision.upstream = Some(checked_out.resolved_revision.clone());
         lockfile_entry.timestamps.fetched_at = LockfileTimestamp::new(timestamp.clone());

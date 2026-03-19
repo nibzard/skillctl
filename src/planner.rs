@@ -24,7 +24,8 @@ use crate::{
     source::{SourceKind, current_timestamp, imports_store_root},
     state::{
         InstallRecord, LocalModificationKind, LocalModificationRecord, LocalStateStore,
-        ManagedScope, ManagedSkillRef, ProjectionRecord, UpdateCheckOutcome, UpdateCheckRecord,
+        ManagedScope, ManagedSkillRef, PinRecord, ProjectionRecord, UpdateCheckOutcome,
+        UpdateCheckRecord,
     },
     telemetry,
     trust::SkillTrust,
@@ -121,17 +122,20 @@ pub fn handle_update(
 
     for managed_skill in selected_skills {
         let snapshot = store.skill_snapshot(&managed_skill)?;
+        let install = snapshot
+            .install
+            .as_ref()
+            .ok_or_else(|| AppError::ResolutionValidation {
+                message: format!(
+                    "skill '{}' does not have an installed state record",
+                    managed_skill.skill_id
+                ),
+            })?;
         let prepared = prepare_update_plan(
             context,
             &manifest,
-            &snapshot
-                .install
-                .ok_or_else(|| AppError::ResolutionValidation {
-                    message: format!(
-                        "skill '{}' does not have an installed state record",
-                        managed_skill.skill_id
-                    ),
-                })?,
+            install,
+            snapshot.pin.as_ref(),
             &snapshot.projections,
             candidate_map.get(&(managed_skill.scope, managed_skill.skill_id.clone())),
             &checked_at,
@@ -273,6 +277,7 @@ fn prepare_update_plan(
     context: &AppContext,
     manifest: &WorkspaceManifest,
     install: &InstallRecord,
+    pin: Option<&PinRecord>,
     projections: &[ProjectionRecord],
     candidate: Option<&ResolvedSkillCandidate>,
     checked_at: &str,
@@ -384,7 +389,9 @@ fn prepare_update_plan(
             notes.push("local sources do not support upstream update checks".to_string());
         }
         SourceKind::Git => {
-            let upstream_result = latest_git_revision(&install.source_url);
+            let requested_reference = active_requested_git_reference(install, pin, candidate);
+            let upstream_result =
+                latest_git_revision(&install.source_url, requested_reference, &pinned_revision);
             match upstream_result {
                 Ok(upstream_revision) => {
                     latest_revision = Some(upstream_revision.clone());
@@ -622,9 +629,29 @@ fn overlay_state(
     }))
 }
 
-fn latest_git_revision(source_url: &str) -> Result<String, String> {
+fn active_requested_git_reference<'a>(
+    install: &InstallRecord,
+    pin: Option<&'a PinRecord>,
+    candidate: Option<&'a ResolvedSkillCandidate>,
+) -> Option<&'a str> {
+    candidate
+        .and_then(|candidate| candidate.import.as_ref())
+        .filter(|import| import.resolved_revision == install.resolved_revision)
+        .map(|import| import.requested_ref.as_str())
+        .or_else(|| {
+            pin.filter(|pin| pin.resolved_revision == install.resolved_revision)
+                .map(|pin| pin.requested_reference.as_str())
+        })
+}
+
+fn latest_git_revision(
+    source_url: &str,
+    requested_reference: Option<&str>,
+    pinned_revision: &str,
+) -> Result<String, String> {
+    let reference = requested_reference.unwrap_or("HEAD");
     let output = Command::new("git")
-        .args(["ls-remote", source_url, "HEAD"])
+        .args(["ls-remote", source_url, reference])
         .output()
         .map_err(|source| format!("failed to run git ls-remote for '{source_url}': {source}"))?;
 
@@ -641,12 +668,45 @@ fn latest_git_revision(source_url: &str) -> Result<String, String> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .split_whitespace()
-        .next()
-        .filter(|revision| !revision.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| format!("upstream revision lookup for '{source_url}' returned no HEAD"))
+    parse_ls_remote_revision(stdout.as_ref())
+        .or_else(|| {
+            is_pinned_revision_reference(reference, pinned_revision)
+                .then(|| pinned_revision.to_string())
+        })
+        .ok_or_else(|| {
+            if reference == "HEAD" {
+                format!("upstream revision lookup for '{source_url}' returned no HEAD")
+            } else {
+                format!(
+                    "upstream revision lookup for '{source_url}' returned no revision for '{reference}'"
+                )
+            }
+        })
+}
+
+fn parse_ls_remote_revision(stdout: &str) -> Option<String> {
+    let mut revision = None;
+    let mut peeled_tag_revision = None;
+
+    for line in stdout.lines() {
+        let mut parts = line.split_whitespace();
+        let candidate_revision = parts.next()?;
+        let candidate_ref = parts.next()?;
+        if candidate_ref.ends_with("^{}") {
+            peeled_tag_revision = Some(candidate_revision.to_string());
+        } else if revision.is_none() {
+            revision = Some(candidate_revision.to_string());
+        }
+    }
+
+    peeled_tag_revision.or(revision)
+}
+
+fn is_pinned_revision_reference(reference: &str, pinned_revision: &str) -> bool {
+    !reference.is_empty()
+        && reference.len() <= pinned_revision.len()
+        && pinned_revision.starts_with(reference)
+        && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn detect_projected_copy_modifications(

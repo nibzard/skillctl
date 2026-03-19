@@ -1081,6 +1081,27 @@
         "to-do.json"
       ],
       "updated_at": "2026-03-19T18:40:12Z"
+    },
+    {
+      "id": "T042",
+      "title": "Make `skillctl update` respect the active pinned Git reference instead of always querying remote HEAD",
+      "status": "done",
+      "priority": 1,
+      "details": "Review reproduced that after `skillctl pin <skill> feature`, the update planner still runs `git ls-remote <url> HEAD` and compares against the default branch. Preserve or consult the active requested reference when recording installs and pins so update checks follow the intended branch or tag, and add regression coverage for non-default refs.",
+      "tags": [
+        "review-followup",
+        "update",
+        "git-ref"
+      ],
+      "files": [
+        "src/planner.rs",
+        "src/history.rs",
+        "src/source.rs",
+        "tests/cli.rs",
+        "to-do.json"
+      ],
+      "created_at": "2026-03-19T18:49:05Z",
+      "updated_at": "2026-03-19T18:59:03Z"
     }
   ]
 }

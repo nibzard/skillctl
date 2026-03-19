@@ -781,6 +781,7 @@ fn build_install_operation(
     let import_id = candidate.name.clone();
     let source_subpath = Path::new(&candidate.selected_subpath);
     let skill_root = prepared.root.join(source_subpath);
+    let requested_reference = install_requested_reference(source.kind, revision);
     let content_hash = hash_directory_contents(&skill_root)?;
     let overlay_hash = context
         .manifest
@@ -820,7 +821,7 @@ fn build_install_operation(
             id: import_id,
             kind: import_source_type(source.kind),
             url: source.url.clone(),
-            ref_spec: revision.resolved.clone(),
+            ref_spec: requested_reference,
             path: ManifestPath::new(candidate.selected_subpath.clone()),
             scope: manifest_scope(scope),
             enabled: true,
@@ -993,7 +994,7 @@ fn record_install_state(
 
         store.upsert_pin_record(&PinRecord {
             skill,
-            requested_reference: operation.installed.resolved_revision.clone(),
+            requested_reference: operation.import.ref_spec.clone(),
             resolved_revision: operation.installed.resolved_revision.clone(),
             effective_version_hash: Some(operation.installed.effective_version_hash.clone()),
             pinned_at: install_timestamp.to_string(),
@@ -1031,6 +1032,13 @@ fn record_install_state(
     }
 
     Ok(())
+}
+
+fn install_requested_reference(kind: SourceKind, revision: &SourceRevision) -> String {
+    match kind {
+        SourceKind::Git => "HEAD".to_string(),
+        SourceKind::LocalPath | SourceKind::Archive => revision.resolved.clone(),
+    }
 }
 
 fn projection_records_for_install(
