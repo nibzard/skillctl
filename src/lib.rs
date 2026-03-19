@@ -24,4 +24,4 @@ pub mod state;
 pub mod telemetry;
 pub mod tui;
 
-pub use runtime::run;
+pub use runtime::{run, run_from_args};

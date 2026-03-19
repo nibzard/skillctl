@@ -102,6 +102,29 @@ fn json_output_uses_stable_response_contract_for_command_errors() {
 }
 
 #[test]
+fn json_output_normalizes_parse_failures_into_the_response_envelope() {
+    let mut cmd = Command::cargo_bin("skillctl").expect("binary exists");
+
+    let assert = cmd
+        .args(["--json", "install"])
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(predicate::str::is_empty());
+
+    let output = assert.get_output();
+    let body: Value = serde_json::from_slice(&output.stdout).expect("stdout is valid json");
+    let error = body["errors"][0].as_str().expect("error message exists");
+
+    assert_eq!(body["command"], "install");
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["warnings"], json!([]));
+    assert_eq!(body["data"], json!({}));
+    assert!(error.contains("required arguments were not provided"));
+    assert!(error.contains("Usage: skillctl install <SOURCE>"));
+}
+
+#[test]
 fn global_execution_flags_are_accepted_before_the_subcommand() {
     let workspace = TestWorkspace::new();
     workspace.write_skill_source("shared-skills", "release-notes");
@@ -142,6 +165,78 @@ fn global_execution_flags_are_accepted_before_the_subcommand() {
             .join(".agents/skills/release-notes/SKILL.md")
             .is_file()
     );
+}
+
+#[test]
+fn global_execution_flags_are_accepted_after_the_subcommand() {
+    let workspace = TestWorkspace::new();
+    workspace.write_skill_source("shared-skills", "release-notes");
+    let mut cmd = Command::cargo_bin("skillctl").expect("binary exists");
+
+    let assert = cmd
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args([
+            "install",
+            "--json",
+            "--no-input",
+            "--name",
+            "release-notes",
+            "--scope",
+            "workspace",
+            "--target",
+            "codex",
+            "--cwd",
+            ".",
+            "shared-skills",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let output = assert.get_output();
+    let body: Value = serde_json::from_slice(&output.stdout).expect("stdout is valid json");
+
+    assert_eq!(body["command"], "install");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["data"]["selected"][0]["name"], "release-notes");
+    assert_eq!(body["data"]["installed"][0]["scope"], "workspace");
+}
+
+#[test]
+fn quiet_mode_suppresses_success_summaries() {
+    let workspace = TestWorkspace::new();
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .args(["--quiet", "init"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::is_empty());
+
+    assert!(workspace.path().join(".agents/skills").is_dir());
+    assert!(workspace.path().join(".agents/overlays").is_dir());
+}
+
+#[test]
+fn verbose_mode_renders_structured_data_in_human_output() {
+    let workspace = TestWorkspace::new();
+    fs::create_dir_all(workspace.path().join(".git/info")).expect("git info directory exists");
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .args(["--verbose", "init"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is utf-8");
+    assert!(stdout.contains("Initialized skillctl workspace"));
+    assert!(stdout.contains("\"created\""));
+    assert!(stdout.contains("\"git_exclude\""));
 }
 
 #[test]

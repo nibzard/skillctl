@@ -1,11 +1,11 @@
 //! Command dispatch and presentation for the `skillctl` runtime.
 
-use std::fmt::Write as _;
+use std::{ffi::OsString, fmt::Write as _};
 
-use clap::CommandFactory;
+use clap::{CommandFactory, Parser, error::ErrorKind};
 
 use crate::{
-    app::{AppContext, OutputMode},
+    app::{AppContext, OutputMode, Verbosity},
     cli::{Cli, Command},
     doctor,
     error::{AppError, ExitStatus},
@@ -23,13 +23,29 @@ pub struct RunResult {
     pub exit_status: ExitStatus,
 }
 
+/// Parse raw CLI arguments, normalize parse failures, and execute the command.
+pub fn run_from_args<I, T>(args: I) -> Result<RunResult, AppError>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    let raw_args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let output_mode = output_mode_from_raw_args(&raw_args);
+
+    match Cli::try_parse_from(raw_args.iter().cloned()) {
+        Ok(cli) => run(cli),
+        Err(error) => render_parse_error(&raw_args, output_mode, error),
+    }
+}
+
 /// Execute a parsed CLI invocation and render the resulting output.
 pub fn run(cli: Cli) -> Result<RunResult, AppError> {
     let output_mode = OutputMode::from_json_flag(cli.global.json);
+    let verbosity = Verbosity::from_flags(cli.global.quiet, cli.global.verbose);
     let command_name = cli.command.as_ref().map_or("skillctl", Command::name);
     let context = match AppContext::from_global_args(&cli.global) {
         Ok(context) => context,
-        Err(error) => return render_failure(output_mode, command_name, error),
+        Err(error) => return render_failure(output_mode, verbosity, command_name, error),
     };
 
     match cli.command {
@@ -48,14 +64,19 @@ fn run_command(command: Command, context: &AppContext) -> Result<RunResult, AppE
     match dispatch(&command, context) {
         Ok(response) => {
             let exit_status = response.exit_status();
-            let output = render_response(context.output_mode, response)?;
+            let output = render_response(context.output_mode, context.verbosity, response)?;
 
             Ok(RunResult {
                 output,
                 exit_status,
             })
         }
-        Err(error) => render_failure(context.output_mode, command.name(), error),
+        Err(error) => render_failure(
+            context.output_mode,
+            context.verbosity,
+            command.name(),
+            error,
+        ),
     }
 }
 
@@ -113,12 +134,14 @@ fn dispatch(command: &Command, context: &AppContext) -> Result<AppResponse, AppE
 
 fn render_failure(
     output_mode: OutputMode,
+    verbosity: Verbosity,
     command: &'static str,
     error: AppError,
 ) -> Result<RunResult, AppError> {
     let exit_status = error.exit_status();
     let output = render_response(
         output_mode,
+        verbosity,
         AppResponse::failure(command, error.to_string()),
     )?;
 
@@ -130,6 +153,7 @@ fn render_failure(
 
 fn render_response(
     output_mode: OutputMode,
+    verbosity: Verbosity,
     response: AppResponse,
 ) -> Result<RenderedOutput, AppError> {
     match output_mode {
@@ -137,22 +161,34 @@ fn render_response(
             stdout: format!("{}\n", serde_json::to_string_pretty(&response)?),
             stderr: String::new(),
         }),
-        OutputMode::Human => Ok(render_human_response(response)),
+        OutputMode::Human => Ok(render_human_response(verbosity, response)),
     }
 }
 
-fn render_human_response(response: AppResponse) -> RenderedOutput {
+fn render_human_response(verbosity: Verbosity, response: AppResponse) -> RenderedOutput {
     if response.ok {
         let mut stdout = String::new();
+        let has_data = response_has_data(&response);
 
-        if let Some(summary) = response.summary {
-            let _ = writeln!(stdout, "{summary}");
-        } else {
-            let _ = writeln!(stdout, "{} completed successfully", response.command);
+        if !matches!(verbosity, Verbosity::Quiet) {
+            if let Some(summary) = response.summary {
+                let _ = writeln!(stdout, "{summary}");
+            } else {
+                let _ = writeln!(stdout, "{} completed successfully", response.command);
+            }
         }
 
-        for warning in response.warnings {
+        for warning in &response.warnings {
             let _ = writeln!(stdout, "warning: {warning}");
+        }
+
+        if matches!(verbosity, Verbosity::Verbose) && has_data {
+            let _ = writeln!(
+                stdout,
+                "{}",
+                serde_json::to_string_pretty(&response.data)
+                    .expect("serializing a JSON value should never fail")
+            );
         }
 
         RenderedOutput {
@@ -161,14 +197,181 @@ fn render_human_response(response: AppResponse) -> RenderedOutput {
         }
     } else {
         let mut stderr = String::new();
-        for error in response.errors {
+        let has_data = response_has_data(&response);
+        for error in &response.errors {
             let _ = writeln!(stderr, "{error}");
+        }
+
+        if matches!(verbosity, Verbosity::Verbose) && has_data {
+            let _ = writeln!(
+                stderr,
+                "{}",
+                serde_json::to_string_pretty(&response.data)
+                    .expect("serializing a JSON value should never fail")
+            );
         }
 
         RenderedOutput {
             stdout: String::new(),
             stderr,
         }
+    }
+}
+
+fn render_parse_error(
+    raw_args: &[OsString],
+    output_mode: OutputMode,
+    error: clap::Error,
+) -> Result<RunResult, AppError> {
+    match error.kind() {
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => Ok(RunResult {
+            output: rendered_text_output(error.to_string(), !error.use_stderr()),
+            exit_status: ExitStatus::Success,
+        }),
+        _ => {
+            let message = error.to_string().trim_end().to_string();
+
+            if matches!(output_mode, OutputMode::Json) {
+                let output = render_response(
+                    output_mode,
+                    Verbosity::Normal,
+                    AppResponse::failure(parse_error_command(raw_args), message),
+                )?;
+                Ok(RunResult {
+                    output,
+                    exit_status: ExitStatus::ValidationFailure,
+                })
+            } else {
+                Ok(RunResult {
+                    output: rendered_text_output(message, false),
+                    exit_status: ExitStatus::ValidationFailure,
+                })
+            }
+        }
+    }
+}
+
+fn rendered_text_output(message: String, stdout: bool) -> RenderedOutput {
+    let mut output = message;
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+
+    if stdout {
+        RenderedOutput {
+            stdout: output,
+            stderr: String::new(),
+        }
+    } else {
+        RenderedOutput {
+            stdout: String::new(),
+            stderr: output,
+        }
+    }
+}
+
+fn output_mode_from_raw_args(args: &[OsString]) -> OutputMode {
+    if args
+        .iter()
+        .skip(1)
+        .take_while(|argument| argument.as_os_str() != "--")
+        .any(|argument| argument.as_os_str() == "--json")
+    {
+        OutputMode::Json
+    } else {
+        OutputMode::Human
+    }
+}
+
+fn parse_error_command(args: &[OsString]) -> &'static str {
+    let mut expect_value = false;
+    let mut tokens = args.iter().skip(1).map(|arg| arg.to_string_lossy());
+
+    while let Some(token) = tokens.next() {
+        if expect_value {
+            expect_value = false;
+            continue;
+        }
+
+        if token == "--" {
+            break;
+        }
+
+        if token == "--name" || token == "--scope" || token == "--target" || token == "--cwd" {
+            expect_value = true;
+            continue;
+        }
+
+        if token.starts_with("--name=")
+            || token.starts_with("--scope=")
+            || token.starts_with("--target=")
+            || token.starts_with("--cwd=")
+        {
+            continue;
+        }
+
+        if token.starts_with('-') {
+            continue;
+        }
+
+        return match token.as_ref() {
+            "init" => "init",
+            "list" => "list",
+            "install" | "i" => "install",
+            "remove" => "remove",
+            "sync" => "sync",
+            "update" => "update",
+            "pin" => "pin",
+            "rollback" => "rollback",
+            "history" => "history",
+            "doctor" => "doctor",
+            "explain" => "explain",
+            "override" => "override",
+            "fork" => "fork",
+            "enable" => "enable",
+            "disable" => "disable",
+            "path" => "path",
+            "validate" => "validate",
+            "clean" => "clean",
+            "tui" => "tui",
+            "telemetry" => parse_nested_command(tokens),
+            "mcp" => parse_nested_command(tokens),
+            _ => "skillctl",
+        };
+    }
+
+    "skillctl"
+}
+
+fn parse_nested_command<'a, I>(tokens: I) -> &'static str
+where
+    I: Iterator<Item = std::borrow::Cow<'a, str>>,
+{
+    for token in tokens {
+        if token == "--" {
+            break;
+        }
+        if token.starts_with('-') {
+            continue;
+        }
+        return match token.as_ref() {
+            "status" => "telemetry-status",
+            "enable" => "telemetry-enable",
+            "disable" => "telemetry-disable",
+            "serve" => "mcp-serve",
+            _ => "skillctl",
+        };
+    }
+
+    "skillctl"
+}
+
+fn response_has_data(response: &AppResponse) -> bool {
+    match &response.data {
+        serde_json::Value::Null => false,
+        serde_json::Value::Array(items) => !items.is_empty(),
+        serde_json::Value::Object(fields) => !fields.is_empty(),
+        _ => true,
     }
 }
 

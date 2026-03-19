@@ -402,7 +402,7 @@
         "T010",
         "T011"
       ],
-      "updated_at": "2026-03-19T12:46:50Z",
+      "updated_at": "2026-03-19T12:47:44Z",
       "files": [
         "src/history.rs",
         "src/materialize.rs",
@@ -433,12 +433,13 @@
         "T010",
         "T013"
       ],
-      "updated_at": "2026-03-19T13:06:34Z",
+      "updated_at": "2026-03-19T13:08:19Z",
       "files": [
         "src/doctor.rs",
         "src/response.rs",
         "src/skill.rs",
-        "tests/cli.rs"
+        "tests/cli.rs",
+        "to-do.json"
       ]
     },
     {
@@ -496,7 +497,7 @@
       "id": "T020",
       "title": "Normalize global flags, JSON output, exit codes, and non-interactive behavior across the CLI",
       "priority": 2,
-      "status": "todo",
+      "status": "done",
       "details": "Make the command surface stable for humans and agents by standardizing `--json`, `--quiet`, `--verbose`, `--no-input`, `--interactive`, `--name`, `--scope`, `--target`, and `--cwd` semantics everywhere.",
       "steps": [
         "Define one response envelope that every command and subcommand uses for success, warnings, errors, and data.",
@@ -510,7 +511,16 @@
         "T015",
         "T016",
         "T018"
-      ]
+      ],
+      "updated_at": "2026-03-19T13:16:13Z",
+      "files": [
+        "src/lib.rs",
+        "src/main.rs",
+        "src/runtime.rs",
+        "tests/cli.rs",
+        "to-do.json"
+      ],
+      "blockers": []
     },
     {
       "id": "T021",

@@ -1,12 +1,7 @@
-use std::process::ExitCode;
-
-use clap::Parser;
-use skillctl::cli::Cli;
+use std::{env, process::ExitCode};
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-
-    match skillctl::run(cli) {
+    match skillctl::run_from_args(env::args_os()) {
         Ok(result) => {
             if !result.output.stdout.is_empty() {
                 print!("{}", result.output.stdout);
