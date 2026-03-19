@@ -512,7 +512,7 @@
         "T016",
         "T018"
       ],
-      "updated_at": "2026-03-19T13:16:13Z",
+      "updated_at": "2026-03-19T13:16:55Z",
       "files": [
         "src/lib.rs",
         "src/main.rs",
@@ -585,8 +585,8 @@
       "id": "T024",
       "title": "Build the full test suite, fixture repos, and cross-platform integration matrix",
       "priority": 2,
-      "status": "todo",
-      "details": "Expand the current help-only tests into the unit and integration coverage required by the spec’s TDD mandate and acceptance criteria.",
+      "status": "done",
+      "details": "Added fixture-backed integration coverage for the spec matrix across workspace and user scope, reusable fixture repos for source layouts and failure cases, and telemetry source suppression tests.",
       "steps": [
         "Add unit tests for manifest parsing, lockfile roundtrips, overlay resolution, conflict resolution, root planning, install candidate detection, history writes, telemetry suppression, and JSON output contracts.",
         "Create fixture repos for canonical local skills, imported skills with overlays, same-name conflicts, monorepos, broken symlink cases, alternate source layouts, update blockers, and private-source installs.",
@@ -594,7 +594,28 @@
       ],
       "depends_on": [
         "T001"
-      ]
+      ],
+      "updated_at": "2026-03-19T13:29:53Z",
+      "files": [
+        "src/telemetry.rs",
+        "tests/integration_matrix.rs",
+        "tests/support/mod.rs",
+        "tests/fixtures/canonical-only/.agents/skills/release-notes/SKILL.md",
+        "tests/fixtures/canonical-only/.agents/skills/release-notes/notes.md",
+        "tests/fixtures/imported-with-overlay/.agents/skills/release-notes/SKILL.md",
+        "tests/fixtures/imported-with-overlay/.agents/skills/release-notes/notes.md",
+        "tests/fixtures/same-name-conflict/.agents/skills/release-notes/SKILL.md",
+        "tests/fixtures/same-name-conflict/skills/release-notes/SKILL.md",
+        "tests/fixtures/nested-monorepo/packages/platform/.agents/skills/bug-triage/SKILL.md",
+        "tests/fixtures/broken-symlink/.agents/skills/release-notes/SKILL.md",
+        "tests/fixtures/broken-symlink/.agents/skills/release-notes/notes.md",
+        "tests/fixtures/opencode-layout/.opencode/skills/ai-sdk/SKILL.md",
+        "tests/fixtures/repo-root-layout/skills/ai-sdk/SKILL.md",
+        "tests/fixtures/update-blocker/.agents/skills/release-notes/SKILL.md",
+        "tests/fixtures/private-source/.agents/skills/private-skill/SKILL.md",
+        "to-do.json"
+      ],
+      "blockers": []
     },
     {
       "id": "T025",
