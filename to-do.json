@@ -86,7 +86,7 @@
       "depends_on": [
         "T001"
       ],
-      "updated_at": "2026-03-19T09:24:30Z",
+      "updated_at": "2026-03-19T09:25:16Z",
       "files": [
         "Cargo.lock",
         "Cargo.toml",
@@ -101,7 +101,7 @@
       "id": "T004",
       "title": "Implement lockfile modeling, deterministic IO, and state versioning",
       "priority": 1,
-      "status": "todo",
+      "status": "done",
       "details": "Add `.agents/skillctl.lock` support that records exact source identity, revision, hashes, timestamps, and effective-version data with deliberate schema evolution.",
       "steps": [
         "Model lock entries for source type, normalized source URL, selected subpath, commit or digest, content hash, overlay hash, and effective version hash.",
@@ -111,7 +111,19 @@
       "depends_on": [
         "T001",
         "T003"
-      ]
+      ],
+      "updated_at": "2026-03-19T09:37:09Z",
+      "files": [
+        "src/error.rs",
+        "src/lib.rs",
+        "src/lockfile.rs",
+        "src/manifest.rs",
+        "src/source.rs",
+        "src/state.rs",
+        "tests/cli.rs",
+        "to-do.json"
+      ],
+      "blockers": []
     },
     {
       "id": "T005",

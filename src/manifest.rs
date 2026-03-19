@@ -10,14 +10,20 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::json;
 
 use crate::{
-    adapter::TargetRuntime, app::AppContext, error::AppError, overlay::DEFAULT_OVERLAYS_DIR,
-    response::AppResponse, skill::DEFAULT_SKILLS_DIR,
+    adapter::TargetRuntime,
+    app::AppContext,
+    error::AppError,
+    lockfile::{DEFAULT_LOCKFILE_PATH, WorkspaceLockfile},
+    overlay::DEFAULT_OVERLAYS_DIR,
+    response::AppResponse,
+    skill::DEFAULT_SKILLS_DIR,
+    state::{CURRENT_MANIFEST_VERSION, MANIFEST_SCHEMA_POLICY, VersionDisposition},
 };
 
 /// Default relative path to the workspace manifest.
 pub const DEFAULT_MANIFEST_PATH: &str = ".agents/skillctl.yaml";
 /// Current supported manifest schema version.
-pub const DEFAULT_MANIFEST_VERSION: u32 = 1;
+pub const DEFAULT_MANIFEST_VERSION: u32 = CURRENT_MANIFEST_VERSION;
 
 const DEFAULT_GIT_EXCLUDE_PATH: &str = ".git/info/exclude";
 const GENERATED_RUNTIME_ROOT_EXCLUDES: &[&str] = &[
@@ -159,14 +165,26 @@ impl WorkspaceManifest {
 
     /// Validate manifest invariants that require more than enum parsing.
     pub fn validate(&self) -> Result<(), AppError> {
-        if self.version != DEFAULT_MANIFEST_VERSION {
-            return Err(manifest_validation(
-                &self.path,
-                format!(
-                    "version must be {DEFAULT_MANIFEST_VERSION}, found {}",
-                    self.version
-                ),
-            ));
+        match MANIFEST_SCHEMA_POLICY.classify(self.version) {
+            VersionDisposition::Current => {}
+            VersionDisposition::NeedsMigration { from, to } => {
+                return Err(manifest_validation(
+                    &self.path,
+                    format!("version {from} requires migration to {to}"),
+                ));
+            }
+            VersionDisposition::Unsupported {
+                found,
+                minimum_supported,
+                current,
+            } => {
+                let message = if minimum_supported == current {
+                    format!("version must be {current}, found {found}")
+                } else {
+                    format!("version supports {minimum_supported} through {current}, found {found}")
+                };
+                return Err(manifest_validation(&self.path, message));
+            }
         }
 
         let targets = validate_targets(&self.targets, &self.path)?;
@@ -548,6 +566,7 @@ pub fn handle_init(context: &AppContext, _request: InitRequest) -> Result<AppRes
     let skills_dir = context.working_directory.join(DEFAULT_SKILLS_DIR);
     let overlays_dir = context.working_directory.join(DEFAULT_OVERLAYS_DIR);
     let manifest_path = context.working_directory.join(DEFAULT_MANIFEST_PATH);
+    let lockfile_path = context.working_directory.join(DEFAULT_LOCKFILE_PATH);
 
     let mut created = Vec::new();
     let mut skipped = Vec::new();
@@ -567,6 +586,12 @@ pub fn handle_init(context: &AppContext, _request: InitRequest) -> Result<AppRes
     record_path_result(
         ensure_manifest(&manifest_path)?,
         DEFAULT_MANIFEST_PATH,
+        &mut created,
+        &mut skipped,
+    );
+    record_path_result(
+        ensure_lockfile(&lockfile_path)?,
+        DEFAULT_LOCKFILE_PATH,
         &mut created,
         &mut skipped,
     );
@@ -672,6 +697,30 @@ fn ensure_manifest(path: &Path) -> Result<PathAction, AppError> {
         }
         Err(source) => Err(AppError::FilesystemOperation {
             action: "inspect manifest",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn ensure_lockfile(path: &Path) -> Result<PathAction, AppError> {
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            if metadata.is_file() {
+                Ok(PathAction::Skipped)
+            } else {
+                Err(AppError::PathConflict {
+                    path: path.to_path_buf(),
+                    expected: "file",
+                })
+            }
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            WorkspaceLockfile::default_at(path.to_path_buf()).write_to_path()?;
+            Ok(PathAction::Created)
+        }
+        Err(source) => Err(AppError::FilesystemOperation {
+            action: "inspect lockfile",
             path: path.to_path_buf(),
             source,
         }),

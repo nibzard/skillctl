@@ -123,6 +123,32 @@ pub enum AppError {
         #[source]
         source: serde_yaml::Error,
     },
+    /// Lockfile YAML parsing failed.
+    #[error("failed to parse lockfile '{path}': {source}")]
+    LockfileParse {
+        /// Path to the lockfile file.
+        path: PathBuf,
+        /// Serialization error.
+        #[source]
+        source: serde_yaml::Error,
+    },
+    /// Lockfile validation failed.
+    #[error("lockfile '{path}' is invalid: {message}")]
+    LockfileValidation {
+        /// Path to the lockfile file.
+        path: PathBuf,
+        /// Validation message.
+        message: String,
+    },
+    /// Lockfile YAML rendering failed.
+    #[error("failed to render lockfile '{path}': {source}")]
+    LockfileSerialize {
+        /// Path to the lockfile file.
+        path: PathBuf,
+        /// Serialization error.
+        #[source]
+        source: serde_yaml::Error,
+    },
 }
 
 impl AppError {
@@ -139,7 +165,10 @@ impl AppError {
             | Self::JsonRender { .. } => ExitStatus::OperationalError,
             Self::ManifestParse { .. }
             | Self::ManifestValidation { .. }
-            | Self::ManifestSerialize { .. } => ExitStatus::ValidationFailure,
+            | Self::ManifestSerialize { .. }
+            | Self::LockfileParse { .. }
+            | Self::LockfileValidation { .. }
+            | Self::LockfileSerialize { .. } => ExitStatus::ValidationFailure,
             Self::InputRequired { .. } => ExitStatus::InputRequired,
         }
     }

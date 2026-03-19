@@ -7,6 +7,14 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+const MINIMAL_LOCKFILE: &str = concat!(
+    "version: 1\n",
+    "\n",
+    "state:\n",
+    "  manifest_version: 1\n",
+    "  local_state_version: 1\n",
+);
+
 #[test]
 fn root_help_lists_core_commands() {
     let mut cmd = Command::cargo_bin("skillctl").expect("binary exists");
@@ -148,6 +156,7 @@ fn init_bootstraps_the_default_workspace_layout() {
         .stdout(predicate::str::contains(".agents/skills"))
         .stdout(predicate::str::contains(".agents/overlays"))
         .stdout(predicate::str::contains(".agents/skillctl.yaml"))
+        .stdout(predicate::str::contains(".agents/skillctl.lock"))
         .stdout(predicate::str::contains("Skipped local git excludes"));
 
     assert!(workspace.path().join(".agents/skills").is_dir());
@@ -163,6 +172,11 @@ fn init_bootstraps_the_default_workspace_layout() {
             "  - gemini-cli\n",
             "  - opencode\n",
         )
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path().join(".agents/skillctl.lock"))
+            .expect("lockfile exists"),
+        MINIMAL_LOCKFILE
     );
 }
 
@@ -258,7 +272,8 @@ fn init_json_output_describes_created_and_skipped_items() {
                 "created": [
                     ".agents/skills",
                     ".agents/overlays",
-                    ".agents/skillctl.yaml"
+                    ".agents/skillctl.yaml",
+                    ".agents/skillctl.lock"
                 ],
                 "skipped": [],
                 "git_exclude": {

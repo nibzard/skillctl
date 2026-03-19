@@ -1,9 +1,12 @@
 //! Source detection and install domain entry points.
 
+use serde::{Deserialize, Serialize};
+
 use crate::{app::AppContext, error::AppError, response::AppResponse};
 
 /// Supported install source categories.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SourceKind {
     /// Remote Git repository.
     Git,
