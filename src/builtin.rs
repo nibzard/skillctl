@@ -277,12 +277,11 @@ fn bundled_mutation_required(context: &AppContext, force: bool) -> Result<bool, 
         if !is_bundled_install(record) {
             return Ok(!owned_projection_paths(context)?.is_empty());
         }
-    } else if !force {
-        if let Some(store) = store.as_ref()
-            && is_explicitly_removed(store)?
-        {
-            return Ok(false);
-        }
+    } else if !force
+        && let Some(store) = store.as_ref()
+        && is_explicitly_removed(store)?
+    {
+        return Ok(false);
     }
 
     let content_hash = bundled_content_hash();

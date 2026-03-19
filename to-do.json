@@ -1023,6 +1023,24 @@
       "created_at": "2026-03-19T17:50:23Z",
       "updated_at": "2026-03-19T18:11:36Z",
       "blockers": []
+    },
+    {
+      "id": "T039",
+      "title": "Restore strict clippy compliance so the advertised CI gate passes again",
+      "status": "done",
+      "priority": 1,
+      "details": "`cargo clippy --all-targets --all-features -- -D warnings` currently fails on `src/builtin.rs` with `clippy::collapsible_if`, which means the repository no longer satisfies the strict clippy contract described in the spec and enforced by `.github/workflows/ci.yml`. Fix the regression and add a small regression check if needed so local and CI lint runs agree.",
+      "tags": [
+        "review-followup",
+        "quality",
+        "ci"
+      ],
+      "files": [
+        "src/builtin.rs",
+        "to-do.json"
+      ],
+      "updated_at": "2026-03-19T18:19:30Z",
+      "blockers": []
     }
   ]
 }
