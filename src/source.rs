@@ -39,6 +39,7 @@ use crate::{
         InstallRecord, LocalStateStore, ManagedScope, ManagedSkillRef, PinRecord, ProjectionMode,
         ProjectionRecord,
     },
+    telemetry,
 };
 
 const DETECTION_ROOTS: &[DetectionRoot] = &[
@@ -332,7 +333,12 @@ pub fn handle_install(
         .iter()
         .map(|operation| operation.installed.clone())
         .collect();
-    let summary = install_summary(&installed, &sync_report);
+    let telemetry = telemetry::prepare_install_report(context, &inspection.source, &installed)?;
+    let mut summary = install_summary(&installed, &sync_report);
+    if let Some(notice) = telemetry.notice_message() {
+        summary.push('\n');
+        summary.push_str(notice);
+    }
 
     Ok(AppResponse::success("install")
         .with_summary(summary)
@@ -343,6 +349,7 @@ pub fn handle_install(
             "selected": selected,
             "installed": installed,
             "projection": sync_report,
+            "telemetry": telemetry,
         })))
 }
 

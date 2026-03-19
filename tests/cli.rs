@@ -451,6 +451,155 @@ fn install_updates_manifest_lockfile_store_state_and_projection_records() {
 }
 
 #[test]
+fn install_shows_a_first_run_telemetry_notice_and_persists_default_consent() {
+    let workspace = TestWorkspace::new();
+    workspace.write_skill_source("shared-skills", "release-notes");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770000000")
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty())
+        .stdout(predicate::str::contains(
+            "Telemetry is enabled for public-source install and update events.",
+        ))
+        .stdout(predicate::str::contains("skillctl telemetry disable"));
+
+    let connection = Connection::open(workspace.home_path().join(".skillctl/state.db"))
+        .expect("state database opens");
+    let telemetry_row: (String, Option<String>, String) = connection
+        .query_row(
+            "SELECT consent, notice_seen_at, updated_at FROM telemetry_settings",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("telemetry settings exist");
+    assert_eq!(telemetry_row.0, "enabled");
+    assert_eq!(telemetry_row.1.as_deref(), Some("2026-02-02T02:40:00Z"));
+    assert_eq!(telemetry_row.2, "2026-02-02T02:40:00Z");
+
+    let consent_history_events: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM history_events WHERE kind = ?1",
+            params!["telemetry-consent-changed"],
+            |row| row.get(0),
+        )
+        .expect("history query succeeds");
+    assert_eq!(consent_history_events, 0);
+}
+
+#[test]
+fn telemetry_status_enable_and_disable_use_the_local_state_store() {
+    let workspace = TestWorkspace::new();
+
+    let status_assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--json", "telemetry", "status"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let status_body: Value =
+        serde_json::from_slice(&status_assert.get_output().stdout).expect("stdout is valid json");
+    assert_eq!(status_body["command"], "telemetry-status");
+    assert_eq!(status_body["ok"], true);
+    assert_eq!(status_body["data"]["consent"], "unknown");
+    assert_eq!(status_body["data"]["notice_seen"], false);
+    assert_eq!(status_body["data"]["workspace_enabled"], true);
+    assert_eq!(status_body["data"]["workspace_mode"], "public-only");
+    assert_eq!(status_body["data"]["effective_enabled"], false);
+    assert_eq!(status_body["data"]["effective_mode"], "public-only");
+
+    let enable_assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770000000")
+        .args(["--json", "telemetry", "enable"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let enable_body: Value =
+        serde_json::from_slice(&enable_assert.get_output().stdout).expect("stdout is valid json");
+    assert_eq!(enable_body["command"], "telemetry-enable");
+    assert_eq!(enable_body["ok"], true);
+    assert_eq!(enable_body["data"]["consent"], "enabled");
+    assert_eq!(enable_body["data"]["notice_seen"], true);
+    assert_eq!(
+        enable_body["data"]["notice_seen_at"],
+        "2026-02-02T02:40:00Z"
+    );
+    assert_eq!(enable_body["data"]["updated_at"], "2026-02-02T02:40:00Z");
+    assert_eq!(enable_body["data"]["effective_enabled"], true);
+    assert_eq!(enable_body["data"]["changed"], true);
+
+    let disable_assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770001234")
+        .args(["--json", "telemetry", "disable"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let disable_body: Value =
+        serde_json::from_slice(&disable_assert.get_output().stdout).expect("stdout is valid json");
+    assert_eq!(disable_body["command"], "telemetry-disable");
+    assert_eq!(disable_body["ok"], true);
+    assert_eq!(disable_body["data"]["consent"], "disabled");
+    assert_eq!(disable_body["data"]["notice_seen"], true);
+    assert_eq!(
+        disable_body["data"]["notice_seen_at"],
+        "2026-02-02T02:40:00Z"
+    );
+    assert_eq!(disable_body["data"]["updated_at"], "2026-02-02T03:00:34Z");
+    assert_eq!(disable_body["data"]["effective_enabled"], false);
+    assert_eq!(disable_body["data"]["changed"], true);
+
+    let connection = Connection::open(workspace.home_path().join(".skillctl/state.db"))
+        .expect("state database opens");
+    let telemetry_row: (String, String, String) = connection
+        .query_row(
+            "SELECT consent, notice_seen_at, updated_at FROM telemetry_settings",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("telemetry settings row exists");
+    assert_eq!(telemetry_row.0, "disabled");
+    assert_eq!(telemetry_row.1, "2026-02-02T02:40:00Z");
+    assert_eq!(telemetry_row.2, "2026-02-02T03:00:34Z");
+
+    let history_kinds: Vec<String> = connection
+        .prepare("SELECT kind FROM history_events ORDER BY occurred_at ASC, id ASC")
+        .expect("statement prepares")
+        .query_map([], |row| row.get(0))
+        .expect("history query succeeds")
+        .collect::<Result<_, _>>()
+        .expect("history rows decode");
+    assert_eq!(
+        history_kinds,
+        vec![
+            "telemetry-consent-changed".to_string(),
+            "telemetry-consent-changed".to_string(),
+        ]
+    );
+}
+
+#[test]
 fn validate_reports_invalid_local_skills() {
     let workspace = TestWorkspace::new();
     workspace.write_file(
@@ -1373,6 +1522,16 @@ fn update_checks_git_upstream_and_records_a_safe_apply_plan() {
     assert_eq!(
         history_kinds.last().map(String::as_str),
         Some("update-check")
+    );
+    assert_eq!(body["data"]["telemetry"]["events"][0]["kind"], "update");
+    assert_eq!(body["data"]["telemetry"]["events"][0]["emitted"], false);
+    assert_eq!(
+        body["data"]["telemetry"]["events"][0]["suppression_reason"],
+        "local-source"
+    );
+    assert_eq!(
+        body["data"]["telemetry"]["events"][0]["source_visibility"],
+        "suppressed-local"
     );
 }
 

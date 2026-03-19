@@ -26,6 +26,7 @@ use crate::{
         InstallRecord, LocalModificationKind, LocalModificationRecord, LocalStateStore,
         ManagedScope, ManagedSkillRef, ProjectionRecord, UpdateCheckOutcome, UpdateCheckRecord,
     },
+    telemetry,
 };
 
 /// Reusable projection-root plan shared by sync, doctor, explain, and JSON output.
@@ -145,10 +146,18 @@ pub fn handle_update(
         plans.push(prepared.plan);
     }
 
-    let summary = update_summary(&plans);
+    let telemetry = telemetry::prepare_update_report(context, &plans)?;
+    let mut summary = update_summary(&plans);
+    if let Some(notice) = telemetry.notice_message() {
+        summary.push('\n');
+        summary.push_str(notice);
+    }
     Ok(AppResponse::success("update")
         .with_summary(summary)
-        .with_data(json!({ "plans": plans })))
+        .with_data(json!({
+            "plans": plans,
+            "telemetry": telemetry,
+        })))
 }
 
 /// Planner recommendation for how to respond to one update result.

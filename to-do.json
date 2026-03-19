@@ -463,7 +463,7 @@
       "id": "T018",
       "title": "Implement telemetry consent, settings commands, and public-only event emission",
       "priority": 3,
-      "status": "todo",
+      "status": "done",
       "details": "Add the first-run notice, opt-out controls, consent persistence, and event filtering so telemetry is useful without leaking private-source information.",
       "steps": [
         "Implement `telemetry status`, `telemetry enable`, and `telemetry disable` backed by the local state store.",
@@ -474,7 +474,16 @@
         "T010",
         "T011",
         "T013"
-      ]
+      ],
+      "updated_at": "2026-03-19T13:53:20Z",
+      "files": [
+        "src/planner.rs",
+        "src/source.rs",
+        "src/telemetry.rs",
+        "tests/cli.rs",
+        "to-do.json"
+      ],
+      "blockers": []
     },
     {
       "id": "T019",
