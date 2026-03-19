@@ -127,11 +127,9 @@ pub fn sync_workspace(context: &AppContext) -> Result<MaterializationReport, App
             winners.clone()
         };
 
-        if root_winners.is_empty() {
-            if canonical_root.as_ref() == Some(&resolved_root) {
-                canonical_roots.push(root.path.clone());
-                continue;
-            }
+        if root_winners.is_empty() && canonical_root.as_ref() == Some(&resolved_root) {
+            canonical_roots.push(root.path.clone());
+            continue;
         }
 
         let report = materialize_generated_root(

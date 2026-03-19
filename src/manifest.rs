@@ -163,6 +163,26 @@ impl WorkspaceManifest {
         render_manifest_yaml(&view, &self.path)
     }
 
+    /// Write the manifest to disk using the minimal deterministic YAML form.
+    pub fn write_to_path(&self) -> Result<(), AppError> {
+        self.validate()?;
+        let contents = self.to_minimal_yaml_string()?;
+
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|source| AppError::FilesystemOperation {
+                action: "create manifest parent directory",
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+
+        fs::write(&self.path, contents).map_err(|source| AppError::FilesystemOperation {
+            action: "write manifest",
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     /// Validate manifest invariants that require more than enum parsing.
     pub fn validate(&self) -> Result<(), AppError> {
         match MANIFEST_SCHEMA_POLICY.classify(self.version) {

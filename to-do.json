@@ -293,7 +293,7 @@
         "T009",
         "T010"
       ],
-      "updated_at": "2026-03-19T11:40:08Z",
+      "updated_at": "2026-03-19T11:41:03Z",
       "files": [
         "Cargo.lock",
         "Cargo.toml",
@@ -309,7 +309,7 @@
       "id": "T012",
       "title": "Implement the overlay model and `skillctl override` workflow",
       "priority": 2,
-      "status": "todo",
+      "status": "done",
       "details": "Add shadow-file overlays in `.agents/overlays/<skill-id>/` so imported skills can be customized without breaking upgradeability.",
       "steps": [
         "Resolve overlay files by relative path and make them override upstream content in the effective-skill view.",
@@ -321,7 +321,17 @@
         "T008",
         "T009",
         "T010"
-      ]
+      ],
+      "updated_at": "2026-03-19T11:54:41Z",
+      "files": [
+        "src/manifest.rs",
+        "src/materialize.rs",
+        "src/overlay.rs",
+        "src/source.rs",
+        "tests/cli.rs",
+        "to-do.json"
+      ],
+      "blockers": []
     },
     {
       "id": "T013",

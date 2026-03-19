@@ -32,7 +32,7 @@ use crate::{
         WorkspaceManifest,
     },
     materialize::{self, MaterializationReport},
-    overlay::DEFAULT_OVERLAYS_DIR,
+    overlay::{self, DEFAULT_OVERLAYS_DIR},
     response::AppResponse,
     skill::{DEFAULT_SKILLS_DIR, SkillDefinition},
     state::{
@@ -247,6 +247,14 @@ struct InstallOperation {
     locked_import: LockedImport,
 }
 
+struct InstallBuildContext<'a> {
+    working_directory: &'a Path,
+    manifest: &'a WorkspaceManifest,
+    lockfile: &'a WorkspaceLockfile,
+    imports_root: &'a Path,
+    install_timestamp: &'a str,
+}
+
 /// Inspect, normalize, and stage an install source before later lifecycle steps.
 pub fn inspect_install_source(
     working_directory: &Path,
@@ -283,15 +291,20 @@ pub fn handle_install(
     let mut operations = Vec::with_capacity(selected.len());
 
     for candidate in &selected {
+        let build_context = InstallBuildContext {
+            working_directory: &context.working_directory,
+            manifest: &manifest,
+            lockfile: &lockfile,
+            imports_root: &imports_root,
+            install_timestamp: &install_timestamp,
+        };
         let operation = build_install_operation(
             &prepared,
             &inspection.source,
             &inspection.revision,
-            &lockfile,
             scope,
             candidate,
-            &imports_root,
-            &install_timestamp,
+            &build_context,
         )?;
         upsert_manifest_import(&mut manifest, operation.import.clone());
         lockfile.imports.insert(
@@ -719,25 +732,32 @@ fn build_install_operation(
     prepared: &PreparedInstall,
     source: &NormalizedInstallSource,
     revision: &SourceRevision,
-    lockfile: &WorkspaceLockfile,
     scope: TargetScope,
     candidate: &InstallCandidate,
-    imports_root: &Path,
-    install_timestamp: &str,
+    context: &InstallBuildContext<'_>,
 ) -> Result<InstallOperation, AppError> {
     let import_id = candidate.name.clone();
     let source_subpath = Path::new(&candidate.selected_subpath);
     let skill_root = prepared.root.join(source_subpath);
     let content_hash = hash_directory_contents(&skill_root)?;
-    let overlay_hash = "sha256:none".to_string();
+    let overlay_hash = context
+        .manifest
+        .overrides
+        .get(&import_id)
+        .map(|overlay_path| {
+            overlay::hash_overlay_root(&context.working_directory.join(overlay_path.as_str()))
+        })
+        .transpose()?
+        .unwrap_or_else(|| overlay::NO_OVERLAY_HASH.to_string());
     let effective_version_hash =
         compute_effective_version_hash(&revision.resolved, &content_hash, &overlay_hash);
-    let stored_source_root = imports_root.join(&import_id);
-    let first_installed_at = lockfile
+    let stored_source_root = context.imports_root.join(&import_id);
+    let first_installed_at = context
+        .lockfile
         .imports
         .get(&import_id)
         .map(|entry| entry.timestamps.first_installed_at.clone())
-        .unwrap_or_else(|| LockfileTimestamp::new(install_timestamp.to_string()));
+        .unwrap_or_else(|| LockfileTimestamp::new(context.install_timestamp.to_string()));
 
     Ok(InstallOperation {
         installed: InstalledSkill {
@@ -773,9 +793,9 @@ fn build_install_operation(
                 upstream: revision.upstream.clone(),
             },
             timestamps: LockedTimestamps {
-                fetched_at: LockfileTimestamp::new(install_timestamp.to_string()),
+                fetched_at: LockfileTimestamp::new(context.install_timestamp.to_string()),
                 first_installed_at,
-                last_updated_at: LockfileTimestamp::new(install_timestamp.to_string()),
+                last_updated_at: LockfileTimestamp::new(context.install_timestamp.to_string()),
             },
             hashes: LockedHashes {
                 content: content_hash,
@@ -804,22 +824,7 @@ fn upsert_manifest_import(manifest: &mut WorkspaceManifest, import: ImportDefini
 }
 
 fn write_manifest(manifest: &WorkspaceManifest) -> Result<(), AppError> {
-    manifest.validate()?;
-    let contents = manifest.to_minimal_yaml_string()?;
-
-    if let Some(parent) = manifest.path.parent() {
-        fs::create_dir_all(parent).map_err(|source| AppError::FilesystemOperation {
-            action: "create manifest parent directory",
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-
-    fs::write(&manifest.path, contents).map_err(|source| AppError::FilesystemOperation {
-        action: "write manifest",
-        path: manifest.path.clone(),
-        source,
-    })
+    manifest.write_to_path()
 }
 
 fn copy_source_tree(source_root: &Path, destination_root: &Path) -> Result<(), AppError> {
@@ -1062,7 +1067,7 @@ fn install_summary(installed: &[InstalledSkill], sync_report: &MaterializationRe
     summary
 }
 
-fn imports_store_root() -> Result<PathBuf, AppError> {
+pub(crate) fn imports_store_root() -> Result<PathBuf, AppError> {
     env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
         .map(PathBuf::from)
@@ -1070,7 +1075,7 @@ fn imports_store_root() -> Result<PathBuf, AppError> {
         .ok_or(AppError::HomeDirectoryUnavailable)
 }
 
-fn current_timestamp() -> String {
+pub(crate) fn current_timestamp() -> String {
     let format = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
 
     if let Some(value) = env::var_os("SOURCE_DATE_EPOCH")
@@ -1086,7 +1091,7 @@ fn current_timestamp() -> String {
         .expect("current timestamp formats as RFC3339")
 }
 
-fn compute_effective_version_hash(
+pub(crate) fn compute_effective_version_hash(
     resolved_revision: &str,
     content_hash: &str,
     overlay_hash: &str,
