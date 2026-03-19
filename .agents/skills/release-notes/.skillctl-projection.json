@@ -1,0 +1,23 @@
+{
+  "generated_at": "1773946062",
+  "generation_mode": "copy",
+  "internal_id": "import:workspace:release-notes:.agents/skills/release-notes",
+  "physical_root": ".agents/skills",
+  "skill_name": "release-notes",
+  "source": {
+    "content_hash": "sha256:59dde5bd2a05e1cb814100751a9b5b7378dd129371e84e899990aa472fbe73e2",
+    "effective_version_hash": "sha256:0ad259a7e0b4803c3c5474e79cf3640e58f65b7b2d4bb5e870d440ce2c8c21cb",
+    "import_id": "release-notes",
+    "kind": "imported",
+    "overlay_hash": "sha256:none",
+    "overlay_path": null,
+    "requested_ref": "sha256:b5aaf56bf01e8d745101a2a7bebcd6e42c31196cbd622748039f17fe9b369d52",
+    "resolved_revision": "sha256:b5aaf56bf01e8d745101a2a7bebcd6e42c31196cbd622748039f17fe9b369d52",
+    "scope": "workspace",
+    "selected_subpath": ".agents/skills/release-notes",
+    "source_url": "file:///tmp/tmp.TArWpWNOSk/repo/",
+    "upstream_revision": null
+  },
+  "tool": "skillctl",
+  "version": "0.1.0"
+}

@@ -1,0 +1,15 @@
+version: 1
+
+imports:
+  - id: release-notes
+    type: local-path
+    url: file:///tmp/tmp.TArWpWNOSk/repo/
+    ref: sha256:b5aaf56bf01e8d745101a2a7bebcd6e42c31196cbd622748039f17fe9b369d52
+    path: .agents/skills/release-notes
+    scope: workspace
+    enabled: true
+
+targets:
+  - codex
+  - gemini-cli
+  - opencode

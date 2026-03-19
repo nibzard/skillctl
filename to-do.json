@@ -1015,13 +1015,14 @@
       "files": [
         "src/builtin.rs",
         "src/materialize.rs",
-        "tests/cli.rs"
+        "tests/cli.rs",
+        "to-do.json"
       ],
       "tags": [
         "review"
       ],
       "created_at": "2026-03-19T17:50:23Z",
-      "updated_at": "2026-03-19T18:11:36Z",
+      "updated_at": "2026-03-19T18:12:15Z",
       "blockers": []
     },
     {
@@ -1039,7 +1040,7 @@
         "src/builtin.rs",
         "to-do.json"
       ],
-      "updated_at": "2026-03-19T18:19:30Z",
+      "updated_at": "2026-03-19T18:22:50Z",
       "blockers": []
     },
     {
@@ -1059,7 +1060,7 @@
         "tests/cli.rs",
         "to-do.json"
       ],
-      "updated_at": "2026-03-19T18:33:51Z"
+      "updated_at": "2026-03-19T18:35:39Z"
     },
     {
       "id": "T041",
@@ -1073,14 +1074,14 @@
         "ux"
       ],
       "files": [
-        "src/runtime.rs",
-        "src/cli.rs",
-        "tests/cli.rs",
         "README.md",
         "docs/troubleshooting.md",
+        "src/cli.rs",
+        "src/runtime.rs",
+        "tests/cli.rs",
         "to-do.json"
       ],
-      "updated_at": "2026-03-19T18:40:12Z"
+      "updated_at": "2026-03-19T18:42:11Z"
     },
     {
       "id": "T042",
@@ -1094,14 +1095,14 @@
         "git-ref"
       ],
       "files": [
-        "src/planner.rs",
         "src/history.rs",
+        "src/planner.rs",
         "src/source.rs",
         "tests/cli.rs",
         "to-do.json"
       ],
       "created_at": "2026-03-19T18:49:05Z",
-      "updated_at": "2026-03-19T18:59:03Z"
+      "updated_at": "2026-03-19T19:01:00Z"
     }
   ]
 }

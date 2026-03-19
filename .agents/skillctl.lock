@@ -1,0 +1,22 @@
+version: 1
+
+state:
+  manifest_version: 1
+  local_state_version: 1
+
+imports:
+  release-notes:
+    source:
+      type: local-path
+      url: file:///tmp/tmp.TArWpWNOSk/repo/
+      subpath: .agents/skills/release-notes
+    revision:
+      resolved: sha256:b5aaf56bf01e8d745101a2a7bebcd6e42c31196cbd622748039f17fe9b369d52
+    timestamps:
+      fetched_at: 2026-03-19T18:47:42Z
+      first_installed_at: 2026-03-19T18:47:42Z
+      last_updated_at: 2026-03-19T18:47:42Z
+    hashes:
+      content: sha256:59dde5bd2a05e1cb814100751a9b5b7378dd129371e84e899990aa472fbe73e2
+      overlay: sha256:none
+      effective_version: sha256:0ad259a7e0b4803c3c5474e79cf3640e58f65b7b2d4bb5e870d440ce2c8c21cb
