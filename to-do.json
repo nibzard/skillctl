@@ -63,7 +63,7 @@
       "depends_on": [
         "T001"
       ],
-      "updated_at": "2026-03-19T09:10:33Z",
+      "updated_at": "2026-03-19T09:11:22Z",
       "files": [
         "src/error.rs",
         "src/manifest.rs",
@@ -76,7 +76,7 @@
       "id": "T003",
       "title": "Implement manifest loading, validation, and serialization for `.agents/skillctl.yaml`",
       "priority": 1,
-      "status": "todo",
+      "status": "done",
       "details": "Model the workspace manifest with strong Rust types, explicit defaults, and validation for targets, projection policy, layout, imports, overrides, adapters, and telemetry settings.",
       "steps": [
         "Parse the minimal and full manifest shapes described in the spec.",
@@ -85,7 +85,17 @@
       ],
       "depends_on": [
         "T001"
-      ]
+      ],
+      "updated_at": "2026-03-19T09:24:30Z",
+      "files": [
+        "Cargo.lock",
+        "Cargo.toml",
+        "src/adapter.rs",
+        "src/error.rs",
+        "src/manifest.rs",
+        "to-do.json"
+      ],
+      "blockers": []
     },
     {
       "id": "T004",

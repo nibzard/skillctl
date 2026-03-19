@@ -1,7 +1,10 @@
 //! Runtime adapter metadata shared by planners and diagnostics.
 
+use serde::{Deserialize, Serialize};
+
 /// Supported agent runtimes in the initial compatibility matrix.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum TargetRuntime {
     /// OpenAI Codex.
     Codex,

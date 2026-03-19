@@ -97,6 +97,32 @@ pub enum AppError {
         #[from]
         source: serde_json::Error,
     },
+    /// Manifest YAML parsing failed.
+    #[error("failed to parse manifest '{path}': {source}")]
+    ManifestParse {
+        /// Path to the manifest file.
+        path: PathBuf,
+        /// Serialization error.
+        #[source]
+        source: serde_yaml::Error,
+    },
+    /// Manifest validation failed.
+    #[error("manifest '{path}' is invalid: {message}")]
+    ManifestValidation {
+        /// Path to the manifest file.
+        path: PathBuf,
+        /// Validation message.
+        message: String,
+    },
+    /// Manifest YAML rendering failed.
+    #[error("failed to render manifest '{path}': {source}")]
+    ManifestSerialize {
+        /// Path to the manifest file.
+        path: PathBuf,
+        /// Serialization error.
+        #[source]
+        source: serde_yaml::Error,
+    },
 }
 
 impl AppError {
@@ -111,6 +137,9 @@ impl AppError {
             | Self::InvalidGitDirFile { .. }
             | Self::NotYetImplemented { .. }
             | Self::JsonRender { .. } => ExitStatus::OperationalError,
+            Self::ManifestParse { .. }
+            | Self::ManifestValidation { .. }
+            | Self::ManifestSerialize { .. } => ExitStatus::ValidationFailure,
             Self::InputRequired { .. } => ExitStatus::InputRequired,
         }
     }
