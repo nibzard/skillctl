@@ -17,6 +17,7 @@ use crate::{
     doctor,
     error::AppError,
     history::{self, HistoryLedger},
+    lifecycle,
     lockfile::WorkspaceLockfile,
     manifest::{ImportDefinition, ManifestScope, WorkspaceManifest},
     materialize::{self, MaterializationReport},
@@ -355,118 +356,135 @@ pub fn handle_remove(
     context: &AppContext,
     request: RemoveRequest,
 ) -> Result<AppResponse, AppError> {
-    let mut store = LocalStateStore::open_default()?;
-    let managed_skill =
-        match resolve_installed_skill(&store, request.skill.as_str(), context.selector.scope) {
-            Ok(skill) => skill,
-            Err(_error)
-                if builtin::is_bundled_request(request.skill.as_str(), context.selector.scope) =>
-            {
-                return builtin::handle_remove(context);
-            }
-            Err(error) => return Err(error),
-        };
-    let install_record =
-        store
-            .install_record(&managed_skill)?
-            .ok_or_else(|| AppError::ResolutionValidation {
+    lifecycle::run_transaction("remove", |transaction| {
+        let mut store = LocalStateStore::open_default()?;
+        transaction.track_state_database()?;
+        let managed_skill =
+            match resolve_installed_skill(&store, request.skill.as_str(), context.selector.scope) {
+                Ok(skill) => skill,
+                Err(_error)
+                    if builtin::is_bundled_request(
+                        request.skill.as_str(),
+                        context.selector.scope,
+                    ) =>
+                {
+                    return builtin::handle_remove(context);
+                }
+                Err(error) => return Err(error),
+            };
+        let install_record = store.install_record(&managed_skill)?.ok_or_else(|| {
+            AppError::ResolutionValidation {
                 message: format!(
                     "skill '{}' does not have an installed state record",
                     request.skill.as_str()
                 ),
-            })?;
-    if builtin::is_bundled_install(&install_record) {
-        return builtin::handle_remove(context);
-    }
-
-    let mut manifest = load_manifest_or_default(&context.working_directory)?;
-    let mut lockfile = load_lockfile_or_default(&context.working_directory)?;
-    let timestamp = current_timestamp();
-    let mut removed_paths = Vec::new();
-    let mut retained_paths = Vec::new();
-
-    if let Some(import_index) = manifest_import_index(&manifest, &managed_skill) {
-        manifest.imports.remove(import_index);
-        if let Some(overlay_path) = manifest.overrides.remove(request.skill.as_str()) {
-            retained_paths.push(overlay_path.as_str().to_string());
+            }
+        })?;
+        if builtin::is_bundled_install(&install_record) {
+            return builtin::handle_remove(context);
         }
-        manifest.write_to_path()?;
 
-        lockfile.imports.remove(request.skill.as_str());
-        lockfile.write_to_path()?;
-    } else if !(install_record.detached || install_record.forked) {
-        return Err(AppError::ResolutionValidation {
-            message: format!(
-                "skill '{}' is not a managed import in the workspace manifest",
-                request.skill.as_str()
-            ),
-        });
-    }
-
-    if managed_skill.scope == ManagedScope::Workspace
-        && (install_record.detached || install_record.forked)
-    {
-        let local_root = context
-            .working_directory
-            .join(manifest.layout.skills_dir.as_str())
-            .join(request.skill.as_str());
-        if remove_directory_if_exists(&local_root, "remove canonical workspace skill")? {
-            removed_paths.push(planner::display_path(context, &local_root));
+        let mut manifest = load_manifest_or_default(&context.working_directory)?;
+        let mut lockfile = load_lockfile_or_default(&context.working_directory)?;
+        transaction.track_path(&manifest.path)?;
+        transaction.track_path(&lockfile.path)?;
+        let scoped_context = history::context_for_scope(context, managed_skill.scope);
+        for root in materialize::planned_physical_root_paths(
+            &scoped_context,
+            &manifest,
+            target_scope(managed_skill.scope),
+        )? {
+            transaction.track_path(root)?;
         }
-    }
+        let timestamp = current_timestamp();
+        let mut removed_paths = Vec::new();
+        let mut retained_paths = Vec::new();
 
-    let stored_source_root = imports_store_root()?.join(request.skill.as_str());
-    if remove_directory_if_exists(&stored_source_root, "remove stored import root")? {
-        removed_paths.push(stored_source_root.display().to_string());
-    }
+        if let Some(import_index) = manifest_import_index(&manifest, &managed_skill) {
+            manifest.imports.remove(import_index);
+            if let Some(overlay_path) = manifest.overrides.remove(request.skill.as_str()) {
+                retained_paths.push(overlay_path.as_str().to_string());
+            }
+            manifest.write_to_path()?;
 
-    let sync_report =
-        materialize::sync_workspace(&history::context_for_scope(context, managed_skill.scope))?;
+            lockfile.imports.remove(request.skill.as_str());
+            lockfile.write_to_path()?;
+        } else if !(install_record.detached || install_record.forked) {
+            return Err(AppError::ResolutionValidation {
+                message: format!(
+                    "skill '{}' is not a managed import in the workspace manifest",
+                    request.skill.as_str()
+                ),
+            });
+        }
 
-    {
-        let mut ledger = HistoryLedger::new(&mut store);
-        record_pruned_projection_history(
-            &mut ledger,
-            context,
+        if managed_skill.scope == ManagedScope::Workspace
+            && (install_record.detached || install_record.forked)
+        {
+            let local_root = context
+                .working_directory
+                .join(manifest.layout.skills_dir.as_str())
+                .join(request.skill.as_str());
+            transaction.track_path(&local_root)?;
+            if remove_directory_if_exists(&local_root, "remove canonical workspace skill")? {
+                removed_paths.push(planner::display_path(context, &local_root));
+            }
+        }
+
+        let stored_source_root = imports_store_root()?.join(request.skill.as_str());
+        transaction.track_path(&stored_source_root)?;
+        if remove_directory_if_exists(&stored_source_root, "remove stored import root")? {
+            removed_paths.push(stored_source_root.display().to_string());
+        }
+
+        let sync_report = materialize::sync_workspace(&scoped_context)?;
+
+        {
+            let mut ledger = HistoryLedger::new(&mut store);
+            record_pruned_projection_history(
+                &mut ledger,
+                context,
+                managed_skill.scope,
+                &sync_report,
+                &timestamp,
+            )?;
+            for removed_path in &removed_paths {
+                ledger.record_cleanup(Some(&managed_skill), removed_path, &timestamp)?;
+            }
+        }
+
+        store.delete_current_skill_state(&managed_skill)?;
+        rebuild_projection_records_for_scope(
+            &mut store,
             managed_skill.scope,
             &sync_report,
             &timestamp,
         )?;
-        for removed_path in &removed_paths {
-            ledger.record_cleanup(Some(&managed_skill), removed_path, &timestamp)?;
+        transaction.checkpoint("after-state")?;
+
+        let mut response = AppResponse::success("remove")
+            .with_summary(format!(
+                "Removed {} from {} scope.",
+                request.skill.as_str(),
+                managed_skill.scope.as_str()
+            ))
+            .with_data(json!({
+                "skill": request.skill.as_str(),
+                "scope": managed_skill.scope.as_str(),
+                "removed_paths": removed_paths,
+                "retained_paths": retained_paths,
+                "projection": sync_report,
+            }));
+
+        for retained_path in &retained_paths {
+            response = response.with_warning(format!(
+                "retained overlay directory '{}' for manual reuse",
+                retained_path
+            ));
         }
-    }
 
-    store.delete_current_skill_state(&managed_skill)?;
-    rebuild_projection_records_for_scope(
-        &mut store,
-        managed_skill.scope,
-        &sync_report,
-        &timestamp,
-    )?;
-
-    let mut response = AppResponse::success("remove")
-        .with_summary(format!(
-            "Removed {} from {} scope.",
-            request.skill.as_str(),
-            managed_skill.scope.as_str()
-        ))
-        .with_data(json!({
-            "skill": request.skill.as_str(),
-            "scope": managed_skill.scope.as_str(),
-            "removed_paths": removed_paths,
-            "retained_paths": retained_paths,
-            "projection": sync_report,
-        }));
-
-    for retained_path in &retained_paths {
-        response = response.with_warning(format!(
-            "retained overlay directory '{}' for manual reuse",
-            retained_path
-        ));
-    }
-
-    Ok(response)
+        Ok(response)
+    })
 }
 
 /// Handle `skillctl explain`.
@@ -713,65 +731,77 @@ fn toggle_managed_import(
     enabled: bool,
     command: &'static str,
 ) -> Result<AppResponse, AppError> {
-    let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
-    let mut store = LocalStateStore::open_default()?;
-    let managed_skill = resolve_installed_skill(&store, skill, context.selector.scope)?;
-    let import_index = manifest_import_index(&manifest, &managed_skill).ok_or_else(|| {
-        AppError::ResolutionValidation {
-            message: format!(
-                "skill '{}' is not a managed import in the workspace manifest",
-                skill
-            ),
+    lifecycle::run_transaction(command, |transaction| {
+        let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
+        let mut store = LocalStateStore::open_default()?;
+        transaction.track_path(&manifest.path)?;
+        transaction.track_state_database()?;
+        let managed_skill = resolve_installed_skill(&store, skill, context.selector.scope)?;
+        let scoped_context = history::context_for_scope(context, managed_skill.scope);
+        for root in materialize::planned_physical_root_paths(
+            &scoped_context,
+            &manifest,
+            target_scope(managed_skill.scope),
+        )? {
+            transaction.track_path(root)?;
         }
-    })?;
-    let changed = manifest.imports[import_index].enabled != enabled;
-    manifest.imports[import_index].enabled = enabled;
-    manifest.write_to_path()?;
+        let import_index = manifest_import_index(&manifest, &managed_skill).ok_or_else(|| {
+            AppError::ResolutionValidation {
+                message: format!(
+                    "skill '{}' is not a managed import in the workspace manifest",
+                    skill
+                ),
+            }
+        })?;
+        let changed = manifest.imports[import_index].enabled != enabled;
+        manifest.imports[import_index].enabled = enabled;
+        manifest.write_to_path()?;
 
-    let timestamp = current_timestamp();
-    let sync_report =
-        materialize::sync_workspace(&history::context_for_scope(context, managed_skill.scope))?;
-    let current_projections = rebuild_projection_records_for_scope(
-        &mut store,
-        managed_skill.scope,
-        &sync_report,
-        &timestamp,
-    )?;
+        let timestamp = current_timestamp();
+        let sync_report = materialize::sync_workspace(&scoped_context)?;
+        let current_projections = rebuild_projection_records_for_scope(
+            &mut store,
+            managed_skill.scope,
+            &sync_report,
+            &timestamp,
+        )?;
 
-    let mut ledger = HistoryLedger::new(&mut store);
-    record_pruned_projection_history(
-        &mut ledger,
-        context,
-        managed_skill.scope,
-        &sync_report,
-        &timestamp,
-    )?;
-    for record in current_projections
-        .iter()
-        .filter(|record| record.skill == managed_skill)
-    {
-        ledger.record_projection(record)?;
-    }
+        let mut ledger = HistoryLedger::new(&mut store);
+        record_pruned_projection_history(
+            &mut ledger,
+            context,
+            managed_skill.scope,
+            &sync_report,
+            &timestamp,
+        )?;
+        for record in current_projections
+            .iter()
+            .filter(|record| record.skill == managed_skill)
+        {
+            ledger.record_projection(record)?;
+        }
+        transaction.checkpoint("after-state")?;
 
-    let mut response = AppResponse::success(command)
-        .with_summary(format!(
-            "{} {} in {} scope.",
-            if enabled { "Enabled" } else { "Disabled" },
-            skill,
-            managed_skill.scope.as_str()
-        ))
-        .with_data(json!({
-            "skill": skill,
-            "scope": managed_skill.scope.as_str(),
-            "enabled": enabled,
-            "changed": changed,
-            "projection": sync_report,
-        }));
-    for warning in &sync_report.warnings {
-        response = response.with_warning(warning.clone());
-    }
+        let mut response = AppResponse::success(command)
+            .with_summary(format!(
+                "{} {} in {} scope.",
+                if enabled { "Enabled" } else { "Disabled" },
+                skill,
+                managed_skill.scope.as_str()
+            ))
+            .with_data(json!({
+                "skill": skill,
+                "scope": managed_skill.scope.as_str(),
+                "enabled": enabled,
+                "changed": changed,
+                "projection": sync_report,
+            }));
+        for warning in &sync_report.warnings {
+            response = response.with_warning(warning.clone());
+        }
 
-    Ok(response)
+        Ok(response)
+    })
 }
 
 fn rebuild_projection_records_for_scope(

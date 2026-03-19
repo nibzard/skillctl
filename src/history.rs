@@ -12,9 +12,11 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 use crate::{
+    adapter::TargetScope,
     app::AppContext,
     cli::Scope,
     error::AppError,
+    lifecycle,
     lockfile::{LockfileTimestamp, WorkspaceLockfile},
     manifest::{ManifestScope, WorkspaceManifest},
     materialize::{self, MaterializationReport},
@@ -523,117 +525,132 @@ impl HistoryRequest {
 
 /// Handle `skillctl pin`.
 pub fn handle_pin(context: &AppContext, request: PinRequest) -> Result<AppResponse, AppError> {
-    let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
-    let mut lockfile = WorkspaceLockfile::load_from_workspace(&context.working_directory)?;
-    let mut store = LocalStateStore::open_default()?;
-    let managed_skill = resolve_installed_skill(&store, &request.skill, context.selector.scope)?;
-    let install_record =
-        store
-            .install_record(&managed_skill)?
-            .ok_or_else(|| AppError::ResolutionValidation {
+    lifecycle::run_transaction("pin", |transaction| {
+        let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
+        let mut lockfile = WorkspaceLockfile::load_from_workspace(&context.working_directory)?;
+        let mut store = LocalStateStore::open_default()?;
+        transaction.track_path(&manifest.path)?;
+        transaction.track_path(&lockfile.path)?;
+        transaction.track_state_database()?;
+        let managed_skill =
+            resolve_installed_skill(&store, &request.skill, context.selector.scope)?;
+        let install_record = store.install_record(&managed_skill)?.ok_or_else(|| {
+            AppError::ResolutionValidation {
                 message: format!(
                     "skill '{}' does not have an installed state record",
                     request.skill
                 ),
-            })?;
+            }
+        })?;
 
-    ensure_pin_supported(&install_record)?;
+        ensure_pin_supported(&install_record)?;
 
-    let import_index =
-        managed_import_index(&manifest, &managed_skill.skill_id, managed_skill.scope)?;
-    let import_id = manifest.imports[import_index].id.clone();
-    let lockfile_entry =
-        lockfile
-            .imports
-            .get_mut(&import_id)
-            .ok_or_else(|| AppError::ResolutionValidation {
-                message: format!(
-                    "managed import '{}' is missing from the lockfile",
-                    import_id
-                ),
-            })?;
+        let scoped_context = context_for_scope(context, managed_skill.scope);
+        for root in materialize::planned_physical_root_paths(
+            &scoped_context,
+            &manifest,
+            target_scope(managed_skill.scope),
+        )? {
+            transaction.track_path(root)?;
+        }
 
-    let checked_out = checkout_git_revision(&install_record.source_url, &request.reference)?;
-    let skill_root = checked_out
-        .root
-        .join(lockfile_entry.source.subpath.as_str());
-    ensure_directory(&skill_root, "inspect pinned imported skill")?;
-    let content_hash = hash_directory_contents(&skill_root)?;
-    let overlay_hash = overlay_hash(&manifest, &context.working_directory, &import_id)?;
-    let effective_version_hash = compute_effective_version_hash(
-        &checked_out.resolved_revision,
-        &content_hash,
-        &overlay_hash,
-    );
-    let timestamp = current_timestamp();
+        let import_index =
+            managed_import_index(&manifest, &managed_skill.skill_id, managed_skill.scope)?;
+        let import_id = manifest.imports[import_index].id.clone();
+        transaction.track_path(imports_store_root()?.join(&import_id))?;
+        let lockfile_entry =
+            lockfile
+                .imports
+                .get_mut(&import_id)
+                .ok_or_else(|| AppError::ResolutionValidation {
+                    message: format!(
+                        "managed import '{}' is missing from the lockfile",
+                        import_id
+                    ),
+                })?;
 
-    manifest.imports[import_index].ref_spec = checked_out.resolved_revision.clone();
-    lockfile_entry.revision.resolved = checked_out.resolved_revision.clone();
-    lockfile_entry.revision.upstream = Some(checked_out.resolved_revision.clone());
-    lockfile_entry.timestamps.fetched_at = LockfileTimestamp::new(timestamp.clone());
-    lockfile_entry.timestamps.last_updated_at = LockfileTimestamp::new(timestamp.clone());
-    lockfile_entry.hashes.content = content_hash.clone();
-    lockfile_entry.hashes.overlay = overlay_hash.clone();
-    lockfile_entry.hashes.effective_version = effective_version_hash.clone();
+        let checked_out = checkout_git_revision(&install_record.source_url, &request.reference)?;
+        let skill_root = checked_out
+            .root
+            .join(lockfile_entry.source.subpath.as_str());
+        ensure_directory(&skill_root, "inspect pinned imported skill")?;
+        let content_hash = hash_directory_contents(&skill_root)?;
+        let overlay_hash = overlay_hash(&manifest, &context.working_directory, &import_id)?;
+        let effective_version_hash = compute_effective_version_hash(
+            &checked_out.resolved_revision,
+            &content_hash,
+            &overlay_hash,
+        );
+        let timestamp = current_timestamp();
 
-    manifest.write_to_path()?;
-    lockfile.write_to_path()?;
+        manifest.imports[import_index].ref_spec = checked_out.resolved_revision.clone();
+        lockfile_entry.revision.resolved = checked_out.resolved_revision.clone();
+        lockfile_entry.revision.upstream = Some(checked_out.resolved_revision.clone());
+        lockfile_entry.timestamps.fetched_at = LockfileTimestamp::new(timestamp.clone());
+        lockfile_entry.timestamps.last_updated_at = LockfileTimestamp::new(timestamp.clone());
+        lockfile_entry.hashes.content = content_hash.clone();
+        lockfile_entry.hashes.overlay = overlay_hash.clone();
+        lockfile_entry.hashes.effective_version = effective_version_hash.clone();
 
-    copy_source_tree(&checked_out.root, &imports_store_root()?.join(&import_id))?;
+        manifest.write_to_path()?;
+        lockfile.write_to_path()?;
 
-    let sync_report =
-        materialize::sync_workspace(&context_for_scope(context, managed_skill.scope))?;
+        copy_source_tree(&checked_out.root, &imports_store_root()?.join(&import_id))?;
 
-    let updated_install = InstallRecord {
-        resolved_revision: checked_out.resolved_revision.clone(),
-        upstream_revision: Some(checked_out.resolved_revision.clone()),
-        content_hash,
-        overlay_hash,
-        effective_version_hash: effective_version_hash.clone(),
-        updated_at: timestamp.clone(),
-        detached: false,
-        forked: false,
-        ..install_record
-    };
-    let pin_record = PinRecord {
-        skill: managed_skill.clone(),
-        requested_reference: request.reference.clone(),
-        resolved_revision: checked_out.resolved_revision.clone(),
-        effective_version_hash: Some(effective_version_hash.clone()),
-        pinned_at: timestamp.clone(),
-    };
+        let sync_report = materialize::sync_workspace(&scoped_context)?;
 
-    store.upsert_install_record(&updated_install)?;
-    let projection_records = projection_records_for_skill(
-        &sync_report,
-        &managed_skill,
-        &effective_version_hash,
-        &timestamp,
-    );
-    let mut ledger = HistoryLedger::new(&mut store);
-    ledger.record_pin(&pin_record)?;
-    for record in projection_records {
-        ledger.record_projection(&record)?;
-    }
+        let updated_install = InstallRecord {
+            resolved_revision: checked_out.resolved_revision.clone(),
+            upstream_revision: Some(checked_out.resolved_revision.clone()),
+            content_hash,
+            overlay_hash,
+            effective_version_hash: effective_version_hash.clone(),
+            updated_at: timestamp.clone(),
+            detached: false,
+            forked: false,
+            ..install_record
+        };
+        let pin_record = PinRecord {
+            skill: managed_skill.clone(),
+            requested_reference: request.reference.clone(),
+            resolved_revision: checked_out.resolved_revision.clone(),
+            effective_version_hash: Some(effective_version_hash.clone()),
+            pinned_at: timestamp.clone(),
+        };
 
-    let mut response = AppResponse::success("pin")
-        .with_summary(format!(
-            "Pinned {} to {}",
-            request.skill, checked_out.resolved_revision
-        ))
-        .with_data(json!({
-            "skill": request.skill,
-            "scope": managed_skill.scope.as_str(),
-            "requested_reference": request.reference,
-            "resolved_revision": checked_out.resolved_revision,
-            "effective_version_hash": effective_version_hash,
-            "projection": sync_report,
-        }));
-    for warning in &sync_report.warnings {
-        response = response.with_warning(warning.clone());
-    }
+        store.upsert_install_record(&updated_install)?;
+        let projection_records = projection_records_for_skill(
+            &sync_report,
+            &managed_skill,
+            &effective_version_hash,
+            &timestamp,
+        );
+        let mut ledger = HistoryLedger::new(&mut store);
+        ledger.record_pin(&pin_record)?;
+        for record in projection_records {
+            ledger.record_projection(&record)?;
+        }
+        transaction.checkpoint("after-state")?;
 
-    Ok(response)
+        let mut response = AppResponse::success("pin")
+            .with_summary(format!(
+                "Pinned {} to {}",
+                request.skill, checked_out.resolved_revision
+            ))
+            .with_data(json!({
+                "skill": request.skill,
+                "scope": managed_skill.scope.as_str(),
+                "requested_reference": request.reference,
+                "resolved_revision": checked_out.resolved_revision,
+                "effective_version_hash": effective_version_hash,
+                "projection": sync_report,
+            }));
+        for warning in &sync_report.warnings {
+            response = response.with_warning(warning.clone());
+        }
+
+        Ok(response)
+    })
 }
 
 /// Handle `skillctl rollback`.
@@ -641,136 +658,152 @@ pub fn handle_rollback(
     context: &AppContext,
     request: RollbackRequest,
 ) -> Result<AppResponse, AppError> {
-    let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
-    let mut lockfile = WorkspaceLockfile::load_from_workspace(&context.working_directory)?;
-    let mut store = LocalStateStore::open_default()?;
-    let managed_skill = resolve_installed_skill(&store, &request.skill, context.selector.scope)?;
-    let install_record =
-        store
-            .install_record(&managed_skill)?
-            .ok_or_else(|| AppError::ResolutionValidation {
+    lifecycle::run_transaction("rollback", |transaction| {
+        let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
+        let mut lockfile = WorkspaceLockfile::load_from_workspace(&context.working_directory)?;
+        let mut store = LocalStateStore::open_default()?;
+        transaction.track_path(&manifest.path)?;
+        transaction.track_path(&lockfile.path)?;
+        transaction.track_state_database()?;
+        let managed_skill =
+            resolve_installed_skill(&store, &request.skill, context.selector.scope)?;
+        let install_record = store.install_record(&managed_skill)?.ok_or_else(|| {
+            AppError::ResolutionValidation {
                 message: format!(
                     "skill '{}' does not have an installed state record",
                     request.skill
                 ),
-            })?;
+            }
+        })?;
 
-    ensure_pin_supported(&install_record)?;
+        ensure_pin_supported(&install_record)?;
 
-    let import_index =
-        managed_import_index(&manifest, &managed_skill.skill_id, managed_skill.scope)?;
-    let import_id = manifest.imports[import_index].id.clone();
-    let lockfile_entry =
-        lockfile
-            .imports
-            .get_mut(&import_id)
-            .ok_or_else(|| AppError::ResolutionValidation {
+        let scoped_context = context_for_scope(context, managed_skill.scope);
+        for root in materialize::planned_physical_root_paths(
+            &scoped_context,
+            &manifest,
+            target_scope(managed_skill.scope),
+        )? {
+            transaction.track_path(root)?;
+        }
+
+        let import_index =
+            managed_import_index(&manifest, &managed_skill.skill_id, managed_skill.scope)?;
+        let import_id = manifest.imports[import_index].id.clone();
+        transaction.track_path(imports_store_root()?.join(&import_id))?;
+        let lockfile_entry =
+            lockfile
+                .imports
+                .get_mut(&import_id)
+                .ok_or_else(|| AppError::ResolutionValidation {
+                    message: format!(
+                        "managed import '{}' is missing from the lockfile",
+                        import_id
+                    ),
+                })?;
+        let target = resolve_recorded_version(&store, &managed_skill, &install_record, &request)?;
+
+        let checked_out =
+            checkout_git_revision(&install_record.source_url, &target.resolved_revision)?;
+        let skill_root = checked_out
+            .root
+            .join(lockfile_entry.source.subpath.as_str());
+        ensure_directory(&skill_root, "inspect rolled back imported skill")?;
+        let content_hash = hash_directory_contents(&skill_root)?;
+        let overlay_hash = overlay_hash(&manifest, &context.working_directory, &import_id)?;
+        let effective_version_hash = compute_effective_version_hash(
+            &checked_out.resolved_revision,
+            &content_hash,
+            &overlay_hash,
+        );
+        if let Some(expected) = target.effective_version_hash.as_deref()
+            && effective_version_hash != expected
+        {
+            return Err(AppError::ResolutionValidation {
                 message: format!(
-                    "managed import '{}' is missing from the lockfile",
-                    import_id
+                    "recorded effective version '{}' no longer matches the current overlay state",
+                    request.version_or_commit
                 ),
-            })?;
-    let target = resolve_recorded_version(&store, &managed_skill, &install_record, &request)?;
+            });
+        }
 
-    let checked_out = checkout_git_revision(&install_record.source_url, &target.resolved_revision)?;
-    let skill_root = checked_out
-        .root
-        .join(lockfile_entry.source.subpath.as_str());
-    ensure_directory(&skill_root, "inspect rolled back imported skill")?;
-    let content_hash = hash_directory_contents(&skill_root)?;
-    let overlay_hash = overlay_hash(&manifest, &context.working_directory, &import_id)?;
-    let effective_version_hash = compute_effective_version_hash(
-        &checked_out.resolved_revision,
-        &content_hash,
-        &overlay_hash,
-    );
-    if let Some(expected) = target.effective_version_hash.as_deref()
-        && effective_version_hash != expected
-    {
-        return Err(AppError::ResolutionValidation {
-            message: format!(
-                "recorded effective version '{}' no longer matches the current overlay state",
-                request.version_or_commit
-            ),
-        });
-    }
+        let timestamp = current_timestamp();
+        manifest.imports[import_index].ref_spec = checked_out.resolved_revision.clone();
+        lockfile_entry.revision.resolved = checked_out.resolved_revision.clone();
+        lockfile_entry.revision.upstream = Some(checked_out.resolved_revision.clone());
+        lockfile_entry.timestamps.fetched_at = LockfileTimestamp::new(timestamp.clone());
+        lockfile_entry.timestamps.last_updated_at = LockfileTimestamp::new(timestamp.clone());
+        lockfile_entry.hashes.content = content_hash.clone();
+        lockfile_entry.hashes.overlay = overlay_hash.clone();
+        lockfile_entry.hashes.effective_version = effective_version_hash.clone();
 
-    let timestamp = current_timestamp();
-    manifest.imports[import_index].ref_spec = checked_out.resolved_revision.clone();
-    lockfile_entry.revision.resolved = checked_out.resolved_revision.clone();
-    lockfile_entry.revision.upstream = Some(checked_out.resolved_revision.clone());
-    lockfile_entry.timestamps.fetched_at = LockfileTimestamp::new(timestamp.clone());
-    lockfile_entry.timestamps.last_updated_at = LockfileTimestamp::new(timestamp.clone());
-    lockfile_entry.hashes.content = content_hash.clone();
-    lockfile_entry.hashes.overlay = overlay_hash.clone();
-    lockfile_entry.hashes.effective_version = effective_version_hash.clone();
+        manifest.write_to_path()?;
+        lockfile.write_to_path()?;
 
-    manifest.write_to_path()?;
-    lockfile.write_to_path()?;
+        copy_source_tree(&checked_out.root, &imports_store_root()?.join(&import_id))?;
 
-    copy_source_tree(&checked_out.root, &imports_store_root()?.join(&import_id))?;
+        let sync_report = materialize::sync_workspace(&scoped_context)?;
 
-    let sync_report =
-        materialize::sync_workspace(&context_for_scope(context, managed_skill.scope))?;
+        let updated_install = InstallRecord {
+            resolved_revision: checked_out.resolved_revision.clone(),
+            upstream_revision: Some(checked_out.resolved_revision.clone()),
+            content_hash,
+            overlay_hash,
+            effective_version_hash: effective_version_hash.clone(),
+            updated_at: timestamp.clone(),
+            detached: false,
+            forked: false,
+            ..install_record.clone()
+        };
+        let pin_record = PinRecord {
+            skill: managed_skill.clone(),
+            requested_reference: request.version_or_commit.clone(),
+            resolved_revision: checked_out.resolved_revision.clone(),
+            effective_version_hash: Some(effective_version_hash.clone()),
+            pinned_at: timestamp.clone(),
+        };
+        let rollback_record = RollbackRecord {
+            id: None,
+            skill: managed_skill.clone(),
+            rolled_back_at: timestamp.clone(),
+            from_reference: install_record.resolved_revision.clone(),
+            to_reference: request.version_or_commit.clone(),
+        };
 
-    let updated_install = InstallRecord {
-        resolved_revision: checked_out.resolved_revision.clone(),
-        upstream_revision: Some(checked_out.resolved_revision.clone()),
-        content_hash,
-        overlay_hash,
-        effective_version_hash: effective_version_hash.clone(),
-        updated_at: timestamp.clone(),
-        detached: false,
-        forked: false,
-        ..install_record.clone()
-    };
-    let pin_record = PinRecord {
-        skill: managed_skill.clone(),
-        requested_reference: request.version_or_commit.clone(),
-        resolved_revision: checked_out.resolved_revision.clone(),
-        effective_version_hash: Some(effective_version_hash.clone()),
-        pinned_at: timestamp.clone(),
-    };
-    let rollback_record = RollbackRecord {
-        id: None,
-        skill: managed_skill.clone(),
-        rolled_back_at: timestamp.clone(),
-        from_reference: install_record.resolved_revision.clone(),
-        to_reference: request.version_or_commit.clone(),
-    };
+        store.upsert_install_record(&updated_install)?;
+        store.upsert_pin_record(&pin_record)?;
+        let projection_records = projection_records_for_skill(
+            &sync_report,
+            &managed_skill,
+            &effective_version_hash,
+            &timestamp,
+        );
+        let mut ledger = HistoryLedger::new(&mut store);
+        ledger.record_rollback(&rollback_record)?;
+        for record in projection_records {
+            ledger.record_projection(&record)?;
+        }
+        transaction.checkpoint("after-state")?;
 
-    store.upsert_install_record(&updated_install)?;
-    store.upsert_pin_record(&pin_record)?;
-    let projection_records = projection_records_for_skill(
-        &sync_report,
-        &managed_skill,
-        &effective_version_hash,
-        &timestamp,
-    );
-    let mut ledger = HistoryLedger::new(&mut store);
-    ledger.record_rollback(&rollback_record)?;
-    for record in projection_records {
-        ledger.record_projection(&record)?;
-    }
+        let mut response = AppResponse::success("rollback")
+            .with_summary(format!(
+                "Rolled back {} to {}",
+                request.skill, checked_out.resolved_revision
+            ))
+            .with_data(json!({
+                "skill": request.skill,
+                "scope": managed_skill.scope.as_str(),
+                "requested_version": request.version_or_commit,
+                "resolved_revision": checked_out.resolved_revision,
+                "effective_version_hash": effective_version_hash,
+                "projection": sync_report,
+            }));
+        for warning in &sync_report.warnings {
+            response = response.with_warning(warning.clone());
+        }
 
-    let mut response = AppResponse::success("rollback")
-        .with_summary(format!(
-            "Rolled back {} to {}",
-            request.skill, checked_out.resolved_revision
-        ))
-        .with_data(json!({
-            "skill": request.skill,
-            "scope": managed_skill.scope.as_str(),
-            "requested_version": request.version_or_commit,
-            "resolved_revision": checked_out.resolved_revision,
-            "effective_version_hash": effective_version_hash,
-            "projection": sync_report,
-        }));
-    for warning in &sync_report.warnings {
-        response = response.with_warning(warning.clone());
-    }
-
-    Ok(response)
+        Ok(response)
+    })
 }
 
 /// Handle `skillctl history`.
@@ -883,6 +916,13 @@ fn cli_scope(scope: Scope) -> ManagedScope {
     match scope {
         Scope::Workspace => ManagedScope::Workspace,
         Scope::User => ManagedScope::User,
+    }
+}
+
+fn target_scope(scope: ManagedScope) -> TargetScope {
+    match scope {
+        ManagedScope::Workspace => TargetScope::Workspace,
+        ManagedScope::User => TargetScope::User,
     }
 }
 

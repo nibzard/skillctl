@@ -750,7 +750,13 @@ fn install_rolls_back_when_the_transaction_fails_after_state_write() {
         &workspace,
         "install:after-state",
         "1770000000",
-        &["--no-input", "--name", "release-notes", "install", "shared-skills"],
+        &[
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ],
         &snapshot,
     );
 }
@@ -4056,12 +4062,7 @@ fn assert_transaction_rolled_back(
         .code(1)
         .stderr(predicate::str::contains("injected lifecycle failure"));
 
-    let actual = workspace.snapshot_paths(
-        &expected
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-    );
+    let actual = workspace.snapshot_paths(&expected.keys().map(String::as_str).collect::<Vec<_>>());
     assert_eq!(&actual, expected);
 }
 
@@ -4075,11 +4076,9 @@ fn snapshot_path(path: &Path) -> PathSnapshot {
     };
 
     if metadata.file_type().is_symlink() {
-        return PathSnapshot::Symlink(
-            fs::read_link(path).unwrap_or_else(|error| {
-                panic!("failed to read symlink '{}': {error}", path.display())
-            }),
-        );
+        return PathSnapshot::Symlink(fs::read_link(path).unwrap_or_else(|error| {
+            panic!("failed to read symlink '{}': {error}", path.display())
+        }));
     }
 
     if metadata.is_file() {
@@ -4097,7 +4096,10 @@ fn snapshot_path(path: &Path) -> PathSnapshot {
             })
             .collect::<Result<Vec<_>, _>>()
             .unwrap_or_else(|error| {
-                panic!("failed to read directory entry '{}': {error}", path.display())
+                panic!(
+                    "failed to read directory entry '{}': {error}",
+                    path.display()
+                )
             });
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {

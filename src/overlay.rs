@@ -14,6 +14,7 @@ use crate::{
     cli::Scope,
     error::AppError,
     history::{self, HistoryLedger},
+    lifecycle,
     lockfile::{LockfileTimestamp, WorkspaceLockfile},
     manifest::{ImportDefinition, ManifestPath, ManifestScope, WorkspaceManifest},
     materialize::{self, PROJECTION_METADATA_FILE},
@@ -204,139 +205,156 @@ pub fn handle_override(
 
 /// Handle `skillctl fork`.
 pub fn handle_fork(context: &AppContext, request: ForkRequest) -> Result<AppResponse, AppError> {
-    let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
-    let mut lockfile = WorkspaceLockfile::load_from_workspace(&context.working_directory)?;
-    let mut store = LocalStateStore::open_default()?;
-    let managed_skill = resolve_managed_skill(&store, &request.skill, context.selector.scope)?;
-    if managed_skill.scope != ManagedScope::Workspace {
-        return Err(AppError::ResolutionValidation {
-            message: format!(
-                "skill '{}' can only be forked from workspace scope",
-                request.skill
-            ),
-        });
-    }
+    lifecycle::run_transaction("fork", |transaction| {
+        let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
+        let mut lockfile = WorkspaceLockfile::load_from_workspace(&context.working_directory)?;
+        let mut store = LocalStateStore::open_default()?;
+        transaction.track_path(&manifest.path)?;
+        transaction.track_path(&lockfile.path)?;
+        transaction.track_state_database()?;
+        let managed_skill = resolve_managed_skill(&store, &request.skill, context.selector.scope)?;
+        if managed_skill.scope != ManagedScope::Workspace {
+            return Err(AppError::ResolutionValidation {
+                message: format!(
+                    "skill '{}' can only be forked from workspace scope",
+                    request.skill
+                ),
+            });
+        }
 
-    let mut install_record =
-        store
-            .install_record(&managed_skill)?
-            .ok_or_else(|| AppError::ResolutionValidation {
+        let mut install_record = store.install_record(&managed_skill)?.ok_or_else(|| {
+            AppError::ResolutionValidation {
                 message: format!(
                     "skill '{}' does not have an installed state record",
                     request.skill
                 ),
-            })?;
-    if install_record.detached || install_record.forked {
-        return Err(AppError::ResolutionValidation {
-            message: format!(
-                "skill '{}' is already detached from upstream lifecycle management",
-                request.skill
-            ),
-        });
-    }
-
-    let import_index = manifest
-        .imports
-        .iter()
-        .position(|import| import.id == request.skill && import.scope == ManifestScope::Workspace)
-        .ok_or_else(|| AppError::ResolutionValidation {
-            message: format!(
-                "skill '{}' is not a managed import in the workspace manifest",
-                request.skill
-            ),
+            }
         })?;
-    let import = manifest.imports[import_index].clone();
-    let lockfile_entry = lockfile.imports.get(&import.id).cloned().ok_or_else(|| {
-        AppError::ResolutionValidation {
-            message: format!(
-                "managed import '{}' is missing from the lockfile",
-                import.id
-            ),
+        if install_record.detached || install_record.forked {
+            return Err(AppError::ResolutionValidation {
+                message: format!(
+                    "skill '{}' is already detached from upstream lifecycle management",
+                    request.skill
+                ),
+            });
         }
-    })?;
 
-    let stored_skill_root = imports_store_root()?
-        .join(&import.id)
-        .join(lockfile_entry.source.subpath.as_str());
-    ensure_directory_path(&stored_skill_root, "inspect stored imported skill")?;
+        let scoped_context = history::context_for_scope(context, managed_skill.scope);
+        for root in materialize::planned_physical_root_paths(
+            &scoped_context,
+            &manifest,
+            crate::adapter::TargetScope::Workspace,
+        )? {
+            transaction.track_path(root)?;
+        }
 
-    let local_root_relative = ManifestPath::new(format!(
-        "{}/{}",
-        manifest.layout.skills_dir.as_str().trim_end_matches('/'),
-        request.skill
-    ));
-    let local_root = context.working_directory.join(local_root_relative.as_str());
-    prepare_local_root(&local_root, &request.skill)?;
-    copy_tree_contents(&stored_skill_root, &local_root)?;
+        let import_index = manifest
+            .imports
+            .iter()
+            .position(|import| {
+                import.id == request.skill && import.scope == ManifestScope::Workspace
+            })
+            .ok_or_else(|| AppError::ResolutionValidation {
+                message: format!(
+                    "skill '{}' is not a managed import in the workspace manifest",
+                    request.skill
+                ),
+            })?;
+        let import = manifest.imports[import_index].clone();
+        let lockfile_entry = lockfile.imports.get(&import.id).cloned().ok_or_else(|| {
+            AppError::ResolutionValidation {
+                message: format!(
+                    "managed import '{}' is missing from the lockfile",
+                    import.id
+                ),
+            }
+        })?;
 
-    if let Some(overlay_path) = manifest.overrides.remove(&import.id) {
-        let overlay_root = context.working_directory.join(overlay_path.as_str());
-        match fs::metadata(&overlay_root) {
-            Ok(metadata) if metadata.is_dir() => {
-                copy_tree_contents(&overlay_root, &local_root)?;
-                fs::remove_dir_all(&overlay_root).map_err(|source| {
-                    AppError::FilesystemOperation {
-                        action: "remove detached overlay root",
+        let stored_skill_root = imports_store_root()?
+            .join(&import.id)
+            .join(lockfile_entry.source.subpath.as_str());
+        ensure_directory_path(&stored_skill_root, "inspect stored imported skill")?;
+
+        let local_root_relative = ManifestPath::new(format!(
+            "{}/{}",
+            manifest.layout.skills_dir.as_str().trim_end_matches('/'),
+            request.skill
+        ));
+        let local_root = context.working_directory.join(local_root_relative.as_str());
+        transaction.track_path(&local_root)?;
+        prepare_local_root(&local_root, &request.skill)?;
+        copy_tree_contents(&stored_skill_root, &local_root)?;
+
+        if let Some(overlay_path) = manifest.overrides.remove(&import.id) {
+            let overlay_root = context.working_directory.join(overlay_path.as_str());
+            transaction.track_path(&overlay_root)?;
+            match fs::metadata(&overlay_root) {
+                Ok(metadata) if metadata.is_dir() => {
+                    copy_tree_contents(&overlay_root, &local_root)?;
+                    fs::remove_dir_all(&overlay_root).map_err(|source| {
+                        AppError::FilesystemOperation {
+                            action: "remove detached overlay root",
+                            path: overlay_root,
+                            source,
+                        }
+                    })?;
+                }
+                Ok(_) => {
+                    return Err(AppError::PathConflict {
+                        path: overlay_root,
+                        expected: "directory",
+                    });
+                }
+                Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(AppError::FilesystemOperation {
+                        action: "inspect detached overlay root",
                         path: overlay_root,
                         source,
-                    }
-                })?;
-            }
-            Ok(_) => {
-                return Err(AppError::PathConflict {
-                    path: overlay_root,
-                    expected: "directory",
-                });
-            }
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(AppError::FilesystemOperation {
-                    action: "inspect detached overlay root",
-                    path: overlay_root,
-                    source,
-                });
+                    });
+                }
             }
         }
-    }
-    remove_projection_metadata(&local_root)?;
+        remove_projection_metadata(&local_root)?;
 
-    manifest.imports.remove(import_index);
-    manifest.write_to_path()?;
-    lockfile.imports.remove(&import.id);
-    lockfile.write_to_path()?;
+        manifest.imports.remove(import_index);
+        manifest.write_to_path()?;
+        lockfile.imports.remove(&import.id);
+        lockfile.write_to_path()?;
 
-    let timestamp = current_timestamp();
-    install_record.detached = true;
-    install_record.forked = true;
-    install_record.updated_at = timestamp.clone();
+        let timestamp = current_timestamp();
+        install_record.detached = true;
+        install_record.forked = true;
+        install_record.updated_at = timestamp.clone();
 
-    let sync_report =
-        materialize::sync_workspace(&history::context_for_scope(context, managed_skill.scope))?;
+        let sync_report = materialize::sync_workspace(&scoped_context)?;
 
-    let projection_records = history::projection_records_for_skill(
-        &sync_report,
-        &managed_skill,
-        &install_record.effective_version_hash,
-        &timestamp,
-    );
-    let mut ledger = HistoryLedger::new(&mut store);
-    ledger.record_fork(&install_record, local_root_relative.as_str())?;
-    for record in projection_records {
-        ledger.record_projection(&record)?;
-    }
+        let projection_records = history::projection_records_for_skill(
+            &sync_report,
+            &managed_skill,
+            &install_record.effective_version_hash,
+            &timestamp,
+        );
+        let mut ledger = HistoryLedger::new(&mut store);
+        ledger.record_fork(&install_record, local_root_relative.as_str())?;
+        for record in projection_records {
+            ledger.record_projection(&record)?;
+        }
+        transaction.checkpoint("after-state")?;
 
-    Ok(AppResponse::success("fork")
-        .with_summary(format!(
-            "Forked {} into {}",
-            request.skill,
-            local_root_relative.as_str()
-        ))
-        .with_data(json!({
-            "skill": request.skill,
-            "scope": managed_skill.scope.as_str(),
-            "local_root": local_root_relative.as_str(),
-            "projection": sync_report,
-        })))
+        Ok(AppResponse::success("fork")
+            .with_summary(format!(
+                "Forked {} into {}",
+                request.skill,
+                local_root_relative.as_str()
+            ))
+            .with_data(json!({
+                "skill": request.skill,
+                "scope": managed_skill.scope.as_str(),
+                "local_root": local_root_relative.as_str(),
+                "projection": sync_report,
+            })))
+    })
 }
 
 fn resolve_managed_skill(

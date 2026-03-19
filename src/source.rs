@@ -282,8 +282,11 @@ pub fn handle_install(
     lifecycle::run_transaction("install", |transaction| {
         transaction.track_state_database()?;
         transaction.track_path(context.working_directory.join(DEFAULT_MANIFEST_PATH))?;
-        transaction
-            .track_path(context.working_directory.join(crate::lockfile::DEFAULT_LOCKFILE_PATH))?;
+        transaction.track_path(
+            context
+                .working_directory
+                .join(crate::lockfile::DEFAULT_LOCKFILE_PATH),
+        )?;
 
         ensure_workspace_bootstrap(&context.working_directory)?;
 

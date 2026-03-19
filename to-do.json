@@ -832,7 +832,7 @@
       "id": "T031",
       "title": "Make lifecycle mutations transactional across manifest, lockfile, store, and projection updates",
       "priority": 1,
-      "status": "doing",
+      "status": "done",
       "details": "install, pin, rollback, fork, remove, enable, and disable all persist part of their state before later copy, sync, cleanup, or state-store work completes. A later filesystem or materialization failure can leave .agents/skillctl.yaml, .agents/skillctl.lock, stored imports, runtime projections, and SQLite state disagreeing. Rework these flows so they commit atomically or roll back partial mutations, and add failure-path coverage.",
       "steps": [
         "Audit the lifecycle commands that currently write manifest or lockfile state before copy, sync, cleanup, or state-store updates.",
@@ -845,14 +845,16 @@
         "state-management"
       ],
       "files": [
-        "src/source.rs",
         "src/history.rs",
+        "src/lifecycle.rs",
         "src/overlay.rs",
         "src/skill.rs",
-        "tests/cli.rs"
+        "src/source.rs",
+        "tests/cli.rs",
+        "to-do.json"
       ],
       "blockers": [],
-      "updated_at": "2026-03-19T16:22:05Z"
+      "updated_at": "2026-03-19T16:38:21Z"
     },
     {
       "id": "T032",
