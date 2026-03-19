@@ -260,6 +260,26 @@ pub(crate) fn record_pruned_projection_history(
     Ok(())
 }
 
+pub(crate) fn refresh_projection_state_for_scope(
+    store: &mut LocalStateStore,
+    context: &AppContext,
+    scope: ManagedScope,
+    sync_report: &MaterializationReport,
+    occurred_at: &str,
+    record_additional_history: impl FnOnce(&mut HistoryLedger<'_>) -> Result<(), AppError>,
+) -> Result<Vec<ProjectionRecord>, AppError> {
+    let projection_records =
+        rebuild_projection_records_for_scope(store, scope, sync_report, occurred_at)?;
+    let mut ledger = HistoryLedger::new(store);
+    record_pruned_projection_history(&mut ledger, context, scope, sync_report, occurred_at)?;
+    record_additional_history(&mut ledger)?;
+    for record in &projection_records {
+        ledger.record_projection(record)?;
+    }
+
+    Ok(projection_records)
+}
+
 /// Handle `skillctl sync`.
 pub fn handle_sync(context: &AppContext, _request: SyncRequest) -> Result<AppResponse, AppError> {
     lifecycle::run_transaction("sync", |transaction| {
@@ -273,23 +293,14 @@ pub fn handle_sync(context: &AppContext, _request: SyncRequest) -> Result<AppRes
         let report = sync_workspace(context)?;
         let timestamp = current_timestamp();
         let mut store = LocalStateStore::open_default_for(&context.working_directory)?;
-        let current_projections = rebuild_projection_records_for_scope(
+        refresh_projection_state_for_scope(
             &mut store,
-            managed_scope(scope),
-            &report,
-            &timestamp,
-        )?;
-        let mut ledger = HistoryLedger::new(&mut store);
-        record_pruned_projection_history(
-            &mut ledger,
             context,
             managed_scope(scope),
             &report,
             &timestamp,
+            |_| Ok(()),
         )?;
-        for record in &current_projections {
-            ledger.record_projection(record)?;
-        }
         transaction.checkpoint("after-state")?;
 
         let summary = sync_summary(&report);

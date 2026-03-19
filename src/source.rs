@@ -1033,23 +1033,14 @@ fn record_install_state(
         }
     }
 
-    let projection_records = materialize::rebuild_projection_records_for_scope(
+    materialize::refresh_projection_state_for_scope(
         &mut store,
-        managed_scope,
-        sync_report,
-        install_timestamp,
-    )?;
-    let mut ledger = HistoryLedger::new(&mut store);
-    materialize::record_pruned_projection_history(
-        &mut ledger,
         context,
         managed_scope,
         sync_report,
         install_timestamp,
+        |_| Ok(()),
     )?;
-    for record in projection_records {
-        ledger.record_projection(&record)?;
-    }
 
     Ok(())
 }

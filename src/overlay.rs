@@ -340,23 +340,14 @@ pub fn handle_fork(context: &AppContext, request: ForkRequest) -> Result<AppResp
             let mut ledger = HistoryLedger::new(&mut store);
             ledger.record_fork(&install_record, local_root_relative.as_str())?;
         }
-        let projection_records = materialize::rebuild_projection_records_for_scope(
+        materialize::refresh_projection_state_for_scope(
             &mut store,
-            managed_skill.scope,
-            &sync_report,
-            &timestamp,
-        )?;
-        let mut ledger = HistoryLedger::new(&mut store);
-        materialize::record_pruned_projection_history(
-            &mut ledger,
             context,
             managed_skill.scope,
             &sync_report,
             &timestamp,
+            |_| Ok(()),
         )?;
-        for record in projection_records {
-            ledger.record_projection(&record)?;
-        }
         transaction.checkpoint("after-state")?;
 
         Ok(AppResponse::success("fork")

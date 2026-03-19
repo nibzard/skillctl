@@ -666,24 +666,14 @@ pub fn handle_pin(context: &AppContext, request: PinRequest) -> Result<AppRespon
         };
 
         store.upsert_install_record(&updated_install)?;
-        let projection_records = materialize::rebuild_projection_records_for_scope(
+        materialize::refresh_projection_state_for_scope(
             &mut store,
-            managed_skill.scope,
-            &sync_report,
-            &timestamp,
-        )?;
-        let mut ledger = HistoryLedger::new(&mut store);
-        materialize::record_pruned_projection_history(
-            &mut ledger,
             context,
             managed_skill.scope,
             &sync_report,
             &timestamp,
+            |ledger| ledger.record_pin(&pin_record).map(|_| ()),
         )?;
-        ledger.record_pin(&pin_record)?;
-        for record in projection_records {
-            ledger.record_projection(&record)?;
-        }
         transaction.checkpoint("after-state")?;
 
         let mut response = AppResponse::success("pin")
@@ -833,24 +823,14 @@ pub fn handle_rollback(
 
         store.upsert_install_record(&updated_install)?;
         store.upsert_pin_record(&pin_record)?;
-        let projection_records = materialize::rebuild_projection_records_for_scope(
+        materialize::refresh_projection_state_for_scope(
             &mut store,
-            managed_skill.scope,
-            &sync_report,
-            &timestamp,
-        )?;
-        let mut ledger = HistoryLedger::new(&mut store);
-        materialize::record_pruned_projection_history(
-            &mut ledger,
             context,
             managed_skill.scope,
             &sync_report,
             &timestamp,
+            |ledger| ledger.record_rollback(&rollback_record).map(|_| ()),
         )?;
-        ledger.record_rollback(&rollback_record)?;
-        for record in projection_records {
-            ledger.record_projection(&record)?;
-        }
         transaction.checkpoint("after-state")?;
 
         let mut response = AppResponse::success("rollback")
