@@ -773,6 +773,62 @@ fn install_shows_a_first_run_telemetry_notice_and_persists_default_consent() {
 }
 
 #[test]
+fn install_suppresses_remote_telemetry_for_private_https_git_sources() {
+    let workspace = TestWorkspace::new();
+    workspace.write_skill_source("git-source", "release-notes");
+    workspace.init_git_repo("git-source");
+
+    let private_https_url = "https://github.com/example/private-skill.git";
+    let git_config_path = workspace.path().join("gitconfig");
+    fs::write(
+        &git_config_path,
+        format!(
+            "[url \"{}\"]\n\tinsteadOf = {}\n",
+            workspace.git_repo_url("git-source"),
+            private_https_url
+        ),
+    )
+    .expect("git config written");
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("GIT_CONFIG_GLOBAL", &git_config_path)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args([
+            "--json",
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            private_https_url,
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let body: Value = serde_json::from_slice(&assert.get_output().stdout).expect("stdout is json");
+
+    assert_eq!(body["command"], "install");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["data"]["source"]["type"], "git");
+    assert_eq!(body["data"]["source"]["url"], private_https_url);
+    assert_eq!(body["data"]["telemetry"]["events"][0]["kind"], "install");
+    assert_eq!(body["data"]["telemetry"]["events"][0]["emitted"], false);
+    assert_eq!(
+        body["data"]["telemetry"]["events"][0]["suppression_reason"],
+        "private-source"
+    );
+    assert_eq!(
+        body["data"]["telemetry"]["events"][0]["source_visibility"],
+        "suppressed-private"
+    );
+    assert!(body["data"]["telemetry"]["events"][0]["public_source"].is_null());
+}
+
+#[test]
 fn install_warns_and_reports_trust_for_unreviewed_script_imports() {
     let workspace = TestWorkspace::new();
     workspace.write_skill_source("shared-skills", "release-notes");

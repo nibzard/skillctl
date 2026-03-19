@@ -513,7 +513,9 @@ fn classify_git_source_visibility(source: &NormalizedInstallSource) -> SourceVis
 
             match parsed.host_str() {
                 Some(host) if is_local_host(host) => SourceVisibility::SuppressedLocal,
-                Some(_) => SourceVisibility::Public,
+                // Remote Git URLs can represent private repositories even on public forges.
+                // Keep them suppressed until visibility is proven by a stronger signal.
+                Some(_) => SourceVisibility::SuppressedPrivate,
                 None => SourceVisibility::SuppressedPrivate,
             }
         }
@@ -543,26 +545,32 @@ mod tests {
     }
 
     #[test]
-    fn public_git_sources_remain_eligible_for_public_only_telemetry() {
+    fn remote_git_sources_stay_suppressed_without_explicit_public_proof() {
         let settings = TelemetrySettings {
             enabled: true,
             mode: TelemetryMode::PublicOnly,
         };
         let https = source(
             SourceKind::Git,
-            "https://github.com/example/release-notes.git",
-            "https://github.com/example/release-notes.git",
+            "https://github.com/example/private-skill.git",
+            "https://github.com/example/private-skill.git",
         );
         let git = source(
             SourceKind::Git,
-            "git://example.com/release-notes.git",
-            "git://example.com/release-notes.git",
+            "git://example.com/private-skill.git",
+            "git://example.com/private-skill.git",
         );
 
-        assert_eq!(classify_source_visibility(&https), SourceVisibility::Public);
-        assert_eq!(classify_source_visibility(&git), SourceVisibility::Public);
-        assert!(allows_remote_emission(settings, &https));
-        assert!(allows_remote_emission(settings, &git));
+        assert_eq!(
+            classify_source_visibility(&https),
+            SourceVisibility::SuppressedPrivate
+        );
+        assert_eq!(
+            classify_source_visibility(&git),
+            SourceVisibility::SuppressedPrivate
+        );
+        assert!(!allows_remote_emission(settings, &https));
+        assert!(!allows_remote_emission(settings, &git));
     }
 
     #[test]
@@ -669,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn public_install_and_update_events_are_emitted_only_for_public_sources() {
+    fn install_events_emit_only_when_visibility_is_explicitly_public() {
         let workspace = ManifestTelemetryConfig {
             enabled: true,
             mode: ManifestTelemetryMode::PublicOnly,
@@ -699,55 +707,25 @@ mod tests {
             effective_version_hash: "sha256:effective".to_string(),
             trust: crate::trust::SkillTrust::local(false),
         };
-        let update = SkillUpdatePlan {
-            skill: "release-notes".to_string(),
-            scope: ManagedScope::Workspace,
-            checked_at: "2026-03-19T12:01:00Z".to_string(),
-            source: UpdateSourceSummary {
-                kind: SourceKind::Git,
-                url: public_source.url.clone(),
-                subpath: "skills/release-notes".to_string(),
-            },
-            pinned_revision: "0123456789abcdef".to_string(),
-            latest_revision: Some("1111111111111111".to_string()),
-            outcome: crate::state::UpdateCheckOutcome::UpdateAvailable,
-            overlay_detected: false,
-            local_modification_detected: false,
-            recommended_action: UpdateAction::Apply,
-            available_actions: vec![UpdateAction::Apply, UpdateAction::Skip],
-            modifications: Vec::new(),
-            trust: Some(crate::trust::SkillTrust::local(false)),
-            notes: Vec::new(),
-        };
 
         let install_event = install_event(
             &workspace,
             &persisted,
             effective,
-            classify_source_visibility(&public_source),
+            SourceVisibility::Public,
             &public_source,
             &installed,
         );
-        let update_event = update_event(&workspace, &persisted, effective, &update);
 
         assert!(install_event.emitted);
         assert_eq!(
             install_event.public_source.as_deref(),
             Some("https://github.com/example/release-notes.git")
         );
-        assert!(update_event.emitted);
-        assert_eq!(
-            update_event.public_source.as_deref(),
-            Some("https://github.com/example/release-notes.git")
-        );
-        assert_eq!(
-            update_event.latest_revision.as_deref(),
-            Some("1111111111111111")
-        );
     }
 
     #[test]
-    fn local_or_private_update_events_are_suppressed_even_with_enabled_consent() {
+    fn private_https_update_events_are_suppressed_even_with_enabled_consent() {
         let workspace = ManifestTelemetryConfig {
             enabled: true,
             mode: ManifestTelemetryMode::PublicOnly,
@@ -764,7 +742,7 @@ mod tests {
             checked_at: "2026-03-19T12:01:00Z".to_string(),
             source: UpdateSourceSummary {
                 kind: SourceKind::Git,
-                url: "git@github.com:example/private-skill.git".to_string(),
+                url: "https://github.com/example/private-skill.git".to_string(),
                 subpath: "skills/release-notes".to_string(),
             },
             pinned_revision: "0123456789abcdef".to_string(),

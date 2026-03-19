@@ -773,6 +773,23 @@
         "to-do.json"
       ],
       "blockers": []
+    },
+    {
+      "id": "T028",
+      "title": "Harden public-only telemetry classification so private HTTPS Git remotes stay suppressed",
+      "priority": 1,
+      "status": "done",
+      "details": "The current visibility heuristic treats any non-local http/https/git remote without embedded credentials as public, which can emit remote telemetry for private GitHub or GitLab repositories. Default remote Git sources to suppressed unless public visibility is proven and add regression coverage for private HTTPS remotes.",
+      "tags": [
+        "review-followup",
+        "privacy",
+        "telemetry"
+      ],
+      "files": [
+        "src/telemetry.rs",
+        "tests/cli.rs"
+      ],
+      "updated_at": "2026-03-19T16:03:12Z"
     }
   ]
 }
