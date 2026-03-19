@@ -13,7 +13,7 @@ use crate::{
     cli::Scope,
     error::{AppError, ExitStatus},
     lockfile::WorkspaceLockfile,
-    manifest::{ManifestScope, ProjectionMode, WorkspaceManifest},
+    manifest::{ManifestScope, ProjectionMode, ProjectionPolicy, WorkspaceManifest},
     materialize::PROJECTION_METADATA_FILE,
     planner::{self, ProjectionPlan},
     resolver::{
@@ -207,6 +207,11 @@ struct WorkspaceAnalysis {
     graph: Option<EffectiveSkillGraph>,
 }
 
+struct BundledDoctorArtifacts {
+    checked_skill_count: usize,
+    issues: Vec<DiagnosticIssue>,
+}
+
 /// Handle `skillctl doctor`.
 pub fn handle_doctor(
     context: &AppContext,
@@ -215,22 +220,12 @@ pub fn handle_doctor(
     let analysis = analyze_workspace(context)?;
     let mut issues = analysis.validation.issues.clone();
     issues.extend(doctor_issues(context, &analysis)?);
-    issues.extend(
-        builtin::diagnostics(context)?
-            .into_iter()
-            .map(|diagnostic| DiagnosticIssue {
-                severity: DiagnosticSeverity::Warning,
-                code: diagnostic.code,
-                skill: Some("skillctl".to_string()),
-                scope: Some("user".to_string()),
-                target: None,
-                path: diagnostic.path,
-                trust: None,
-                message: diagnostic.message,
-                fix: diagnostic.fix,
-            }),
+    let bundled = bundled_doctor_artifacts(context)?;
+    issues.extend(bundled.issues);
+    let report = report_from_issues(
+        analysis.validation.checked_skill_count + bundled.checked_skill_count,
+        issues,
     );
-    let report = report_from_issues(analysis.validation.checked_skill_count, issues);
     render_diagnostic_report("doctor", report)
 }
 
@@ -252,8 +247,12 @@ pub fn build_explain_response(
     context: &AppContext,
     skill_name: &str,
 ) -> Result<AppResponse, AppError> {
-    let analysis = analyze_workspace(context)?;
-    let report = build_explain_report(context, &analysis, skill_name)?;
+    let report = if is_bundled_user_skill_request(context, skill_name) {
+        build_bundled_explain_report(context)?
+    } else {
+        let analysis = analyze_workspace(context)?;
+        build_explain_report(context, &analysis, skill_name)?
+    };
     let status = if report.status == ExplainStatus::Conflict {
         ExitStatus::ValidationFailure
     } else {
@@ -279,8 +278,276 @@ pub(crate) fn build_explain_report_for_tui(
     context: &AppContext,
     skill_name: &str,
 ) -> Result<ExplainReport, AppError> {
+    if is_bundled_user_skill_request(context, skill_name) {
+        return build_bundled_explain_report(context);
+    }
+
     let analysis = analyze_workspace(context)?;
     build_explain_report(context, &analysis, skill_name)
+}
+
+fn is_bundled_user_skill_request(context: &AppContext, skill_name: &str) -> bool {
+    selected_managed_scope(context) == ManagedScope::User
+        && builtin::is_bundled_request(skill_name, context.selector.scope)
+}
+
+fn bundled_doctor_artifacts(context: &AppContext) -> Result<BundledDoctorArtifacts, AppError> {
+    let mut issues = bundled_base_issues(context)?;
+    if selected_managed_scope(context) != ManagedScope::User {
+        return Ok(BundledDoctorArtifacts {
+            checked_skill_count: 0,
+            issues,
+        });
+    }
+
+    let store = LocalStateStore::open_default()?;
+    let managed_skill = ManagedSkillRef::new(ManagedScope::User, "skillctl");
+    let snapshot = store.skill_snapshot(&managed_skill)?;
+
+    let managed_state_present = snapshot.install.is_some() || !snapshot.projections.is_empty();
+    if !managed_state_present {
+        return Ok(BundledDoctorArtifacts {
+            checked_skill_count: usize::from(!issues.is_empty()),
+            issues,
+        });
+    }
+
+    let plan = bundled_target_plan(context)?;
+    let expected_roots: BTreeMap<_, _> = plan
+        .assignments
+        .iter()
+        .map(|assignment| (assignment.target, assignment.root.clone()))
+        .collect();
+
+    for record in &snapshot.projections {
+        if let Some(expected_root) = expected_roots.get(&record.target)
+            && &record.physical_root != expected_root
+        {
+            issues.push(DiagnosticIssue {
+                severity: DiagnosticSeverity::Warning,
+                code: "wrong-precedence-root".to_string(),
+                skill: Some("skillctl".to_string()),
+                scope: Some(ManagedScope::User.as_str().to_string()),
+                target: Some(record.target),
+                path: Some(record.physical_root.clone()),
+                trust: None,
+                message: format!(
+                    "target '{}' is projected into '{}' but the bundled plan expects '{}'",
+                    record.target.as_str(),
+                    record.physical_root,
+                    expected_root
+                ),
+                fix: Some(
+                    "run skillctl --scope user enable skillctl to rebuild the bundled projections"
+                        .to_string(),
+                ),
+            });
+        }
+    }
+
+    for assignment in &plan.assignments {
+        let root = planner::resolve_runtime_root_path(context, &assignment.root)?;
+        let projection_root = root.join("skillctl");
+        if let Some(path) = builtin::projection_difference(context, &projection_root)? {
+            issues.push(DiagnosticIssue {
+                severity: DiagnosticSeverity::Warning,
+                code: "projection-drift".to_string(),
+                skill: Some("skillctl".to_string()),
+                scope: Some(ManagedScope::User.as_str().to_string()),
+                target: Some(assignment.target),
+                path: Some(path),
+                trust: None,
+                message: format!(
+                    "target '{}' currently materializes a bundled copy that does not match the active built-in asset",
+                    assignment.target.as_str()
+                ),
+                fix: Some(
+                    "run skillctl --scope user enable skillctl to rebuild the bundled projections"
+                        .to_string(),
+                ),
+            });
+        }
+    }
+
+    Ok(BundledDoctorArtifacts {
+        checked_skill_count: 1,
+        issues,
+    })
+}
+
+fn build_bundled_explain_report(context: &AppContext) -> Result<ExplainReport, AppError> {
+    let store = LocalStateStore::open_default()?;
+    let managed_skill = ManagedSkillRef::new(ManagedScope::User, "skillctl");
+    let snapshot = store.skill_snapshot(&managed_skill)?;
+    let plan = bundled_target_plan(context)?;
+    let issues = bundled_base_issues(context)?;
+    let managed_state_present = snapshot.install.is_some() || !snapshot.projections.is_empty();
+    let status = if managed_state_present {
+        ExplainStatus::Selected
+    } else {
+        ExplainStatus::Missing
+    };
+
+    let managed_effective_version = snapshot
+        .install
+        .as_ref()
+        .map(|install| install.effective_version_hash.clone())
+        .or_else(|| {
+            snapshot
+                .pin
+                .as_ref()
+                .and_then(|pin| pin.effective_version_hash.clone())
+        });
+
+    let winner = managed_state_present.then(|| ExplainCandidate {
+        scope: ManagedScope::User.as_str().to_string(),
+        internal_id: "builtin:user:skillctl".to_string(),
+        source_class: "bundled".to_string(),
+        root: snapshot
+            .install
+            .as_ref()
+            .map(|install| install.source_url.clone())
+            .unwrap_or_else(|| "builtin://skillctl".to_string()),
+        why: "skillctl manages the bundled user-scope asset directly".to_string(),
+        import_id: None,
+        overlay_root: None,
+        resolved_revision: snapshot
+            .install
+            .as_ref()
+            .map(|install| install.resolved_revision.clone())
+            .or_else(|| {
+                snapshot
+                    .pin
+                    .as_ref()
+                    .map(|pin| pin.resolved_revision.clone())
+            }),
+        effective_version_hash: managed_effective_version.clone(),
+    });
+
+    let targets = bundled_explain_targets(context, &plan, status)?;
+    let active_projection_matches_winner = if managed_state_present {
+        plan.assignments.iter().all(|assignment| {
+            let root = planner::resolve_runtime_root_path(context, &assignment.root).expect("root");
+            builtin::projection_difference(context, &root.join("skillctl"))
+                .expect("bundled projection inspection succeeds")
+                .is_none()
+        })
+    } else {
+        false
+    };
+
+    let active_differs_from_pinned_source = match (status, managed_effective_version.as_ref()) {
+        (ExplainStatus::Selected, Some(_)) => !active_projection_matches_winner,
+        (ExplainStatus::Selected, None) => !active_projection_matches_winner,
+        (ExplainStatus::Missing, Some(_)) => true,
+        (ExplainStatus::Missing, None) => false,
+        (ExplainStatus::Conflict, _) => false,
+    };
+
+    Ok(ExplainReport {
+        skill: "skillctl".to_string(),
+        scope: ManagedScope::User.as_str().to_string(),
+        status,
+        winner,
+        shadowed: Vec::new(),
+        targets,
+        drift: ExplainDrift {
+            active_projection_matches_winner,
+            active_differs_from_pinned_source,
+            pinned_reference: snapshot
+                .pin
+                .as_ref()
+                .map(|pin| pin.requested_reference.clone()),
+            effective_version_hash: managed_effective_version,
+            detached: snapshot
+                .install
+                .as_ref()
+                .is_some_and(|install| install.detached),
+            forked: snapshot
+                .install
+                .as_ref()
+                .is_some_and(|install| install.forked),
+        },
+        issues,
+    })
+}
+
+fn bundled_base_issues(context: &AppContext) -> Result<Vec<DiagnosticIssue>, AppError> {
+    builtin::diagnostics(context)?
+        .into_iter()
+        .map(|diagnostic| {
+            Ok(DiagnosticIssue {
+                severity: DiagnosticSeverity::Warning,
+                code: diagnostic.code,
+                skill: Some("skillctl".to_string()),
+                scope: Some(ManagedScope::User.as_str().to_string()),
+                target: None,
+                path: diagnostic.path,
+                trust: None,
+                message: diagnostic.message,
+                fix: diagnostic.fix,
+            })
+        })
+        .collect()
+}
+
+fn bundled_target_plan(context: &AppContext) -> Result<ProjectionPlan, AppError> {
+    let targets = bundled_targets(context)?;
+    planner::plan_target_roots(
+        &AdapterRegistry::new(),
+        TargetScope::User,
+        ProjectionPolicy::PreferNeutral,
+        &targets,
+        &BTreeMap::new(),
+    )
+}
+
+fn bundled_targets(context: &AppContext) -> Result<Vec<TargetRuntime>, AppError> {
+    if context.selector.targets.is_empty() {
+        return Ok(TargetRuntime::all().to_vec());
+    }
+
+    context
+        .selector
+        .targets
+        .iter()
+        .map(|target| parse_target_runtime(target))
+        .collect()
+}
+
+fn bundled_explain_targets(
+    context: &AppContext,
+    plan: &ProjectionPlan,
+    status: ExplainStatus,
+) -> Result<Vec<ExplainTarget>, AppError> {
+    plan.assignments
+        .iter()
+        .map(|assignment| {
+            let root = planner::resolve_runtime_root_path(context, &assignment.root)?;
+            let path = root.join("skillctl");
+            let visible = status == ExplainStatus::Selected;
+            let reason = match status {
+                ExplainStatus::Selected => {
+                    "the bundled skillctl asset projects into this user-scope root".to_string()
+                }
+                ExplainStatus::Conflict => {
+                    "a same-name conflict prevents a single active winner".to_string()
+                }
+                ExplainStatus::Missing => {
+                    "the bundled skillctl asset is not currently installed in user scope"
+                        .to_string()
+                }
+            };
+
+            Ok(ExplainTarget {
+                target: assignment.target,
+                root: planner::display_path(context, &root),
+                path: planner::display_path(context, &path),
+                visible,
+                reason,
+            })
+        })
+        .collect()
 }
 
 fn analyze_workspace(context: &AppContext) -> Result<WorkspaceAnalysis, AppError> {

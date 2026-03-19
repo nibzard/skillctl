@@ -3833,6 +3833,232 @@ fn bundled_skill_is_installed_in_user_scope_on_first_command() {
 }
 
 #[test]
+fn bundled_skill_appears_in_user_scope_explain_doctor_and_tui() {
+    let workspace = TestWorkspace::new();
+    let home_path = workspace.home_path();
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", &home_path)
+        .args(["--json", "telemetry", "status"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let explain_assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", &home_path)
+        .args(["--json", "--scope", "user", "explain", "skillctl"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+    let explain_body: Value =
+        serde_json::from_slice(&explain_assert.get_output().stdout).expect("stdout is json");
+
+    assert_eq!(explain_body["command"], "explain");
+    assert_eq!(explain_body["data"]["skill"], "skillctl");
+    assert_eq!(explain_body["data"]["scope"], "user");
+    assert_eq!(explain_body["data"]["status"], "selected");
+    assert_eq!(explain_body["data"]["winner"]["scope"], "user");
+    assert_eq!(explain_body["data"]["winner"]["source_class"], "bundled");
+    assert_eq!(
+        explain_body["data"]["drift"]["active_projection_matches_winner"],
+        true
+    );
+    assert_eq!(
+        explain_body["data"]["drift"]["active_differs_from_pinned_source"],
+        false
+    );
+    let explain_targets = explain_body["data"]["targets"]
+        .as_array()
+        .expect("explain targets exist");
+    assert_eq!(explain_targets.len(), 6);
+    for target in [
+        "codex",
+        "claude-code",
+        "github-copilot",
+        "gemini-cli",
+        "amp",
+        "opencode",
+    ] {
+        assert!(
+            explain_targets
+                .iter()
+                .any(|entry| entry["target"] == target && entry["visible"] == true),
+            "expected bundled skill to be visible for {target}: {explain_body:#?}",
+        );
+    }
+
+    let doctor_assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", &home_path)
+        .args(["--json", "--scope", "user", "doctor"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+    let doctor_body: Value =
+        serde_json::from_slice(&doctor_assert.get_output().stdout).expect("stdout is json");
+
+    assert_eq!(doctor_body["command"], "doctor");
+    assert_eq!(
+        doctor_body["data"]["summary"]["checked_skill_count"]
+            .as_u64()
+            .expect("checked skill count is numeric"),
+        1,
+    );
+    assert!(
+        doctor_body["data"]["issues"]
+            .as_array()
+            .expect("doctor issues are an array")
+            .is_empty(),
+        "unexpected doctor issues: {doctor_body:#?}",
+    );
+
+    let tui_assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", &home_path)
+        .args(["--json", "--scope", "user", "--name", "skillctl", "tui"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+    let tui_body: Value =
+        serde_json::from_slice(&tui_assert.get_output().stdout).expect("stdout is json");
+
+    assert_eq!(tui_body["command"], "tui");
+    assert_eq!(tui_body["data"]["skills"][0]["skill"], "skillctl");
+    assert_eq!(tui_body["data"]["skills"][0]["scope"], "user");
+    assert_eq!(
+        tui_body["data"]["skills"][0]["visibility"]["status"],
+        "selected"
+    );
+    assert_eq!(
+        tui_body["data"]["skills"][0]["visibility"]["winner"]["source_class"],
+        "bundled"
+    );
+    assert_eq!(
+        tui_body["data"]["skills"][0]["visibility"]["targets"]
+            .as_array()
+            .expect("tui targets exist")
+            .len(),
+        6,
+    );
+    assert_eq!(
+        tui_body["data"]["skills"][0]["visibility"]["drift"]["active_projection_matches_winner"],
+        true
+    );
+}
+
+#[test]
+fn bundled_skill_conflicts_are_reported_in_explain_doctor_and_tui() {
+    let workspace = TestWorkspace::new();
+    let home_path = workspace.home_path();
+    let custom_skill_root = home_path.join(".claude/skills/skillctl");
+    fs::create_dir_all(&custom_skill_root).expect("custom skill root exists");
+    fs::write(
+        custom_skill_root.join("SKILL.md"),
+        concat!(
+            "---\n",
+            "name: skillctl\n",
+            "description: User-managed skillctl variant.\n",
+            "---\n",
+            "\n",
+            "# custom skillctl\n",
+        ),
+    )
+    .expect("custom skill manifest exists");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", &home_path)
+        .args(["--json", "telemetry", "status"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let explain_assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", &home_path)
+        .args(["--json", "--scope", "user", "explain", "skillctl"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+    let explain_body: Value =
+        serde_json::from_slice(&explain_assert.get_output().stdout).expect("stdout is json");
+
+    assert_eq!(explain_body["data"]["status"], "selected");
+    assert_eq!(
+        explain_body["data"]["drift"]["active_projection_matches_winner"],
+        false
+    );
+    assert_eq!(
+        explain_body["data"]["drift"]["active_differs_from_pinned_source"],
+        true
+    );
+
+    let doctor_assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", &home_path)
+        .args(["--json", "--scope", "user", "doctor"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::is_empty());
+    let doctor_body: Value =
+        serde_json::from_slice(&doctor_assert.get_output().stdout).expect("stdout is json");
+
+    assert!(
+        doctor_body["data"]["issues"]
+            .as_array()
+            .expect("doctor issues are an array")
+            .iter()
+            .any(|issue| issue["code"] == "bundled-skill-conflict" && issue["skill"] == "skillctl"),
+        "expected bundled conflict issue: {doctor_body:#?}",
+    );
+    assert!(
+        doctor_body["data"]["issues"]
+            .as_array()
+            .expect("doctor issues are an array")
+            .iter()
+            .any(|issue| issue["code"] == "projection-drift" && issue["skill"] == "skillctl"),
+        "expected bundled projection drift issue: {doctor_body:#?}",
+    );
+
+    let tui_assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", &home_path)
+        .args(["--json", "--scope", "user", "--name", "skillctl", "tui"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+    let tui_body: Value =
+        serde_json::from_slice(&tui_assert.get_output().stdout).expect("stdout is json");
+
+    assert_eq!(
+        tui_body["data"]["skills"][0]["visibility"]["drift"]["active_projection_matches_winner"],
+        false
+    );
+    assert_eq!(
+        tui_body["data"]["skills"][0]["visibility"]["drift"]["active_differs_from_pinned_source"],
+        true
+    );
+    assert!(
+        tui_body["data"]["skills"][0]["visibility"]["issues"]
+            .as_array()
+            .expect("tui visibility issues are an array")
+            .iter()
+            .any(|issue| issue["code"] == "bundled-skill-conflict"),
+        "expected bundled conflict issue in TUI visibility: {tui_body:#?}",
+    );
+}
+
+#[test]
 fn bundled_bootstrap_rolls_back_when_the_transaction_fails_after_state_write() {
     let workspace = TestWorkspace::new();
 

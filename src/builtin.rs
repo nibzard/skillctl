@@ -367,6 +367,18 @@ pub(crate) fn diagnostics(context: &AppContext) -> Result<Vec<BundledSkillDiagno
     Ok(diagnostics)
 }
 
+pub(crate) fn projection_difference(
+    context: &AppContext,
+    path: &Path,
+) -> Result<Option<String>, AppError> {
+    match inspect_projection_root(path)? {
+        RootStatus::Current => Ok(None),
+        RootStatus::NeedsWrite | RootStatus::Conflict { .. } => {
+            Ok(Some(planner::display_path(context, path)))
+        }
+    }
+}
+
 pub(crate) fn is_bundled_install(record: &InstallRecord) -> bool {
     record.skill.scope == ManagedScope::User
         && record.skill.skill_id == BUNDLED_SKILL_ID

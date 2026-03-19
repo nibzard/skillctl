@@ -1041,6 +1041,25 @@
       ],
       "updated_at": "2026-03-19T18:19:30Z",
       "blockers": []
+    },
+    {
+      "id": "T040",
+      "title": "Make bundled `skillctl` show up correctly in explain, doctor, and TUI diagnostics",
+      "status": "done",
+      "priority": 1,
+      "details": "After the bundled user-scope skill is bootstrapped, `skillctl --scope user explain skillctl` still reports `status: missing`, `doctor --scope user` reports zero checked skills and no bundled state, and the TUI inherits the same broken explain report. Teach the diagnostics path to treat the built-in install and its projection records as first-class inputs so bundled-skill visibility and drift are reported accurately.",
+      "tags": [
+        "review-followup",
+        "bundled-skill",
+        "diagnostics"
+      ],
+      "files": [
+        "src/builtin.rs",
+        "src/doctor.rs",
+        "tests/cli.rs",
+        "to-do.json"
+      ],
+      "updated_at": "2026-03-19T18:33:51Z"
     }
   ]
 }
