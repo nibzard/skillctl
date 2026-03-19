@@ -10,6 +10,7 @@ use crate::{
     error::AppError,
     lockfile::{LockfilePath, WorkspaceLockfile},
     manifest::{ImportDefinition, ManifestPath, ManifestScope, WorkspaceManifest},
+    materialize::PROJECTION_METADATA_FILE,
     skill::{OPENAI_METADATA_FILE, SKILL_MANIFEST_FILE, SkillDefinition, SkillVendorMetadata},
 };
 
@@ -382,36 +383,66 @@ fn discover_local_candidates(
     let mut skill_roots = read_child_directories(&skills_root, "canonical skill root")?;
     skill_roots.sort();
 
-    skill_roots
-        .into_iter()
-        .map(|root| {
-            let skill = SkillDefinition::load_from_dir(&root)?;
-            let files = collect_effective_files(&root)?;
-            let relative_path =
-                portable_relative_path(root.strip_prefix(&request.working_directory).map_err(
-                    |_| AppError::ResolutionValidation {
-                        message: format!(
-                            "canonical skill root '{}' is outside the workspace '{}'",
-                            root.display(),
-                            request.working_directory.display()
-                        ),
-                    },
-                )?)?;
-            let internal_id = InternalSkillId::local(SkillScope::Workspace, relative_path);
-            let manifest_priority = request.manifest_priorities.get(&internal_id).copied();
+    let mut candidates = Vec::new();
+    for root in skill_roots {
+        if is_generated_projection_root(&root)? {
+            continue;
+        }
 
-            Ok(ResolvedSkillCandidate {
-                internal_id,
-                manifest_priority,
-                source_class: SkillSourceClass::CanonicalLocal,
-                scope: SkillScope::Workspace,
-                skill,
-                files,
-                overlay: None,
-                import: None,
-            })
-        })
-        .collect()
+        let skill = SkillDefinition::load_from_dir(&root)?;
+        let files = collect_effective_files(&root)?;
+        let relative_path =
+            portable_relative_path(root.strip_prefix(&request.working_directory).map_err(
+                |_| AppError::ResolutionValidation {
+                    message: format!(
+                        "canonical skill root '{}' is outside the workspace '{}'",
+                        root.display(),
+                        request.working_directory.display()
+                    ),
+                },
+            )?)?;
+        let internal_id = InternalSkillId::local(SkillScope::Workspace, relative_path);
+        let manifest_priority = request.manifest_priorities.get(&internal_id).copied();
+
+        candidates.push(ResolvedSkillCandidate {
+            internal_id,
+            manifest_priority,
+            source_class: SkillSourceClass::CanonicalLocal,
+            scope: SkillScope::Workspace,
+            skill,
+            files,
+            overlay: None,
+            import: None,
+        });
+    }
+
+    Ok(candidates)
+}
+
+fn is_generated_projection_root(root: &Path) -> Result<bool, AppError> {
+    let metadata_path = root.join(PROJECTION_METADATA_FILE);
+    let contents = match fs::read_to_string(&metadata_path) {
+        Ok(contents) => contents,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(AppError::FilesystemOperation {
+                action: "read projection metadata",
+                path: metadata_path,
+                source,
+            });
+        }
+    };
+
+    let parsed = serde_json::from_str::<serde_json::Value>(&contents).map_err(|source| {
+        AppError::ResolutionValidation {
+            message: format!(
+                "projection metadata '{}' is invalid JSON: {source}",
+                metadata_path.display()
+            ),
+        }
+    })?;
+
+    Ok(parsed.get("tool").and_then(serde_json::Value::as_str) == Some("skillctl"))
 }
 
 fn discover_import_candidates(
@@ -1109,6 +1140,51 @@ mod tests {
         assert_eq!(
             winner.skill.description,
             "Imported skill wins due to explicit priority."
+        );
+    }
+
+    #[test]
+    fn ignores_generated_projection_roots_when_discovering_canonical_local_skills() {
+        let fixture = ResolverFixture::new();
+        fixture.write_skill(
+            ".agents/skills/release-notes",
+            "release-notes",
+            "Generated projection should not become canonical local.",
+        );
+        fixture.write_text(
+            ".agents/skills/release-notes/.skillctl-projection.json",
+            "{\n  \"tool\": \"skillctl\",\n  \"skill_name\": \"release-notes\"\n}\n",
+        );
+        fixture.write_skill(
+            "imports/notes-import/skills/release-notes",
+            "release-notes",
+            "Imported skill should remain the active winner.",
+        );
+
+        let request = fixture.request(
+            vec![import_definition("notes-import", "skills/release-notes")],
+            vec![locked_import(
+                "notes-import",
+                "https://example.com/release.git",
+                "skills/release-notes",
+            )],
+        );
+
+        let graph =
+            build_effective_skill_graph(&request).expect("effective skill graph should build");
+        graph
+            .ensure_conflict_free()
+            .expect("graph should be conflict free");
+
+        let projection = graph
+            .projection_for("release-notes")
+            .expect("projection exists");
+        let winner = projection.winner().expect("winner exists");
+
+        assert_eq!(winner.source_class, SkillSourceClass::Imported);
+        assert_eq!(
+            winner.skill.description,
+            "Imported skill should remain the active winner."
         );
     }
 
