@@ -15,6 +15,7 @@ use crate::{
     cli::Scope,
     error::AppError,
     history::{HistoryEventKind, HistoryLedger},
+    lifecycle::{self, LifecycleTransaction},
     manifest::ProjectionPolicy,
     materialize::PROJECTION_METADATA_FILE,
     overlay::NO_OVERLAY_HASH,
@@ -23,7 +24,7 @@ use crate::{
     source::{SourceKind, compute_effective_version_hash, current_timestamp},
     state::{
         HistoryEntry, HistoryQuery, InstallRecord, LocalStateStore, ManagedScope, ManagedSkillRef,
-        PinRecord, ProjectionMode, ProjectionRecord,
+        PinRecord, ProjectionMode, ProjectionRecord, default_state_database_path,
     },
 };
 
@@ -73,17 +74,42 @@ pub(crate) struct BundledSkillDiagnostic {
 }
 
 pub(crate) fn ensure_bundled_skill(context: &AppContext, force: bool) -> Result<(), AppError> {
+    if !force && !bundled_mutation_required(context, force)? {
+        return Ok(());
+    }
+
+    ensure_bundled_skill_with_transaction(context, force, "bundled-bootstrap")?;
+    Ok(())
+}
+
+fn ensure_bundled_skill_with_transaction(
+    context: &AppContext,
+    force: bool,
+    operation: &'static str,
+) -> Result<bool, AppError> {
+    lifecycle::run_transaction(operation, |transaction| {
+        transaction.track_state_database()?;
+        track_bundled_roots(context, transaction)?;
+        let changed = ensure_bundled_skill_inner(context, force)?;
+        if changed {
+            transaction.checkpoint("after-state")?;
+        }
+        Ok(changed)
+    })
+}
+
+fn ensure_bundled_skill_inner(context: &AppContext, force: bool) -> Result<bool, AppError> {
     let skill = bundled_skill_ref();
     let mut store = LocalStateStore::open_default()?;
     let existing = store.install_record(&skill)?;
 
     if let Some(record) = &existing {
         if !is_bundled_install(record) {
-            prune_owned_projections(context)?;
-            return Ok(());
+            let removed_paths = prune_owned_projections(context)?;
+            return Ok(!removed_paths.is_empty());
         }
     } else if !force && is_explicitly_removed(&store)? {
-        return Ok(());
+        return Ok(false);
     }
 
     let timestamp = current_timestamp();
@@ -96,7 +122,7 @@ pub(crate) fn ensure_bundled_skill(context: &AppContext, force: bool) -> Result<
         .filter(|inspection| !matches!(inspection.status, RootStatus::Conflict { .. }))
         .count();
     if manageable_roots == 0 {
-        return Ok(());
+        return Ok(false);
     }
 
     let desired_install = install_record_from_state(
@@ -130,7 +156,7 @@ pub(crate) fn ensure_bundled_skill(context: &AppContext, force: bool) -> Result<
         !same_projection_records(&current_projections, &desired_projections);
 
     if !install_changed && !wrote_projection && !projection_state_changed {
-        return Ok(());
+        return Ok(false);
     }
 
     store.delete_current_skill_state(&skill)?;
@@ -161,52 +187,54 @@ pub(crate) fn ensure_bundled_skill(context: &AppContext, force: bool) -> Result<
         ledger.record_projection(projection)?;
     }
 
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) fn handle_remove(context: &AppContext) -> Result<AppResponse, AppError> {
-    let skill = bundled_skill_ref();
-    let mut store = LocalStateStore::open_default()?;
-    let timestamp = current_timestamp();
-    let removed_paths = prune_owned_projections(context)?;
+    lifecycle::run_transaction("bundled-remove", |transaction| {
+        transaction.track_state_database()?;
+        track_bundled_roots(context, transaction)?;
 
-    store.delete_current_skill_state(&skill)?;
+        let skill = bundled_skill_ref();
+        let mut store = LocalStateStore::open_default()?;
+        let timestamp = current_timestamp();
+        let removed_paths = prune_owned_projections(context)?;
 
-    let recorded_paths = if removed_paths.is_empty() {
-        vec![BUNDLED_SOURCE_URL.to_string()]
-    } else {
-        removed_paths.clone()
-    };
-    for path in recorded_paths {
-        store.append_history_entry(&HistoryEntry {
-            id: None,
-            kind: HistoryEventKind::Cleanup,
-            scope: Some(skill.scope),
-            skill_id: Some(skill.skill_id.clone()),
-            target: None,
-            occurred_at: timestamp.clone(),
-            summary: format!("Removed bundled {} at {}", skill.skill_id, path),
-            details: cleanup_details(&path),
-        })?;
-    }
+        store.delete_current_skill_state(&skill)?;
 
-    Ok(AppResponse::success("remove")
-        .with_summary("Removed skillctl from user scope.".to_string())
-        .with_data(json!({
-            "skill": BUNDLED_SKILL_ID,
-            "scope": ManagedScope::User.as_str(),
-            "builtin": true,
-            "removed_paths": removed_paths,
-        })))
+        let recorded_paths = if removed_paths.is_empty() {
+            vec![BUNDLED_SOURCE_URL.to_string()]
+        } else {
+            removed_paths.clone()
+        };
+        for path in recorded_paths {
+            store.append_history_entry(&HistoryEntry {
+                id: None,
+                kind: HistoryEventKind::Cleanup,
+                scope: Some(skill.scope),
+                skill_id: Some(skill.skill_id.clone()),
+                target: None,
+                occurred_at: timestamp.clone(),
+                summary: format!("Removed bundled {} at {}", skill.skill_id, path),
+                details: cleanup_details(&path),
+            })?;
+        }
+
+        transaction.checkpoint("after-state")?;
+
+        Ok(AppResponse::success("remove")
+            .with_summary("Removed skillctl from user scope.".to_string())
+            .with_data(json!({
+                "skill": BUNDLED_SKILL_ID,
+                "scope": ManagedScope::User.as_str(),
+                "builtin": true,
+                "removed_paths": removed_paths,
+            })))
+    })
 }
 
 pub(crate) fn handle_enable(context: &AppContext) -> Result<AppResponse, AppError> {
-    let store = LocalStateStore::open_default()?;
-    let existing = store.install_record(&bundled_skill_ref())?;
-    let changed = existing.as_ref().is_none_or(is_bundled_install);
-    drop(store);
-
-    ensure_bundled_skill(context, true)?;
+    let changed = ensure_bundled_skill_with_transaction(context, true, "bundled-enable")?;
     let projections = LocalStateStore::open_default()?
         .projection_records(Some(&bundled_skill_ref()))?
         .into_iter()
@@ -223,6 +251,77 @@ pub(crate) fn handle_enable(context: &AppContext) -> Result<AppResponse, AppErro
             "changed": changed,
             "projections": projections,
         })))
+}
+
+fn bundled_mutation_required(context: &AppContext, force: bool) -> Result<bool, AppError> {
+    let skill = bundled_skill_ref();
+    let state_database = default_state_database_path()?;
+    let store = match fs::metadata(&state_database) {
+        Ok(_) => Some(LocalStateStore::open_at(&state_database)?),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => None,
+        Err(source) => {
+            return Err(AppError::FilesystemOperation {
+                action: "inspect local state database",
+                path: state_database,
+                source,
+            });
+        }
+    };
+    let existing = store
+        .as_ref()
+        .map(|store| store.install_record(&skill))
+        .transpose()?
+        .flatten();
+
+    if let Some(record) = &existing {
+        if !is_bundled_install(record) {
+            return Ok(!owned_projection_paths(context)?.is_empty());
+        }
+    } else if !force {
+        if let Some(store) = store.as_ref()
+            && is_explicitly_removed(store)?
+        {
+            return Ok(false);
+        }
+    }
+
+    let content_hash = bundled_content_hash();
+    let effective_version_hash =
+        compute_effective_version_hash(env!("CARGO_PKG_VERSION"), &content_hash, NO_OVERLAY_HASH);
+    let inspections = inspect_roots(context)?;
+    let manageable_roots = inspections
+        .iter()
+        .filter(|inspection| !matches!(inspection.status, RootStatus::Conflict { .. }))
+        .count();
+    if manageable_roots == 0 {
+        return Ok(false);
+    }
+
+    let desired_install = install_record_from_state(
+        existing.as_ref(),
+        &skill,
+        &content_hash,
+        &effective_version_hash,
+        "",
+    );
+    let install_changed = existing
+        .as_ref()
+        .is_none_or(|record| install_record_changed(record, &desired_install));
+    if inspections
+        .iter()
+        .any(|inspection| matches!(inspection.status, RootStatus::NeedsWrite))
+    {
+        return Ok(true);
+    }
+
+    let desired_projections = projection_records_for_roots(&skill, &inspections, "");
+    let current_projections = store
+        .as_ref()
+        .map(|store| store.projection_records(Some(&skill)))
+        .transpose()?
+        .unwrap_or_default();
+
+    Ok(install_changed || !same_projection_records(&current_projections, &desired_projections))
 }
 
 pub(crate) fn planned_root_views(context: &AppContext) -> Result<Vec<Value>, AppError> {
@@ -650,21 +749,42 @@ fn projection_signature(record: &ProjectionRecord) -> (TargetRuntime, String, St
     )
 }
 
+fn track_bundled_roots(
+    context: &AppContext,
+    transaction: &mut LifecycleTransaction,
+) -> Result<(), AppError> {
+    for (_, root_path) in all_user_roots(context)? {
+        transaction.track_path(root_path)?;
+    }
+
+    Ok(())
+}
+
 fn prune_owned_projections(context: &AppContext) -> Result<Vec<String>, AppError> {
-    let mut removed = Vec::new();
+    let mut removed = owned_projection_paths(context)?
+        .into_iter()
+        .map(|path| {
+            fs::remove_dir_all(&path).map_err(|source| AppError::FilesystemOperation {
+                action: "remove bundled skill projection",
+                path: path.clone(),
+                source,
+            })?;
+            Ok(planner::display_path(context, &path))
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+
+    removed.sort();
+    Ok(removed)
+}
+
+fn owned_projection_paths(context: &AppContext) -> Result<Vec<PathBuf>, AppError> {
+    let mut owned = Vec::new();
 
     for (_, root_path) in all_user_roots(context)? {
         let target_dir = root_path.join(BUNDLED_SKILL_ID);
         match builtin_projection_state(&target_dir) {
             Ok(BundledProjectionState::ManagedCurrent | BundledProjectionState::ManagedStale) => {
-                fs::remove_dir_all(&target_dir).map_err(|source| {
-                    AppError::FilesystemOperation {
-                        action: "remove bundled skill projection",
-                        path: target_dir.clone(),
-                        source,
-                    }
-                })?;
-                removed.push(planner::display_path(context, &target_dir));
+                owned.push(target_dir);
             }
             Ok(BundledProjectionState::Conflict) => {}
             Err(AppError::FilesystemOperation {
@@ -681,8 +801,8 @@ fn prune_owned_projections(context: &AppContext) -> Result<Vec<String>, AppError
         }
     }
 
-    removed.sort();
-    Ok(removed)
+    owned.sort();
+    Ok(owned)
 }
 
 fn all_user_roots(context: &AppContext) -> Result<Vec<(String, PathBuf)>, AppError> {

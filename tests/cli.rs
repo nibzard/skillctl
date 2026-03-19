@@ -3833,6 +3833,26 @@ fn bundled_skill_is_installed_in_user_scope_on_first_command() {
 }
 
 #[test]
+fn bundled_bootstrap_rolls_back_when_the_transaction_fails_after_state_write() {
+    let workspace = TestWorkspace::new();
+
+    let snapshot = workspace.snapshot_paths(&[
+        "home/.skillctl/state.db",
+        "home/.agents/skills",
+        "home/.claude/skills",
+        "home/.config/agents/skills",
+    ]);
+
+    assert_transaction_rolled_back(
+        &workspace,
+        "bundled-bootstrap:after-state",
+        "1770000000",
+        &["telemetry", "status"],
+        &snapshot,
+    );
+}
+
+#[test]
 fn bundled_skill_removal_is_explicit_and_persists_across_later_runs() {
     let workspace = TestWorkspace::new();
     let home_path = workspace.home_path();
@@ -3909,6 +3929,36 @@ fn bundled_skill_removal_is_explicit_and_persists_across_later_runs() {
 }
 
 #[test]
+fn bundled_remove_rolls_back_when_the_transaction_fails_after_state_write() {
+    let workspace = TestWorkspace::new();
+    let home_path = workspace.home_path();
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", &home_path)
+        .args(["--json", "telemetry", "status"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let snapshot = workspace.snapshot_paths(&[
+        "home/.skillctl/state.db",
+        "home/.agents/skills",
+        "home/.claude/skills",
+        "home/.config/agents/skills",
+    ]);
+
+    assert_transaction_rolled_back(
+        &workspace,
+        "bundled-remove:after-state",
+        "1770001234",
+        &["--scope", "user", "remove", "skillctl"],
+        &snapshot,
+    );
+}
+
+#[test]
 fn bundled_skill_does_not_overwrite_hand_authored_user_skill_roots() {
     let workspace = TestWorkspace::new();
     let home_path = workspace.home_path();
@@ -3959,6 +4009,45 @@ fn bundled_skill_does_not_overwrite_hand_authored_user_skill_roots() {
             .iter()
             .any(|issue| issue["code"] == "bundled-skill-conflict"),
         "doctor should surface the blocked bundled-skill projection",
+    );
+}
+
+#[test]
+fn bundled_enable_rolls_back_when_the_transaction_fails_after_state_write() {
+    let workspace = TestWorkspace::new();
+    let home_path = workspace.home_path();
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", &home_path)
+        .args(["--json", "telemetry", "status"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", &home_path)
+        .args(["--json", "--scope", "user", "remove", "skillctl"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let snapshot = workspace.snapshot_paths(&[
+        "home/.skillctl/state.db",
+        "home/.agents/skills",
+        "home/.claude/skills",
+        "home/.config/agents/skills",
+    ]);
+
+    assert_transaction_rolled_back(
+        &workspace,
+        "bundled-enable:after-state",
+        "1770002468",
+        &["--scope", "user", "enable", "skillctl"],
+        &snapshot,
     );
 }
 
@@ -4522,6 +4611,60 @@ fn clean_removes_generated_projections_and_unused_import_state_without_touching_
         })
         .expect("projection count query succeeds");
     assert_eq!(projection_count, 0);
+}
+
+#[test]
+fn clean_rolls_back_when_the_transaction_fails_after_state_write() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_skill_source("shared-skills", "release-notes");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770000000")
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    workspace.write_file(
+        "home/.skillctl/store/imports/stale-skill/SKILL.md",
+        concat!(
+            "---\n",
+            "name: stale-skill\n",
+            "description: Stale immutable source.\n",
+            "---\n",
+            "\n",
+            "# stale-skill\n"
+        ),
+    );
+
+    let snapshot = workspace.snapshot_paths(&[
+        "home/.skillctl/state.db",
+        "home/.skillctl/store/imports",
+        ".claude/skills",
+    ]);
+
+    assert_transaction_rolled_back(
+        &workspace,
+        "clean:after-state",
+        "1770001234",
+        &["clean"],
+        &snapshot,
+    );
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

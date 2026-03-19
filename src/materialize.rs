@@ -306,78 +306,96 @@ pub fn handle_sync(context: &AppContext, _request: SyncRequest) -> Result<AppRes
 
 /// Handle `skillctl clean`.
 pub fn handle_clean(context: &AppContext, _request: CleanRequest) -> Result<AppResponse, AppError> {
-    let manifest = load_manifest_or_default(&context.working_directory)?;
-    let lockfile = load_lockfile_or_default(&context.working_directory)?;
-    let mut store = LocalStateStore::open_default()?;
-    let installs = store.list_install_records()?;
-    let timestamp = current_timestamp();
-    let mut cleaned_projections = Vec::new();
-    let mut cleaned_state = Vec::new();
+    lifecycle::run_transaction("clean", |transaction| {
+        let manifest = load_manifest_or_default(&context.working_directory)?;
+        let lockfile = load_lockfile_or_default(&context.working_directory)?;
+        transaction.track_state_database()?;
+        for (_, root) in cleanup_candidate_roots(context, &manifest)? {
+            transaction.track_path(root)?;
+        }
+        transaction.track_path(imports_store_root()?)?;
+        transaction.track_path(
+            context
+                .working_directory
+                .join(UNUSED_IMPORTS_PLACEHOLDER_DIR),
+        )?;
 
-    for (scope, root) in cleanup_candidate_roots(context, &manifest)? {
-        cleaned_projections.extend(clean_generated_projections_at(context, scope, &root)?);
-    }
+        let mut store = LocalStateStore::open_default()?;
+        let installs = store.list_install_records()?;
+        let had_projection_records = !store.projection_records(None)?.is_empty();
+        let timestamp = current_timestamp();
+        let mut cleaned_projections = Vec::new();
+        let mut cleaned_state = Vec::new();
 
-    cleaned_state.extend(clean_unused_import_state(context, &manifest, &lockfile)?);
-
-    store.clear_projection_records()?;
-
-    {
-        let installs = installs
-            .into_iter()
-            .map(|record| {
-                (
-                    (record.skill.scope, record.skill.skill_id.clone()),
-                    record.skill,
-                )
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
-        let mut ledger = HistoryLedger::new(&mut store);
-
-        for cleaned in &cleaned_projections {
-            let skill = cleaned.skill.as_ref().and_then(|skill_id| {
-                installs
-                    .get(&(
-                        cleaned.scope.expect("projection cleanup includes a scope"),
-                        skill_id.clone(),
-                    ))
-                    .cloned()
-                    .or_else(|| {
-                        cleaned
-                            .scope
-                            .map(|scope| ManagedSkillRef::new(scope, skill_id))
-                    })
-            });
-            ledger.record_cleanup(skill.as_ref(), &cleaned.path, &timestamp)?;
+        for (scope, root) in cleanup_candidate_roots(context, &manifest)? {
+            cleaned_projections.extend(clean_generated_projections_at(context, scope, &root)?);
         }
 
-        for cleaned in &cleaned_state {
-            ledger.record_cleanup(None, &cleaned.path, &timestamp)?;
+        cleaned_state.extend(clean_unused_import_state(context, &manifest, &lockfile)?);
+
+        store.clear_projection_records()?;
+
+        {
+            let installs = installs
+                .into_iter()
+                .map(|record| {
+                    (
+                        (record.skill.scope, record.skill.skill_id.clone()),
+                        record.skill,
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let mut ledger = HistoryLedger::new(&mut store);
+
+            for cleaned in &cleaned_projections {
+                let skill = cleaned.skill.as_ref().and_then(|skill_id| {
+                    installs
+                        .get(&(
+                            cleaned.scope.expect("projection cleanup includes a scope"),
+                            skill_id.clone(),
+                        ))
+                        .cloned()
+                        .or_else(|| {
+                            cleaned
+                                .scope
+                                .map(|scope| ManagedSkillRef::new(scope, skill_id))
+                        })
+                });
+                ledger.record_cleanup(skill.as_ref(), &cleaned.path, &timestamp)?;
+            }
+
+            for cleaned in &cleaned_state {
+                ledger.record_cleanup(None, &cleaned.path, &timestamp)?;
+            }
         }
-    }
 
-    let summary = if cleaned_projections.is_empty() && cleaned_state.is_empty() {
-        "No generated projections or cached state needed cleanup.".to_string()
-    } else {
-        format!(
-            "Removed {} generated projection{} and {} generated state entr{}.",
-            cleaned_projections.len(),
-            if cleaned_projections.len() == 1 {
-                ""
-            } else {
-                "s"
-            },
-            cleaned_state.len(),
-            if cleaned_state.len() == 1 { "y" } else { "ies" },
-        )
-    };
+        if had_projection_records || !cleaned_projections.is_empty() || !cleaned_state.is_empty() {
+            transaction.checkpoint("after-state")?;
+        }
 
-    Ok(AppResponse::success("clean")
-        .with_summary(summary)
-        .with_data(json!({
-            "cleaned_projections": cleaned_projections,
-            "cleaned_state": cleaned_state,
-        })))
+        let summary = if cleaned_projections.is_empty() && cleaned_state.is_empty() {
+            "No generated projections or cached state needed cleanup.".to_string()
+        } else {
+            format!(
+                "Removed {} generated projection{} and {} generated state entr{}.",
+                cleaned_projections.len(),
+                if cleaned_projections.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                cleaned_state.len(),
+                if cleaned_state.len() == 1 { "y" } else { "ies" },
+            )
+        };
+
+        Ok(AppResponse::success("clean")
+            .with_summary(summary)
+            .with_data(json!({
+                "cleaned_projections": cleaned_projections,
+                "cleaned_state": cleaned_state,
+            })))
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
