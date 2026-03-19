@@ -607,22 +607,23 @@
         "T018",
         "T020"
       ],
-      "updated_at": "2026-03-19T15:35:40Z",
+      "updated_at": "2026-03-19T15:36:26Z",
       "files": [
+        "README.md",
+        "src/cli.rs",
         "src/mcp.rs",
         "src/runtime.rs",
-        "src/cli.rs",
-        "tests/mcp.rs",
         "tests/cli.rs",
+        "tests/mcp.rs",
         "tests/support/mod.rs",
-        "README.md"
+        "to-do.json"
       ]
     },
     {
       "id": "T023",
       "title": "Implement the terminal UI for inspection, updates, and history",
       "priority": 4,
-      "status": "todo",
+      "status": "done",
       "details": "Build the optional TUI around the same state and command model used by the CLI so it adds visibility without adding a second behavior surface.",
       "steps": [
         "Show installed versions, update availability, overlays, local modifications, target visibility, and rollback or pin details.",
@@ -636,7 +637,17 @@
         "T015",
         "T016",
         "T020"
-      ]
+      ],
+      "updated_at": "2026-03-19T15:49:26Z",
+      "files": [
+        "README.md",
+        "src/cli.rs",
+        "src/doctor.rs",
+        "src/tui.rs",
+        "tests/cli.rs",
+        "to-do.json"
+      ],
+      "blockers": []
     },
     {
       "id": "T024",

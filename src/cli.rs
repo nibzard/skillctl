@@ -38,7 +38,7 @@ Supported runtimes:
   codex, claude-code, github-copilot, gemini-cli, amp, opencode
 
 Status:
-  'tui' is a placeholder command today.
+  'tui' opens a read-only dashboard over the same state and inspection model as the CLI.
   'mcp serve' exposes the same lifecycle operations to agents over MCP.";
 
 const INIT_LONG_ABOUT: &str = "\
@@ -261,18 +261,26 @@ Examples:
   skillctl --scope workspace clean";
 
 const TUI_LONG_ABOUT: &str = "\
-Open the terminal UI.
+Open the terminal inspection UI.
 
-Status:
-  The terminal UI command is a placeholder today and returns a not-implemented error.";
+The terminal inspection UI is a read-only dashboard for installed versions,
+update availability, overlays, local modifications, target visibility, pin or
+rollback context, and recent history.
+
+Every suggested action maps to a documented CLI command.";
 
 const TUI_AFTER_LONG_HELP: &str = "\
-CLI equivalents today:
-  installed skills: skillctl list
-  update state: skillctl update [skill]
-  visibility and drift: skillctl explain <skill>
-  filesystem roots: skillctl path <skill>
-  history: skillctl history [skill]";
+Examples:
+  skillctl tui
+  skillctl --scope workspace --name ai-sdk tui
+  skillctl --target codex tui
+
+Mapped actions:
+  refresh update state: skillctl update [skill]
+  inspect visibility: skillctl explain <skill>
+  inspect filesystem roots: skillctl path <skill>
+  inspect history: skillctl history [skill]
+  pin or roll back: skillctl pin <skill> <ref> / skillctl rollback <skill> <version-or-commit>";
 
 const TELEMETRY_LONG_ABOUT: &str = "\
 Inspect or change public-only telemetry consent.

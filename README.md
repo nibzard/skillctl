@@ -6,8 +6,7 @@ It gives one operating model for canonical workspace skills, imported skills, ov
 
 Current status:
 
-- Implemented today: CLI lifecycle commands, copy-first projections with opt-in symlink mode, lockfile and SQLite state, history, telemetry consent, `doctor`, `explain`, `validate`, JSON output, and `skillctl mcp serve`.
-- Planned but not implemented yet: `skillctl tui`.
+- Implemented today: CLI lifecycle commands, copy-first projections with opt-in symlink mode, lockfile and SQLite state, history, telemetry consent, `doctor`, `explain`, `validate`, JSON output, `skillctl tui`, and `skillctl mcp serve`.
 
 The product direction is defined in [spec.md](./spec.md). A focused troubleshooting guide lives in [docs/troubleshooting.md](./docs/troubleshooting.md).
 
@@ -149,7 +148,7 @@ Telemetry commands:
 
 Additional surfaces:
 
-- `skillctl tui`: planned terminal UI
+- `skillctl tui`: read-only terminal dashboard for inspection, update context, and history
 - `skillctl mcp serve`: stdio MCP bridge with v1 tool parity
 
 ## Common Workflows
@@ -203,7 +202,7 @@ MCP v1 tools:
 - `skills_doctor`
 - `skills_telemetry_status`
 
-Current equivalent for the planned TUI:
+TUI action equivalents:
 
 - Installed skills: `skillctl list`
 - Update state: `skillctl update [skill]`

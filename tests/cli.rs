@@ -69,7 +69,7 @@ fn root_help_describes_the_operating_model_and_current_mcp_surface() {
             "Local history and telemetry consent live in ~/.skillctl/state.db.",
         ))
         .stdout(predicate::str::contains(
-            "'tui' is a placeholder command today.",
+            "'tui' opens a read-only dashboard over the same state and inspection model as the CLI.",
         ));
 }
 
@@ -129,9 +129,12 @@ fn tui_and_mcp_help_point_to_current_cli_equivalents() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "The terminal UI command is a placeholder today",
+            "The terminal inspection UI is a read-only dashboard",
         ))
-        .stdout(predicate::str::contains("installed skills: skillctl list"));
+        .stdout(predicate::str::contains("installed versions"))
+        .stdout(predicate::str::contains(
+            "refresh update state: skillctl update [skill]",
+        ));
 
     Command::cargo_bin("skillctl")
         .expect("binary exists")
@@ -144,6 +147,179 @@ fn tui_and_mcp_help_point_to_current_cli_equivalents() {
         .stdout(predicate::str::contains(
             "skills_override_create -> skillctl override <skill> --json",
         ));
+}
+
+#[test]
+fn tui_renders_a_read_only_dashboard_without_writing_history() {
+    let workspace = TestWorkspace::new();
+    workspace.write_skill_source("shared-skills", "release-notes");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770000000")
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770000060")
+        .args(["override", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770000120")
+        .args(["update", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let connection = Connection::open(workspace.home_path().join(".skillctl/state.db"))
+        .expect("state database opens");
+    let history_before: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM history_events WHERE skill_id = ?1",
+            params!["release-notes"],
+            |row| row.get(0),
+        )
+        .expect("history query succeeds");
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["tui"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is utf-8");
+    assert!(
+        stdout.contains("skillctl terminal UI"),
+        "stdout was {stdout}"
+    );
+    assert!(stdout.contains("release-notes"), "stdout was {stdout}");
+    assert!(
+        stdout.contains("update: local-source"),
+        "stdout was {stdout}"
+    );
+    assert!(
+        stdout.contains(".agents/overlays/release-notes"),
+        "stdout was {stdout}"
+    );
+    assert!(stdout.contains("Recent history"), "stdout was {stdout}");
+    assert!(
+        stdout.contains("skillctl --scope workspace update release-notes"),
+        "stdout was {stdout}"
+    );
+    assert!(
+        stdout.contains("skillctl --scope workspace history release-notes"),
+        "stdout was {stdout}"
+    );
+
+    let history_after: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM history_events WHERE skill_id = ?1",
+            params!["release-notes"],
+            |row| row.get(0),
+        )
+        .expect("history query succeeds");
+    assert_eq!(history_before, history_after);
+}
+
+#[test]
+fn tui_json_output_aggregates_skill_state_for_the_selected_skill() {
+    let workspace = TestWorkspace::new();
+    workspace.write_skill_source("shared-skills", "release-notes");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770000000")
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770000060")
+        .args(["override", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770000120")
+        .args(["update", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--json", "--name", "release-notes", "tui"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let body: Value = serde_json::from_slice(&assert.get_output().stdout).expect("stdout is json");
+    assert_eq!(body["command"], "tui");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["data"]["skills"][0]["skill"], "release-notes");
+    assert_eq!(body["data"]["skills"][0]["scope"], "workspace");
+    assert_eq!(
+        body["data"]["skills"][0]["update"]["outcome"],
+        "local-source"
+    );
+    assert_eq!(body["data"]["skills"][0]["overlay"]["present"], true);
+    assert_eq!(
+        body["data"]["skills"][0]["actions"]["history"],
+        "skillctl --scope workspace history release-notes"
+    );
+    assert_eq!(
+        body["data"]["skills"][0]["actions"]["update"],
+        "skillctl --scope workspace update release-notes"
+    );
+    assert_eq!(body["data"]["history"]["skill"], "release-notes");
+    assert!(
+        body["data"]["history"]["entries"]
+            .as_array()
+            .expect("entries array exists")
+            .iter()
+            .any(|entry| entry["kind"] == "overlay-created"),
+        "unexpected history payload: {body:#?}",
+    );
 }
 
 #[test]

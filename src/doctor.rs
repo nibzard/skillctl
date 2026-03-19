@@ -274,6 +274,15 @@ pub fn build_explain_response(
     Ok(with_warning_messages(response, warnings))
 }
 
+/// Build the typed explain report used by the read-only TUI dashboard.
+pub(crate) fn build_explain_report_for_tui(
+    context: &AppContext,
+    skill_name: &str,
+) -> Result<ExplainReport, AppError> {
+    let analysis = analyze_workspace(context)?;
+    build_explain_report(context, &analysis, skill_name)
+}
+
 fn analyze_workspace(context: &AppContext) -> Result<WorkspaceAnalysis, AppError> {
     let manifest = load_manifest_or_default(&context.working_directory)?;
     let lockfile = load_lockfile_or_default(&context.working_directory)?;
