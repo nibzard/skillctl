@@ -2,6 +2,8 @@
 //!
 //! The current bootstrap exposes a typed command runtime with explicit domain
 //! modules so future CLI, MCP, and TUI work can share one execution model.
+#![deny(missing_docs)]
+#![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod adapter;
 pub mod app;

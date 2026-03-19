@@ -151,6 +151,7 @@ pub fn handle_update(
         .with_data(json!({ "plans": plans })))
 }
 
+/// Planner recommendation for how to respond to one update result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum UpdateAction {
@@ -166,6 +167,7 @@ pub enum UpdateAction {
     Skip,
 }
 
+/// Stable source metadata included in an update plan.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct UpdateSourceSummary {
     /// Installed source category.
@@ -177,6 +179,7 @@ pub struct UpdateSourceSummary {
     pub subpath: String,
 }
 
+/// One detected local modification that affects update safety.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PlannedModification {
     /// Classified local change kind.
@@ -191,6 +194,7 @@ pub struct PlannedModification {
     pub details: Option<String>,
 }
 
+/// Structured update-check result for one managed skill.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SkillUpdatePlan {
     /// Managed skill identifier.
@@ -643,7 +647,7 @@ fn first_projection_difference(
 ) -> Result<Option<String>, AppError> {
     let mut expected = BTreeMap::new();
     for file in &candidate.files {
-        if file.relative_path == PathBuf::from(PROJECTION_METADATA_FILE) {
+        if file.relative_path == Path::new(PROJECTION_METADATA_FILE) {
             continue;
         }
         expected.insert(file.relative_path.clone(), file.source_path.clone());
@@ -769,7 +773,7 @@ pub(crate) fn resolve_runtime_root_path(
         return Ok(home_directory()?.join(suffix));
     }
     if root == "~" {
-        return Ok(home_directory()?);
+        return home_directory();
     }
 
     let path = PathBuf::from(root);

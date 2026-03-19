@@ -436,7 +436,7 @@ fn validate_import(
     };
 
     let stored_root = imports_store_root()?.join(&import.id);
-    if let Err(issue) = ensure_directory_issue(
+    if let Some(issue) = ensure_directory_issue(
         context,
         "missing-import-store",
         &stored_root,
@@ -450,7 +450,7 @@ fn validate_import(
     }
 
     let skill_root = stored_root.join(locked_import.source.subpath.as_str());
-    if let Err(issue) = ensure_directory_issue(
+    if let Some(issue) = ensure_directory_issue(
         context,
         "missing-import-source",
         &skill_root,
@@ -1398,10 +1398,10 @@ fn ensure_directory_issue(
     skill: &str,
     label: &str,
     fix: &str,
-) -> Result<(), DiagnosticIssue> {
+) -> Option<DiagnosticIssue> {
     match fs::metadata(path) {
-        Ok(metadata) if metadata.is_dir() => Ok(()),
-        Ok(_) => Err(DiagnosticIssue {
+        Ok(metadata) if metadata.is_dir() => None,
+        Ok(_) => Some(DiagnosticIssue {
             severity: DiagnosticSeverity::Error,
             code: code.to_string(),
             skill: Some(skill.to_string()),
@@ -1415,7 +1415,7 @@ fn ensure_directory_issue(
             ),
             fix: Some(fix.to_string()),
         }),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Err(DiagnosticIssue {
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Some(DiagnosticIssue {
             severity: DiagnosticSeverity::Error,
             code: code.to_string(),
             skill: Some(skill.to_string()),
@@ -1429,7 +1429,7 @@ fn ensure_directory_issue(
             ),
             fix: Some(fix.to_string()),
         }),
-        Err(source) => Err(DiagnosticIssue {
+        Err(source) => Some(DiagnosticIssue {
             severity: DiagnosticSeverity::Error,
             code: code.to_string(),
             skill: Some(skill.to_string()),
@@ -1678,7 +1678,7 @@ fn first_projection_difference(
 ) -> Result<Option<String>, AppError> {
     let mut expected = BTreeMap::new();
     for file in &candidate.files {
-        if file.relative_path == PathBuf::from(PROJECTION_METADATA_FILE) {
+        if file.relative_path == Path::new(PROJECTION_METADATA_FILE) {
             continue;
         }
         expected.insert(file.relative_path.clone(), file.source_path.clone());

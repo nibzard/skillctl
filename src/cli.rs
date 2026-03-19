@@ -20,6 +20,7 @@ pub struct Cli {
     #[command(flatten)]
     pub global: GlobalArgs,
 
+    /// Parsed top-level subcommand, or `None` when rendering help.
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -117,11 +118,13 @@ pub enum Command {
     Tui,
     /// Inspect or change telemetry settings.
     Telemetry {
+        /// Parsed telemetry subcommand.
         #[command(subcommand)]
         command: TelemetryCommand,
     },
     /// Run the MCP server.
     Mcp {
+        /// Parsed MCP subcommand.
         #[command(subcommand)]
         command: McpCommand,
     },

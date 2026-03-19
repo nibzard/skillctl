@@ -2437,15 +2437,15 @@ fn remove_drops_current_install_state_but_history_remains_queryable() {
         .filter_map(|entry| entry["kind"].as_str())
         .collect();
     assert!(
-        history_kinds.iter().any(|kind| *kind == "install"),
+        history_kinds.contains(&"install"),
         "install history should remain queryable: {history_kinds:?}",
     );
     assert!(
-        history_kinds.iter().any(|kind| *kind == "overlay-created"),
+        history_kinds.contains(&"overlay-created"),
         "overlay history should remain queryable: {history_kinds:?}",
     );
     assert!(
-        history_kinds.iter().any(|kind| *kind == "cleanup"),
+        history_kinds.contains(&"cleanup"),
         "remove should append a cleanup event: {history_kinds:?}",
     );
 }

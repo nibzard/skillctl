@@ -19,3 +19,16 @@ At a high level, `skillctl` is intended to:
 - help humans and agents debug why a skill is missing, stale, or conflicting.
 
 The implementation target is Rust, with test-driven development as a core engineering requirement.
+
+## Quality Gates
+
+CI enforces the same local checks that keep the Rust codebase clean:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
+```
+
+The library crate also denies missing public API documentation and broken intra-doc links, so doc coverage regressions fail the docs gate instead of drifting silently.

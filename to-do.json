@@ -621,7 +621,7 @@
       "id": "T025",
       "title": "Add CI quality gates and documentation verification",
       "priority": 2,
-      "status": "todo",
+      "status": "done",
       "details": "Enforce the engineering discipline in the spec so warnings, formatting drift, missing docs, and broken tests are treated as defects.",
       "steps": [
         "Add CI jobs for `cargo fmt --check`, strict `clippy`, `cargo test`, and documentation verification.",
@@ -631,6 +631,17 @@
       "depends_on": [
         "T001",
         "T024"
+      ],
+      "updated_at": "2026-03-19T13:35:08Z",
+      "files": [
+        ".github/workflows/ci.yml",
+        "README.md",
+        "src/lib.rs",
+        "src/cli.rs",
+        "src/source.rs",
+        "src/planner.rs",
+        "src/doctor.rs",
+        "tests/cli.rs"
       ]
     },
     {

@@ -214,6 +214,7 @@ impl PreparedInstall {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+/// Structured record of one completed install.
 pub struct InstalledSkill {
     /// Stable manifest import identifier created for this install.
     pub id: String,
