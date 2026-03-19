@@ -4,6 +4,7 @@ use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use serde_yaml::Value as YamlValue;
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
@@ -721,6 +722,36 @@ fn install_updates_manifest_lockfile_store_state_and_projection_records() {
     assert_eq!(
         history_kinds,
         vec!["install".to_string(), "projection".to_string()]
+    );
+}
+
+#[test]
+fn install_rolls_back_when_the_transaction_fails_after_state_write() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_lockfile(MINIMAL_LOCKFILE);
+    workspace.write_skill_source("shared-skills", "release-notes");
+    initialize_runtime_state(&workspace);
+
+    let snapshot = workspace.snapshot_paths(&[
+        ".agents/skillctl.yaml",
+        ".agents/skillctl.lock",
+        "home/.skillctl/state.db",
+        "home/.skillctl/store/imports/release-notes",
+        ".claude/skills",
+    ]);
+
+    assert_transaction_rolled_back(
+        &workspace,
+        "install:after-state",
+        "1770000000",
+        &["--no-input", "--name", "release-notes", "install", "shared-skills"],
+        &snapshot,
     );
 }
 
@@ -2626,6 +2657,61 @@ fn pin_updates_manifest_lockfile_state_and_projection_metadata() {
 }
 
 #[test]
+fn pin_rolls_back_when_the_transaction_fails_after_state_write() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_skill_source("git-source", "release-notes");
+    workspace.init_git_repo("git-source");
+    let repo_url = workspace.git_repo_url("git-source");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770000000")
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            repo_url.as_str(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    workspace.write_skill_source_at(
+        "git-source",
+        ".agents/skills/release-notes",
+        "release-notes",
+        "Pinned release notes helper.",
+    );
+    workspace.commit_all("git-source", "pin release notes");
+    let pinned_commit = workspace.git_head("git-source");
+
+    let snapshot = workspace.snapshot_paths(&[
+        ".agents/skillctl.yaml",
+        ".agents/skillctl.lock",
+        "home/.skillctl/state.db",
+        "home/.skillctl/store/imports/release-notes",
+        ".claude/skills",
+    ]);
+
+    assert_transaction_rolled_back(
+        &workspace,
+        "pin:after-state",
+        "1770001234",
+        &["pin", "release-notes", pinned_commit.as_str()],
+        &snapshot,
+    );
+}
+
+#[test]
 fn rollback_reactivates_a_prior_effective_version_from_recorded_history() {
     let workspace = TestWorkspace::new();
     workspace.write_manifest(concat!(
@@ -2821,6 +2907,72 @@ fn rollback_reactivates_a_prior_effective_version_from_recorded_history() {
 }
 
 #[test]
+fn rollback_rolls_back_when_the_transaction_fails_after_state_write() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_skill_source("git-source", "release-notes");
+    workspace.init_git_repo("git-source");
+    let repo_url = workspace.git_repo_url("git-source");
+    let original_commit = workspace.git_head("git-source");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770000000")
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            repo_url.as_str(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    workspace.write_skill_source_at(
+        "git-source",
+        ".agents/skills/release-notes",
+        "release-notes",
+        "Pinned release notes helper.",
+    );
+    workspace.commit_all("git-source", "pin release notes");
+    let pinned_commit = workspace.git_head("git-source");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770001234")
+        .args(["pin", "release-notes", pinned_commit.as_str()])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let snapshot = workspace.snapshot_paths(&[
+        ".agents/skillctl.yaml",
+        ".agents/skillctl.lock",
+        "home/.skillctl/state.db",
+        "home/.skillctl/store/imports/release-notes",
+        ".claude/skills",
+    ]);
+
+    assert_transaction_rolled_back(
+        &workspace,
+        "rollback:after-state",
+        "1770002468",
+        &["rollback", "release-notes", original_commit.as_str()],
+        &snapshot,
+    );
+}
+
+#[test]
 fn fork_copies_the_effective_skill_into_local_ownership_and_detaches_updates() {
     let workspace = TestWorkspace::new();
     workspace.write_manifest(concat!(
@@ -2992,6 +3144,61 @@ fn fork_copies_the_effective_skill_into_local_ownership_and_detaches_updates() {
     assert_eq!(plan["outcome"], "detached");
     assert_eq!(plan["recommended_action"], "skip");
     assert_eq!(plan["modifications"][0]["kind"], "detached-fork");
+}
+
+#[test]
+fn fork_rolls_back_when_the_transaction_fails_after_state_write() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_skill_source("shared-skills", "release-notes");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770000000")
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770001234")
+        .args(["override", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let snapshot = workspace.snapshot_paths(&[
+        ".agents/skillctl.yaml",
+        ".agents/skillctl.lock",
+        ".agents/overlays/release-notes",
+        ".agents/skills/release-notes",
+        "home/.skillctl/state.db",
+        ".claude/skills",
+    ]);
+
+    assert_transaction_rolled_back(
+        &workspace,
+        "fork:after-state",
+        "1770002468",
+        &["fork", "release-notes"],
+        &snapshot,
+    );
 }
 
 #[test]
@@ -3394,6 +3601,100 @@ fn disable_and_enable_toggle_manifest_state_and_projections() {
 }
 
 #[test]
+fn disable_rolls_back_when_the_transaction_fails_after_state_write() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_skill_source("shared-skills", "release-notes");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770000000")
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let snapshot = workspace.snapshot_paths(&[
+        ".agents/skillctl.yaml",
+        "home/.skillctl/state.db",
+        ".claude/skills",
+    ]);
+
+    assert_transaction_rolled_back(
+        &workspace,
+        "disable:after-state",
+        "1770001234",
+        &["disable", "release-notes"],
+        &snapshot,
+    );
+}
+
+#[test]
+fn enable_rolls_back_when_the_transaction_fails_after_state_write() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_skill_source("shared-skills", "release-notes");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770000000")
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770001234")
+        .args(["disable", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let snapshot = workspace.snapshot_paths(&[
+        ".agents/skillctl.yaml",
+        "home/.skillctl/state.db",
+        ".claude/skills",
+    ]);
+
+    assert_transaction_rolled_back(
+        &workspace,
+        "enable:after-state",
+        "1770002468",
+        &["enable", "release-notes"],
+        &snapshot,
+    );
+}
+
+#[test]
 fn remove_drops_current_install_state_but_history_remains_queryable() {
     let workspace = TestWorkspace::new();
     workspace.write_manifest(concat!(
@@ -3545,6 +3846,61 @@ fn remove_drops_current_install_state_but_history_remains_queryable() {
 }
 
 #[test]
+fn remove_rolls_back_when_the_transaction_fails_after_state_write() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_skill_source("shared-skills", "release-notes");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770000000")
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770001234")
+        .args(["override", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let snapshot = workspace.snapshot_paths(&[
+        ".agents/skillctl.yaml",
+        ".agents/skillctl.lock",
+        ".agents/overlays/release-notes",
+        "home/.skillctl/state.db",
+        "home/.skillctl/store/imports/release-notes",
+        ".claude/skills",
+    ]);
+
+    assert_transaction_rolled_back(
+        &workspace,
+        "remove:after-state",
+        "1770002468",
+        &["remove", "release-notes"],
+        &snapshot,
+    );
+}
+
+#[test]
 fn clean_removes_generated_projections_and_unused_import_state_without_touching_canonical_skills() {
     let workspace = TestWorkspace::new();
     workspace.write_manifest(concat!(
@@ -3660,6 +4016,98 @@ fn clean_removes_generated_projections_and_unused_import_state_without_touching_
         })
         .expect("projection count query succeeds");
     assert_eq!(projection_count, 0);
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PathSnapshot {
+    Missing,
+    File(Vec<u8>),
+    Directory(BTreeMap<String, PathSnapshot>),
+    Symlink(PathBuf),
+}
+
+fn initialize_runtime_state(workspace: &TestWorkspace) {
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--json", "telemetry", "status"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+}
+
+fn assert_transaction_rolled_back(
+    workspace: &TestWorkspace,
+    failpoint: &str,
+    source_date_epoch: &str,
+    args: &[&str],
+    expected: &BTreeMap<String, PathSnapshot>,
+) {
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", source_date_epoch)
+        .env("SKILLCTL_FAILPOINT", failpoint)
+        .args(args)
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("injected lifecycle failure"));
+
+    let actual = workspace.snapshot_paths(
+        &expected
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(&actual, expected);
+}
+
+fn snapshot_path(path: &Path) -> PathSnapshot {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return PathSnapshot::Missing;
+        }
+        Err(error) => panic!("failed to inspect '{}': {error}", path.display()),
+    };
+
+    if metadata.file_type().is_symlink() {
+        return PathSnapshot::Symlink(
+            fs::read_link(path).unwrap_or_else(|error| {
+                panic!("failed to read symlink '{}': {error}", path.display())
+            }),
+        );
+    }
+
+    if metadata.is_file() {
+        return PathSnapshot::File(
+            fs::read(path)
+                .unwrap_or_else(|error| panic!("failed to read '{}': {error}", path.display())),
+        );
+    }
+
+    if metadata.is_dir() {
+        let mut children = BTreeMap::new();
+        let mut entries = fs::read_dir(path)
+            .unwrap_or_else(|error| {
+                panic!("failed to read directory '{}': {error}", path.display())
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|error| {
+                panic!("failed to read directory entry '{}': {error}", path.display())
+            });
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            children.insert(name, snapshot_path(&entry.path()));
+        }
+        return PathSnapshot::Directory(children);
+    }
+
+    panic!("unsupported filesystem entry '{}'", path.display());
 }
 
 struct TestWorkspace {
@@ -3780,6 +4228,18 @@ impl TestWorkspace {
                 .expect("lockfile exists"),
         )
         .expect("lockfile is valid yaml")
+    }
+
+    fn snapshot_paths(&self, relative_paths: &[&str]) -> BTreeMap<String, PathSnapshot> {
+        relative_paths
+            .iter()
+            .map(|relative_path| {
+                (
+                    (*relative_path).to_string(),
+                    snapshot_path(&self.path.join(relative_path)),
+                )
+            })
+            .collect()
     }
 
     fn git_repo_url(&self, relative_path: &str) -> String {

@@ -638,7 +638,7 @@
         "T016",
         "T020"
       ],
-      "updated_at": "2026-03-19T15:49:26Z",
+      "updated_at": "2026-03-19T15:50:18Z",
       "files": [
         "README.md",
         "src/cli.rs",
@@ -787,9 +787,10 @@
       ],
       "files": [
         "src/telemetry.rs",
-        "tests/cli.rs"
+        "tests/cli.rs",
+        "to-do.json"
       ],
-      "updated_at": "2026-03-19T16:03:12Z"
+      "updated_at": "2026-03-19T16:05:25Z"
     },
     {
       "id": "T029",
@@ -803,12 +804,12 @@
         "installer"
       ],
       "files": [
-        "scripts/install.sh",
         "README.md",
+        "scripts/install.sh",
         "tests/release.rs",
         "to-do.json"
       ],
-      "updated_at": "2026-03-19T16:07:51Z"
+      "updated_at": "2026-03-19T16:10:28Z"
     },
     {
       "id": "T030",
@@ -824,7 +825,54 @@
         "docs/troubleshooting.md",
         "to-do.json"
       ],
-      "updated_at": "2026-03-19T16:12:44Z",
+      "updated_at": "2026-03-19T16:14:56Z",
+      "blockers": []
+    },
+    {
+      "id": "T031",
+      "title": "Make lifecycle mutations transactional across manifest, lockfile, store, and projection updates",
+      "priority": 1,
+      "status": "doing",
+      "details": "install, pin, rollback, fork, remove, enable, and disable all persist part of their state before later copy, sync, cleanup, or state-store work completes. A later filesystem or materialization failure can leave .agents/skillctl.yaml, .agents/skillctl.lock, stored imports, runtime projections, and SQLite state disagreeing. Rework these flows so they commit atomically or roll back partial mutations, and add failure-path coverage.",
+      "steps": [
+        "Audit the lifecycle commands that currently write manifest or lockfile state before copy, sync, cleanup, or state-store updates.",
+        "Introduce a staging, transaction, or rollback strategy that keeps manifest, lockfile, stored imports, projections, and SQLite state consistent when any later step fails.",
+        "Add integration tests that inject mid-operation failures and prove the workspace and local state remain recoverable and in sync."
+      ],
+      "tags": [
+        "review-followup",
+        "reliability",
+        "state-management"
+      ],
+      "files": [
+        "src/source.rs",
+        "src/history.rs",
+        "src/overlay.rs",
+        "src/skill.rs",
+        "tests/cli.rs"
+      ],
+      "blockers": [],
+      "updated_at": "2026-03-19T16:22:05Z"
+    },
+    {
+      "id": "T032",
+      "title": "Fix the broken manual-dispatch path in the release workflow",
+      "priority": 2,
+      "status": "todo",
+      "details": "The release workflow advertises workflow_dispatch, but both jobs immediately fail unless GITHUB_REF_TYPE is tag and GITHUB_REF_NAME matches v*. Manual runs from the Actions UI execute on a selected branch or ref, so the current dispatch path is dead. Either remove the manual trigger or accept a release tag input and explicitly check out and validate that tag before publishing.",
+      "steps": [
+        "Decide whether manual releases are supported or whether tag pushes are the only valid entrypoint.",
+        "If manual dispatch remains supported, add workflow inputs for the release tag and check out that tagged ref explicitly in the build and publish jobs.",
+        "Add workflow or documentation coverage so operators do not trigger a guaranteed-failing manual release run."
+      ],
+      "tags": [
+        "review-followup",
+        "release",
+        "ops"
+      ],
+      "files": [
+        ".github/workflows/release.yml"
+      ],
       "blockers": []
     }
   ]

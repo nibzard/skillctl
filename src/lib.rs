@@ -12,6 +12,7 @@ pub mod cli;
 pub mod doctor;
 pub mod error;
 pub mod history;
+mod lifecycle;
 pub mod lockfile;
 pub mod manifest;
 pub mod materialize;

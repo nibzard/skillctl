@@ -23,6 +23,7 @@ use crate::{
     cli::Scope,
     error::AppError,
     history::HistoryLedger,
+    lifecycle,
     lockfile::{
         LockedHashes, LockedImport, LockedRevision, LockedSource, LockedTimestamps, LockfilePath,
         LockfileTimestamp, WorkspaceLockfile,
@@ -278,97 +279,109 @@ pub fn handle_install(
     let inspection = prepared.inspection();
     let selected = select_install_candidates(context, &inspection)?;
     let scope = select_install_scope(context)?;
+    lifecycle::run_transaction("install", |transaction| {
+        transaction.track_state_database()?;
+        transaction.track_path(context.working_directory.join(DEFAULT_MANIFEST_PATH))?;
+        transaction
+            .track_path(context.working_directory.join(crate::lockfile::DEFAULT_LOCKFILE_PATH))?;
 
-    ensure_workspace_bootstrap(&context.working_directory)?;
+        ensure_workspace_bootstrap(&context.working_directory)?;
 
-    let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
-    let mut lockfile = WorkspaceLockfile::load_from_workspace(&context.working_directory)?;
-
-    validate_install_selection(
-        &context.working_directory,
-        &manifest,
-        &inspection.source,
-        scope,
-        &selected,
-    )?;
-
-    let install_timestamp = current_timestamp();
-    let imports_root = imports_store_root()?;
-    let mut operations = Vec::with_capacity(selected.len());
-
-    for candidate in &selected {
-        let build_context = InstallBuildContext {
-            working_directory: &context.working_directory,
-            manifest: &manifest,
-            lockfile: &lockfile,
-            imports_root: &imports_root,
-            install_timestamp: &install_timestamp,
-        };
-        let operation = build_install_operation(
-            &prepared,
-            &inspection.source,
-            &inspection.revision,
-            scope,
-            candidate,
-            &build_context,
-        )?;
-        upsert_manifest_import(&mut manifest, operation.import.clone());
-        lockfile.imports.insert(
-            operation.installed.id.clone(),
-            operation.locked_import.clone(),
-        );
-        operations.push(operation);
-    }
-
-    write_manifest(&manifest)?;
-    lockfile.write_to_path()?;
-
-    for operation in &operations {
-        copy_source_tree(
-            &prepared.root,
-            Path::new(&operation.installed.stored_source_root),
-        )?;
-    }
-
-    let sync_report = materialize::sync_workspace(&install_context_for_scope(context, scope))?;
-    record_install_state(scope, &operations, &sync_report, &install_timestamp)?;
-
-    let installed: Vec<_> = operations
-        .iter()
-        .map(|operation| operation.installed.clone())
-        .collect();
-    let telemetry = telemetry::prepare_install_report(context, &inspection.source, &installed)?;
-    let mut summary = install_summary(&installed, &sync_report);
-    if let Some(notice) = telemetry.notice_message() {
-        summary.push('\n');
-        summary.push_str(notice);
-    }
-
-    let mut response = AppResponse::success("install")
-        .with_summary(summary)
-        .with_data(json!({
-            "source": inspection.source,
-            "revision": inspection.revision,
-            "candidates": inspection.candidates,
-            "selected": selected,
-            "installed": installed,
-            "projection": sync_report,
-            "telemetry": telemetry,
-        }));
-    for warning in &sync_report.warnings {
-        response = response.with_warning(warning.clone());
-    }
-    let mut warnings = BTreeSet::new();
-    for skill in &installed {
-        for warning in &skill.trust.warnings {
-            warnings.insert(warning.clone());
+        let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
+        let mut lockfile = WorkspaceLockfile::load_from_workspace(&context.working_directory)?;
+        let scoped_context = install_context_for_scope(context, scope);
+        for root in materialize::planned_physical_root_paths(&scoped_context, &manifest, scope)? {
+            transaction.track_path(root)?;
         }
-    }
-    for warning in warnings {
-        response = response.with_warning(warning);
-    }
 
-    Ok(response)
+        validate_install_selection(
+            &context.working_directory,
+            &manifest,
+            &inspection.source,
+            scope,
+            &selected,
+        )?;
+
+        let install_timestamp = current_timestamp();
+        let imports_root = imports_store_root()?;
+        let mut operations = Vec::with_capacity(selected.len());
+
+        for candidate in &selected {
+            let build_context = InstallBuildContext {
+                working_directory: &context.working_directory,
+                manifest: &manifest,
+                lockfile: &lockfile,
+                imports_root: &imports_root,
+                install_timestamp: &install_timestamp,
+            };
+            let operation = build_install_operation(
+                &prepared,
+                &inspection.source,
+                &inspection.revision,
+                scope,
+                candidate,
+                &build_context,
+            )?;
+            transaction.track_path(PathBuf::from(&operation.installed.stored_source_root))?;
+            upsert_manifest_import(&mut manifest, operation.import.clone());
+            lockfile.imports.insert(
+                operation.installed.id.clone(),
+                operation.locked_import.clone(),
+            );
+            operations.push(operation);
+        }
+
+        write_manifest(&manifest)?;
+        lockfile.write_to_path()?;
+
+        for operation in &operations {
+            copy_source_tree(
+                &prepared.root,
+                Path::new(&operation.installed.stored_source_root),
+            )?;
+        }
+
+        let sync_report = materialize::sync_workspace(&scoped_context)?;
+        record_install_state(scope, &operations, &sync_report, &install_timestamp)?;
+        transaction.checkpoint("after-state")?;
+
+        let installed: Vec<_> = operations
+            .iter()
+            .map(|operation| operation.installed.clone())
+            .collect();
+        let telemetry = telemetry::prepare_install_report(context, &inspection.source, &installed)?;
+        let mut summary = install_summary(&installed, &sync_report);
+        if let Some(notice) = telemetry.notice_message() {
+            summary.push('\n');
+            summary.push_str(notice);
+        }
+
+        let mut response = AppResponse::success("install")
+            .with_summary(summary)
+            .with_data(json!({
+                "source": inspection.source,
+                "revision": inspection.revision,
+                "candidates": inspection.candidates,
+                "selected": selected,
+                "installed": installed,
+                "projection": sync_report,
+                "telemetry": telemetry,
+            }));
+        for warning in &sync_report.warnings {
+            response = response.with_warning(warning.clone());
+        }
+        let mut warnings = BTreeSet::new();
+        for skill in &installed {
+            for warning in &skill.trust.warnings {
+                warnings.insert(warning.clone());
+            }
+        }
+        for warning in warnings {
+            response = response.with_warning(warning);
+        }
+
+        Ok(response)
+    })
 }
 
 fn prepare_install_source(

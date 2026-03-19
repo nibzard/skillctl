@@ -165,6 +165,31 @@ pub fn sync_workspace(context: &AppContext) -> Result<MaterializationReport, App
     })
 }
 
+pub(crate) fn planned_physical_root_paths(
+    context: &AppContext,
+    manifest: &WorkspaceManifest,
+    scope: TargetScope,
+) -> Result<Vec<PathBuf>, AppError> {
+    if manifest.targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let registry = AdapterRegistry::new();
+    let targets = selected_targets(context, manifest)?;
+    let plan = planner::plan_target_roots(
+        &registry,
+        scope,
+        manifest.projection.policy,
+        &targets,
+        &manifest.adapters,
+    )?;
+
+    plan.physical_roots
+        .into_iter()
+        .map(|root| resolve_runtime_root_path(context, &root.path))
+        .collect()
+}
+
 /// Handle `skillctl sync`.
 pub fn handle_sync(context: &AppContext, _request: SyncRequest) -> Result<AppResponse, AppError> {
     let report = sync_workspace(context)?;
