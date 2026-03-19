@@ -53,6 +53,31 @@ pub enum AppError {
         /// Invalid directory path.
         path: PathBuf,
     },
+    /// A filesystem path exists but is not the expected kind.
+    #[error("path '{path}' exists but is not a {expected}")]
+    PathConflict {
+        /// Invalid path.
+        path: PathBuf,
+        /// Expected filesystem object kind.
+        expected: &'static str,
+    },
+    /// A filesystem operation failed.
+    #[error("failed to {action} '{path}': {source}")]
+    FilesystemOperation {
+        /// What the operation attempted to do.
+        action: &'static str,
+        /// Path involved in the failure.
+        path: PathBuf,
+        /// Source I/O error.
+        #[source]
+        source: io::Error,
+    },
+    /// A `.git` indirection file had an unsupported format.
+    #[error("git metadata file '{path}' is not in the expected 'gitdir: <path>' format")]
+    InvalidGitDirFile {
+        /// Path to the invalid git metadata file.
+        path: PathBuf,
+    },
     /// The command has no implementation yet.
     #[error("command '{command}' is not implemented yet")]
     NotYetImplemented {
@@ -81,6 +106,9 @@ impl AppError {
             Self::CurrentWorkingDirectory { .. }
             | Self::WorkingDirectoryUnavailable { .. }
             | Self::WorkingDirectoryNotDirectory { .. }
+            | Self::PathConflict { .. }
+            | Self::FilesystemOperation { .. }
+            | Self::InvalidGitDirFile { .. }
             | Self::NotYetImplemented { .. }
             | Self::JsonRender { .. } => ExitStatus::OperationalError,
             Self::InputRequired { .. } => ExitStatus::InputRequired,

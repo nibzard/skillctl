@@ -20,31 +20,32 @@
         "Add a dispatcher that maps parsed clap commands to typed handlers instead of stopping at help output.",
         "Define shared error, response, and application-context types so later commands can reuse one execution model."
       ],
-      "updated_at": "2026-03-19T09:01:13Z",
+      "updated_at": "2026-03-19T09:01:58Z",
       "files": [
-        "Cargo.toml",
         "Cargo.lock",
-        "src/main.rs",
-        "src/lib.rs",
-        "src/cli.rs",
+        "Cargo.toml",
+        "src/adapter.rs",
         "src/app.rs",
+        "src/cli.rs",
+        "src/doctor.rs",
         "src/error.rs",
+        "src/history.rs",
+        "src/lib.rs",
+        "src/lockfile.rs",
+        "src/main.rs",
+        "src/manifest.rs",
+        "src/materialize.rs",
+        "src/mcp.rs",
+        "src/overlay.rs",
+        "src/planner.rs",
         "src/response.rs",
         "src/runtime.rs",
-        "src/manifest.rs",
-        "src/lockfile.rs",
-        "src/source.rs",
         "src/skill.rs",
-        "src/overlay.rs",
-        "src/adapter.rs",
-        "src/planner.rs",
-        "src/materialize.rs",
-        "src/history.rs",
+        "src/source.rs",
         "src/telemetry.rs",
-        "src/doctor.rs",
-        "src/mcp.rs",
         "src/tui.rs",
-        "tests/cli.rs"
+        "tests/cli.rs",
+        "to-do.json"
       ],
       "blockers": []
     },
@@ -52,7 +53,7 @@
       "id": "T002",
       "title": "Implement `skillctl init` workspace bootstrap and repo integration",
       "priority": 1,
-      "status": "todo",
+      "status": "done",
       "details": "Create the manifest-free default workspace layout under `.agents/`, including optional local Git exclusions, without mutating unrelated repository files.",
       "steps": [
         "Create `.agents/skills/`, `.agents/overlays/`, and a minimal `.agents/skillctl.yaml` with sensible defaults.",
@@ -61,7 +62,15 @@
       ],
       "depends_on": [
         "T001"
-      ]
+      ],
+      "updated_at": "2026-03-19T09:10:33Z",
+      "files": [
+        "src/error.rs",
+        "src/manifest.rs",
+        "tests/cli.rs",
+        "to-do.json"
+      ],
+      "blockers": []
     },
     {
       "id": "T003",
