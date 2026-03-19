@@ -337,7 +337,7 @@
       "id": "T013",
       "title": "Implement `skillctl update` planning, upstream checks, and local modification handling",
       "priority": 2,
-      "status": "todo",
+      "status": "done",
       "details": "Compare pinned installs with upstream revisions, detect overlays and unmanaged edits, and propose safe actions rather than overwriting state blindly.",
       "steps": [
         "Check upstream sources and compare the installed pinned commit with the latest available revision.",
@@ -348,7 +348,14 @@
         "T010",
         "T011",
         "T012"
-      ]
+      ],
+      "updated_at": "2026-03-19T12:07:48Z",
+      "files": [
+        "src/planner.rs",
+        "tests/cli.rs",
+        "to-do.json"
+      ],
+      "blockers": []
     },
     {
       "id": "T014",

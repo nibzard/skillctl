@@ -1,15 +1,31 @@
 //! Planning domain types and update entry points.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env, fs, io,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use serde::Serialize;
+use serde_json::json;
 
 use crate::{
     adapter::{AdapterRegistry, TargetRuntime, TargetScope},
     app::AppContext,
     error::AppError,
-    manifest::{AdapterOverride, AdapterRoot, ProjectionPolicy},
+    history::HistoryLedger,
+    lockfile::WorkspaceLockfile,
+    manifest::{AdapterOverride, AdapterRoot, ProjectionPolicy, WorkspaceManifest},
+    materialize::PROJECTION_METADATA_FILE,
+    overlay::{NO_OVERLAY_HASH, hash_overlay_root},
+    resolver::{self, ResolveWorkspaceRequest, ResolvedSkillCandidate, SkillScope},
     response::AppResponse,
+    source::{SourceKind, current_timestamp, imports_store_root},
+    state::{
+        InstallRecord, LocalModificationKind, LocalModificationRecord, LocalStateStore,
+        ManagedScope, ManagedSkillRef, ProjectionRecord, UpdateCheckOutcome, UpdateCheckRecord,
+    },
 };
 
 /// Reusable projection-root plan shared by sync, doctor, explain, and JSON output.
@@ -84,10 +100,723 @@ impl UpdateRequest {
 
 /// Handle `skillctl update`.
 pub fn handle_update(
-    _context: &AppContext,
-    _request: UpdateRequest,
+    context: &AppContext,
+    request: UpdateRequest,
 ) -> Result<AppResponse, AppError> {
-    Err(AppError::NotYetImplemented { command: "update" })
+    let manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
+    let lockfile = WorkspaceLockfile::load_from_workspace(&context.working_directory)?;
+    let mut store = LocalStateStore::open_default()?;
+    let selected_skills = select_managed_skills(&store, context, &request)?;
+    if selected_skills.is_empty() {
+        return Ok(AppResponse::success("update")
+            .with_summary("No managed skills are installed.")
+            .with_data(json!({ "plans": [] })));
+    }
+
+    let candidate_map = imported_candidate_map(context, &manifest, &lockfile)?;
+    let checked_at = current_timestamp();
+    let mut plans = Vec::with_capacity(selected_skills.len());
+
+    for managed_skill in selected_skills {
+        let snapshot = store.skill_snapshot(&managed_skill)?;
+        let prepared = prepare_update_plan(
+            context,
+            &snapshot
+                .install
+                .ok_or_else(|| AppError::ResolutionValidation {
+                    message: format!(
+                        "skill '{}' does not have an installed state record",
+                        managed_skill.skill_id
+                    ),
+                })?,
+            &snapshot.projections,
+            candidate_map.get(&(managed_skill.scope, managed_skill.skill_id.clone())),
+            &checked_at,
+        )?;
+
+        {
+            let mut ledger = HistoryLedger::new(&mut store);
+            ledger.record_update_check(&prepared.update_check)?;
+            for modification in &prepared.local_modification_records {
+                ledger.record_local_modification(modification)?;
+            }
+        }
+
+        plans.push(prepared.plan);
+    }
+
+    let summary = update_summary(&plans);
+    Ok(AppResponse::success("update")
+        .with_summary(summary)
+        .with_data(json!({ "plans": plans })))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UpdateAction {
+    /// Safe to apply the upstream update.
+    Apply,
+    /// Redirect the user into the managed overlay workflow.
+    CreateOverlay,
+    /// Detach into local canonical ownership.
+    Detach,
+    /// Publish the customized variant to a dedicated repository.
+    PublishVariant,
+    /// Keep the current pinned version and defer action.
+    Skip,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct UpdateSourceSummary {
+    /// Installed source category.
+    #[serde(rename = "type")]
+    pub kind: SourceKind,
+    /// Normalized source URL or file URL.
+    pub url: String,
+    /// Selected relative subpath inside the source.
+    pub subpath: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PlannedModification {
+    /// Classified local change kind.
+    pub kind: LocalModificationKind,
+    /// Whether the change is represented by a managed workflow.
+    pub managed: bool,
+    /// Path involved in the drift, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Deterministic explanatory detail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SkillUpdatePlan {
+    /// Managed skill identifier.
+    pub skill: String,
+    /// Owning scope for the skill.
+    pub scope: ManagedScope,
+    /// Timestamp shared by the update run.
+    pub checked_at: String,
+    /// Installed source summary.
+    pub source: UpdateSourceSummary,
+    /// Currently pinned revision evaluated by the check.
+    pub pinned_revision: String,
+    /// Latest observed upstream revision, when one exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_revision: Option<String>,
+    /// Planner-relevant update outcome.
+    pub outcome: UpdateCheckOutcome,
+    /// Whether a managed overlay existed during the check.
+    pub overlay_detected: bool,
+    /// Whether unmanaged local changes were detected.
+    pub local_modification_detected: bool,
+    /// Next action the user or agent should take.
+    pub recommended_action: UpdateAction,
+    /// Deterministic set of valid next actions.
+    pub available_actions: Vec<UpdateAction>,
+    /// Structured local-change details discovered during the check.
+    pub modifications: Vec<PlannedModification>,
+    /// Additional explanatory notes for humans and agents.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+struct PreparedUpdatePlan {
+    plan: SkillUpdatePlan,
+    update_check: UpdateCheckRecord,
+    local_modification_records: Vec<LocalModificationRecord>,
+}
+
+#[derive(Clone)]
+struct OverlayState {
+    path: String,
+    changed_since_recorded_state: bool,
+}
+
+fn prepare_update_plan(
+    context: &AppContext,
+    install: &InstallRecord,
+    projections: &[ProjectionRecord],
+    candidate: Option<&ResolvedSkillCandidate>,
+    checked_at: &str,
+) -> Result<PreparedUpdatePlan, AppError> {
+    let overlay_state = overlay_state(context, install)?;
+    let mut modifications = Vec::new();
+    let mut local_modification_records = Vec::new();
+    let mut notes = Vec::new();
+
+    if let Some(overlay_state) = &overlay_state {
+        let details = if overlay_state.changed_since_recorded_state {
+            "managed overlay changed since the last recorded install state".to_string()
+        } else {
+            "managed overlay will be preserved during updates".to_string()
+        };
+        modifications.push(PlannedModification {
+            kind: LocalModificationKind::Overlay,
+            managed: true,
+            path: Some(overlay_state.path.clone()),
+            details: Some(details.clone()),
+        });
+        notes.push(details);
+    }
+
+    let pinned_revision = install.resolved_revision.clone();
+    let overlay_detected = overlay_state.is_some();
+    let latest_revision;
+    let outcome;
+    let recommended_action;
+    let available_actions;
+
+    if install.detached || install.forked {
+        latest_revision = install.upstream_revision.clone();
+        outcome = UpdateCheckOutcome::Detached;
+        recommended_action = UpdateAction::Skip;
+        available_actions = vec![UpdateAction::Skip];
+        let detail = if install.forked {
+            "skill is forked into local ownership and no longer tracks upstream updates"
+        } else {
+            "skill is detached from upstream lifecycle management"
+        };
+        notes.push(detail.to_string());
+        local_modification_records.push(LocalModificationRecord {
+            id: None,
+            skill: install.skill.clone(),
+            detected_at: checked_at.to_string(),
+            kind: LocalModificationKind::DetachedFork,
+            path: None,
+            details: Some(detail.to_string()),
+        });
+        modifications.push(PlannedModification {
+            kind: LocalModificationKind::DetachedFork,
+            managed: false,
+            path: None,
+            details: Some(detail.to_string()),
+        });
+    } else {
+        match install.source_kind {
+            SourceKind::LocalPath | SourceKind::Archive => {
+                latest_revision = None;
+                outcome = UpdateCheckOutcome::LocalSource;
+                recommended_action = UpdateAction::Skip;
+                available_actions = vec![UpdateAction::Skip];
+                notes.push("local sources do not support upstream update checks".to_string());
+            }
+            SourceKind::Git => {
+                let upstream_result = latest_git_revision(&install.source_url);
+                match upstream_result {
+                    Ok(upstream_revision) => {
+                        latest_revision = Some(upstream_revision.clone());
+                        if overlay_state
+                            .as_ref()
+                            .is_some_and(|state| state.changed_since_recorded_state)
+                        {
+                            notes.push(
+                                "projection copies may be stale because the managed overlay changed"
+                                    .to_string(),
+                            );
+                        } else {
+                            let projection_modifications = detect_projected_copy_modifications(
+                                context,
+                                install,
+                                projections,
+                                candidate,
+                            )?;
+                            for modification in projection_modifications {
+                                local_modification_records.push(LocalModificationRecord {
+                                    id: None,
+                                    skill: install.skill.clone(),
+                                    detected_at: checked_at.to_string(),
+                                    kind: modification.kind,
+                                    path: modification.path.clone(),
+                                    details: modification.details.clone(),
+                                });
+                                modifications.push(modification);
+                            }
+                        }
+
+                        let update_available = upstream_revision != pinned_revision;
+                        let local_modification_detected = modifications
+                            .iter()
+                            .any(|modification| !modification.managed);
+
+                        if update_available && local_modification_detected {
+                            outcome = UpdateCheckOutcome::Blocked;
+                            recommended_action = UpdateAction::CreateOverlay;
+                            available_actions = vec![
+                                UpdateAction::CreateOverlay,
+                                UpdateAction::Detach,
+                                UpdateAction::PublishVariant,
+                                UpdateAction::Skip,
+                            ];
+                            notes.push(format!(
+                                "unmanaged projected-copy edits are blocking an update from {} to {}",
+                                pinned_revision, upstream_revision
+                            ));
+                        } else if update_available {
+                            outcome = UpdateCheckOutcome::UpdateAvailable;
+                            recommended_action = UpdateAction::Apply;
+                            available_actions = vec![UpdateAction::Apply, UpdateAction::Skip];
+                            notes.push(format!(
+                                "upstream revision {} is newer than the pinned revision {}",
+                                upstream_revision, pinned_revision
+                            ));
+                        } else {
+                            outcome = UpdateCheckOutcome::UpToDate;
+                            if local_modification_detected {
+                                recommended_action = UpdateAction::CreateOverlay;
+                                available_actions = vec![
+                                    UpdateAction::CreateOverlay,
+                                    UpdateAction::Detach,
+                                    UpdateAction::PublishVariant,
+                                    UpdateAction::Skip,
+                                ];
+                                notes.push(
+                                    "no upstream update is available, but unmanaged projected-copy edits were detected"
+                                        .to_string(),
+                                );
+                            } else {
+                                recommended_action = UpdateAction::Skip;
+                                available_actions = vec![UpdateAction::Skip];
+                                notes.push("pinned revision already matches upstream".to_string());
+                            }
+                        }
+                    }
+                    Err(message) => {
+                        latest_revision = None;
+                        outcome = UpdateCheckOutcome::Failed;
+                        recommended_action = UpdateAction::Skip;
+                        available_actions = vec![UpdateAction::Skip];
+                        notes.push(message);
+                    }
+                }
+            }
+        }
+    }
+
+    let local_modification_detected = modifications
+        .iter()
+        .any(|modification| !modification.managed);
+    let notes = deduplicate_notes(notes);
+    let note_text = if notes.is_empty() {
+        None
+    } else {
+        Some(notes.join(" "))
+    };
+    let update_check = UpdateCheckRecord {
+        id: None,
+        skill: install.skill.clone(),
+        checked_at: checked_at.to_string(),
+        pinned_revision: pinned_revision.clone(),
+        latest_revision: latest_revision.clone(),
+        outcome,
+        overlay_detected,
+        local_modification_detected,
+        notes: note_text,
+    };
+
+    Ok(PreparedUpdatePlan {
+        plan: SkillUpdatePlan {
+            skill: install.skill.skill_id.clone(),
+            scope: install.skill.scope,
+            checked_at: checked_at.to_string(),
+            source: UpdateSourceSummary {
+                kind: install.source_kind,
+                url: install.source_url.clone(),
+                subpath: install.source_subpath.clone(),
+            },
+            pinned_revision,
+            latest_revision,
+            outcome,
+            overlay_detected,
+            local_modification_detected,
+            recommended_action,
+            available_actions,
+            modifications,
+            notes,
+        },
+        update_check,
+        local_modification_records,
+    })
+}
+
+fn select_managed_skills(
+    store: &LocalStateStore,
+    context: &AppContext,
+    request: &UpdateRequest,
+) -> Result<Vec<ManagedSkillRef>, AppError> {
+    let requested_skill = match (&request.skill, &context.selector.skill_name) {
+        (Some(positional), Some(global)) if positional != global => {
+            return Err(AppError::PlannerValidation {
+                message: format!(
+                    "conflicting skill selectors '{}'(argument) and '{}'(--name)",
+                    positional, global
+                ),
+            });
+        }
+        (Some(positional), _) => Some(positional.clone()),
+        (None, Some(global)) => Some(global.clone()),
+        (None, None) => None,
+    };
+    let requested_scope = context.selector.scope.map(managed_scope);
+
+    let mut installs = store.list_install_records()?;
+    installs.retain(|record| requested_scope.is_none_or(|scope| record.skill.scope == scope));
+
+    if let Some(skill_id) = requested_skill {
+        let matches: Vec<_> = installs
+            .into_iter()
+            .filter(|record| record.skill.skill_id == skill_id)
+            .map(|record| record.skill)
+            .collect();
+        return match matches.len() {
+            0 => Err(AppError::ResolutionValidation {
+                message: format!("skill '{}' is not installed", skill_id),
+            }),
+            1 => Ok(matches),
+            _ => Err(AppError::ResolutionValidation {
+                message: format!(
+                    "skill '{}' exists in multiple scopes; re-run with --scope",
+                    skill_id
+                ),
+            }),
+        };
+    }
+
+    Ok(installs.into_iter().map(|record| record.skill).collect())
+}
+
+fn imported_candidate_map(
+    context: &AppContext,
+    manifest: &WorkspaceManifest,
+    lockfile: &WorkspaceLockfile,
+) -> Result<BTreeMap<(ManagedScope, String), ResolvedSkillCandidate>, AppError> {
+    let request = ResolveWorkspaceRequest::new(
+        &context.working_directory,
+        imports_store_root()?,
+        manifest.clone(),
+        lockfile.clone(),
+    );
+    let graph = resolver::build_effective_skill_graph(&request)?;
+    let mut candidates = BTreeMap::new();
+
+    for candidate in graph.candidates {
+        let Some(import) = candidate.import.as_ref() else {
+            continue;
+        };
+        let scope = managed_scope_from_skill_scope(import.scope);
+        candidates.insert((scope, import.id.clone()), candidate);
+    }
+
+    Ok(candidates)
+}
+
+fn overlay_state(
+    context: &AppContext,
+    install: &InstallRecord,
+) -> Result<Option<OverlayState>, AppError> {
+    let overlay_root = context
+        .working_directory
+        .join(".agents/overlays")
+        .join(&install.skill.skill_id);
+    let current_hash = hash_overlay_root(&overlay_root)?;
+    if current_hash == NO_OVERLAY_HASH && install.overlay_hash == NO_OVERLAY_HASH {
+        return Ok(None);
+    }
+
+    Ok(Some(OverlayState {
+        path: display_path(context, &overlay_root),
+        changed_since_recorded_state: current_hash != install.overlay_hash,
+    }))
+}
+
+fn latest_git_revision(source_url: &str) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["ls-remote", source_url, "HEAD"])
+        .output()
+        .map_err(|source| format!("failed to run git ls-remote for '{source_url}': {source}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            "git ls-remote returned a non-zero exit status".to_string()
+        } else {
+            stderr
+        };
+        return Err(format!(
+            "failed to check upstream revision for '{source_url}': {detail}"
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .split_whitespace()
+        .next()
+        .filter(|revision| !revision.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("upstream revision lookup for '{source_url}' returned no HEAD"))
+}
+
+fn detect_projected_copy_modifications(
+    context: &AppContext,
+    install: &InstallRecord,
+    projections: &[ProjectionRecord],
+    candidate: Option<&ResolvedSkillCandidate>,
+) -> Result<Vec<PlannedModification>, AppError> {
+    let Some(candidate) = candidate else {
+        return Ok(Vec::new());
+    };
+
+    let mut checked_roots = BTreeSet::new();
+    let mut modifications = Vec::new();
+
+    for projection in projections {
+        if projection.effective_version_hash != install.effective_version_hash {
+            continue;
+        }
+
+        let projection_root = resolve_runtime_root_path(context, &projection.physical_root)?
+            .join(&projection.projected_path);
+        if !checked_roots.insert(projection_root.clone()) {
+            continue;
+        }
+
+        if let Some(path) = first_projection_difference(context, &projection_root, candidate)? {
+            modifications.push(PlannedModification {
+                kind: LocalModificationKind::ProjectedCopy,
+                managed: false,
+                path: Some(path.clone()),
+                details: Some(
+                    "projected runtime copy differs from the recorded effective skill".to_string(),
+                ),
+            });
+        }
+    }
+
+    Ok(modifications)
+}
+
+fn first_projection_difference(
+    context: &AppContext,
+    projection_root: &Path,
+    candidate: &ResolvedSkillCandidate,
+) -> Result<Option<String>, AppError> {
+    let mut expected = BTreeMap::new();
+    for file in &candidate.files {
+        if file.relative_path == PathBuf::from(PROJECTION_METADATA_FILE) {
+            continue;
+        }
+        expected.insert(file.relative_path.clone(), file.source_path.clone());
+    }
+
+    let metadata = match fs::metadata(projection_root) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return Ok(Some(display_path(context, projection_root)));
+        }
+        Err(source) => {
+            return Err(AppError::FilesystemOperation {
+                action: "inspect projected skill directory",
+                path: projection_root.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if !metadata.is_dir() {
+        return Ok(Some(display_path(context, projection_root)));
+    }
+
+    let mut actual = Vec::new();
+    collect_projection_files(projection_root, projection_root, &mut actual)?;
+    actual.sort();
+
+    for relative_path in &actual {
+        if relative_path == Path::new(PROJECTION_METADATA_FILE) {
+            continue;
+        }
+
+        let actual_path = projection_root.join(relative_path);
+        let Some(expected_path) = expected.remove(relative_path) else {
+            return Ok(Some(display_path(context, &actual_path)));
+        };
+
+        if !file_contents_equal(&actual_path, &expected_path)? {
+            return Ok(Some(display_path(context, &actual_path)));
+        }
+    }
+
+    if let Some((relative_path, _)) = expected.into_iter().next() {
+        return Ok(Some(display_path(
+            context,
+            &projection_root.join(relative_path),
+        )));
+    }
+
+    Ok(None)
+}
+
+fn collect_projection_files(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), AppError> {
+    let mut entries = fs::read_dir(current)
+        .map_err(|source| AppError::FilesystemOperation {
+            action: "read projected skill directory",
+            path: current.to_path_buf(),
+            source,
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| AppError::FilesystemOperation {
+            action: "read projected skill entry",
+            path: current.to_path_buf(),
+            source,
+        })?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let path = entry.path();
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|source| AppError::FilesystemOperation {
+                action: "inspect projected skill path",
+                path: path.clone(),
+                source,
+            })?;
+
+        if metadata.is_dir() {
+            collect_projection_files(root, &path, files)?;
+            continue;
+        }
+
+        if !metadata.is_file() {
+            files.push(
+                path.strip_prefix(root)
+                    .expect("projection entry remains under the root")
+                    .to_path_buf(),
+            );
+            continue;
+        }
+
+        files.push(
+            path.strip_prefix(root)
+                .expect("projection entry remains under the root")
+                .to_path_buf(),
+        );
+    }
+
+    Ok(())
+}
+
+fn file_contents_equal(left: &Path, right: &Path) -> Result<bool, AppError> {
+    let left_contents = fs::read(left).map_err(|source| AppError::FilesystemOperation {
+        action: "read projected file",
+        path: left.to_path_buf(),
+        source,
+    })?;
+    let right_contents = fs::read(right).map_err(|source| AppError::FilesystemOperation {
+        action: "read effective source file",
+        path: right.to_path_buf(),
+        source,
+    })?;
+    Ok(left_contents == right_contents)
+}
+
+fn resolve_runtime_root_path(context: &AppContext, root: &str) -> Result<PathBuf, AppError> {
+    if let Some(suffix) = root.strip_prefix("~/") {
+        return Ok(home_directory()?.join(suffix));
+    }
+    if root == "~" {
+        return Ok(home_directory()?);
+    }
+
+    let path = PathBuf::from(root);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(context.working_directory.join(path))
+    }
+}
+
+fn home_directory() -> Result<PathBuf, AppError> {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .ok_or(AppError::HomeDirectoryUnavailable)
+}
+
+fn display_path(context: &AppContext, path: &Path) -> String {
+    path.strip_prefix(&context.working_directory)
+        .map(|relative| relative.display().to_string())
+        .unwrap_or_else(|_| path.display().to_string())
+}
+
+fn deduplicate_notes(notes: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut deduplicated = Vec::new();
+    for note in notes {
+        if seen.insert(note.clone()) {
+            deduplicated.push(note);
+        }
+    }
+    deduplicated
+}
+
+fn managed_scope(scope: crate::cli::Scope) -> ManagedScope {
+    match scope {
+        crate::cli::Scope::Workspace => ManagedScope::Workspace,
+        crate::cli::Scope::User => ManagedScope::User,
+    }
+}
+
+fn managed_scope_from_skill_scope(scope: SkillScope) -> ManagedScope {
+    match scope {
+        SkillScope::Workspace => ManagedScope::Workspace,
+        SkillScope::User => ManagedScope::User,
+    }
+}
+
+fn update_summary(plans: &[SkillUpdatePlan]) -> String {
+    let update_available = plans
+        .iter()
+        .filter(|plan| plan.outcome == UpdateCheckOutcome::UpdateAvailable)
+        .count();
+    let blocked = plans
+        .iter()
+        .filter(|plan| plan.outcome == UpdateCheckOutcome::Blocked)
+        .count();
+    let up_to_date = plans
+        .iter()
+        .filter(|plan| plan.outcome == UpdateCheckOutcome::UpToDate)
+        .count();
+    let detached = plans
+        .iter()
+        .filter(|plan| plan.outcome == UpdateCheckOutcome::Detached)
+        .count();
+    let local = plans
+        .iter()
+        .filter(|plan| plan.outcome == UpdateCheckOutcome::LocalSource)
+        .count();
+    let failed = plans
+        .iter()
+        .filter(|plan| plan.outcome == UpdateCheckOutcome::Failed)
+        .count();
+
+    format!(
+        "Checked {} managed skill{}. {} update available, {} blocked, {} up to date, {} detached, {} local source, {} failed.",
+        plans.len(),
+        plural_suffix(plans.len()),
+        update_available,
+        blocked,
+        up_to_date,
+        detached,
+        local,
+        failed,
+    )
+}
+
+fn plural_suffix(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
 }
 
 /// Compute a deterministic projection-root plan for the selected runtimes.

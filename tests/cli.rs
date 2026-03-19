@@ -6,6 +6,7 @@ use serde_yaml::Value as YamlValue;
 use std::{
     fs,
     path::{Path, PathBuf},
+    process::Command as ProcessCommand,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -911,6 +912,281 @@ fn override_is_idempotent_and_does_not_clobber_existing_overlay_edits() {
     );
 }
 
+#[test]
+fn update_checks_git_upstream_and_records_a_safe_apply_plan() {
+    let workspace = TestWorkspace::new();
+    workspace.write_skill_source("git-source", "release-notes");
+    workspace.init_git_repo("git-source");
+    let repo_url = workspace.git_repo_url("git-source");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            repo_url.as_str(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    workspace.write_skill_source_at(
+        "git-source",
+        ".agents/skills/release-notes",
+        "release-notes",
+        "Updated upstream release notes helper.",
+    );
+    workspace.commit_all("git-source", "update release notes");
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--json", "update", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let output = assert.get_output();
+    let body: Value = serde_json::from_slice(&output.stdout).expect("stdout is valid json");
+    let plan = &body["data"]["plans"][0];
+
+    assert_eq!(body["command"], "update");
+    assert_eq!(body["ok"], true);
+    assert_eq!(plan["skill"], "release-notes");
+    assert_eq!(plan["scope"], "workspace");
+    assert_eq!(plan["outcome"], "update-available");
+    assert_eq!(plan["recommended_action"], "apply");
+    assert_eq!(plan["overlay_detected"], false);
+    assert_eq!(plan["local_modification_detected"], false);
+    assert_eq!(plan["modifications"], json!([]));
+    assert_ne!(
+        plan["pinned_revision"]
+            .as_str()
+            .expect("pinned revision exists"),
+        plan["latest_revision"]
+            .as_str()
+            .expect("latest revision exists"),
+    );
+
+    let connection = Connection::open(workspace.home_path().join(".skillctl/state.db"))
+        .expect("state database opens");
+    let update_row: (String, String, i64, i64) = connection
+        .query_row(
+            "SELECT outcome, latest_revision, overlay_detected, local_modification_detected \
+             FROM update_checks WHERE skill_id = ?1 ORDER BY checked_at DESC, id DESC LIMIT 1",
+            params!["release-notes"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("update check exists");
+    assert_eq!(update_row.0, "update-available");
+    assert_eq!(update_row.2, 0);
+    assert_eq!(update_row.3, 0);
+    assert_eq!(
+        update_row.1,
+        plan["latest_revision"]
+            .as_str()
+            .expect("latest revision exists"),
+    );
+
+    let history_kinds: Vec<String> = connection
+        .prepare(
+            "SELECT kind FROM history_events WHERE skill_id = ?1 ORDER BY occurred_at ASC, id ASC",
+        )
+        .expect("statement prepares")
+        .query_map(params!["release-notes"], |row| row.get(0))
+        .expect("history query succeeds")
+        .collect::<Result<_, _>>()
+        .expect("history rows decode");
+    assert_eq!(
+        history_kinds.last().map(String::as_str),
+        Some("update-check")
+    );
+}
+
+#[test]
+fn update_treats_managed_overlays_as_safe_and_does_not_flag_stale_projections() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_skill_source("git-source", "release-notes");
+    workspace.init_git_repo("git-source");
+    let repo_url = workspace.git_repo_url("git-source");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            repo_url.as_str(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["override", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    workspace.write_skill_source_at(
+        "git-source",
+        ".agents/skills/release-notes",
+        "release-notes",
+        "Updated upstream release notes helper.",
+    );
+    workspace.commit_all("git-source", "update release notes");
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--json", "update", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let output = assert.get_output();
+    let body: Value = serde_json::from_slice(&output.stdout).expect("stdout is valid json");
+    let plan = &body["data"]["plans"][0];
+
+    assert_eq!(plan["outcome"], "update-available");
+    assert_eq!(plan["recommended_action"], "apply");
+    assert_eq!(plan["overlay_detected"], true);
+    assert_eq!(plan["local_modification_detected"], false);
+    assert_eq!(plan["modifications"][0]["kind"], "overlay");
+    assert_eq!(plan["modifications"][0]["managed"], true);
+
+    let connection = Connection::open(workspace.home_path().join(".skillctl/state.db"))
+        .expect("state database opens");
+    let direct_modification_events: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM history_events WHERE skill_id = ?1 AND kind = ?2",
+            params!["release-notes", "direct-modification-detected"],
+            |row| row.get(0),
+        )
+        .expect("history query succeeds");
+    assert_eq!(direct_modification_events, 0);
+}
+
+#[test]
+fn update_blocks_when_a_projected_copy_was_edited_directly() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_skill_source("git-source", "release-notes");
+    workspace.init_git_repo("git-source");
+    let repo_url = workspace.git_repo_url("git-source");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            repo_url.as_str(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    fs::write(
+        workspace
+            .path()
+            .join(".claude/skills/release-notes/SKILL.md"),
+        concat!(
+            "---\n",
+            "name: release-notes\n",
+            "description: Directly edited runtime copy.\n",
+            "---\n",
+            "\n",
+            "# release-notes\n"
+        ),
+    )
+    .expect("projected copy edited");
+
+    workspace.write_skill_source_at(
+        "git-source",
+        ".agents/skills/release-notes",
+        "release-notes",
+        "Updated upstream release notes helper.",
+    );
+    workspace.commit_all("git-source", "update release notes");
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--json", "update", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let output = assert.get_output();
+    let body: Value = serde_json::from_slice(&output.stdout).expect("stdout is valid json");
+    let plan = &body["data"]["plans"][0];
+
+    assert_eq!(plan["outcome"], "blocked");
+    assert_eq!(plan["recommended_action"], "create-overlay");
+    assert_eq!(plan["overlay_detected"], false);
+    assert_eq!(plan["local_modification_detected"], true);
+    assert_eq!(plan["modifications"][0]["kind"], "projected-copy");
+    assert_eq!(plan["modifications"][0]["managed"], false);
+    assert!(
+        plan["modifications"][0]["path"]
+            .as_str()
+            .expect("path exists")
+            .contains(".claude/skills/release-notes/SKILL.md"),
+    );
+
+    let connection = Connection::open(workspace.home_path().join(".skillctl/state.db"))
+        .expect("state database opens");
+    let update_row: (String, i64) = connection
+        .query_row(
+            "SELECT outcome, local_modification_detected \
+             FROM update_checks WHERE skill_id = ?1 ORDER BY checked_at DESC, id DESC LIMIT 1",
+            params!["release-notes"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("update check exists");
+    assert_eq!(update_row.0, "blocked");
+    assert_eq!(update_row.1, 1);
+
+    let modification_kinds: Vec<String> = connection
+        .prepare(
+            "SELECT kind FROM local_modifications WHERE skill_id = ?1 ORDER BY detected_at ASC, id ASC",
+        )
+        .expect("statement prepares")
+        .query_map(params!["release-notes"], |row| row.get(0))
+        .expect("modification query succeeds")
+        .collect::<Result<_, _>>()
+        .expect("modification rows decode");
+    assert_eq!(modification_kinds, vec!["projected-copy".to_string()]);
+}
+
 struct TestWorkspace {
     path: PathBuf,
 }
@@ -1029,6 +1305,67 @@ impl TestWorkspace {
                 .expect("lockfile exists"),
         )
         .expect("lockfile is valid yaml")
+    }
+
+    fn git_repo_url(&self, relative_path: &str) -> String {
+        let path = fs::canonicalize(self.path.join(relative_path)).expect("repo path exists");
+        format!("file://{}", path.display())
+    }
+
+    fn init_git_repo(&self, relative_path: &str) {
+        let repo_path = self.path.join(relative_path);
+        self.run_git(&repo_path, &["init", "--initial-branch", "main"]);
+        self.run_git(&repo_path, &["config", "user.name", "Skillctl Tests"]);
+        self.run_git(
+            &repo_path,
+            &["config", "user.email", "skillctl-tests@example.com"],
+        );
+        self.run_git(&repo_path, &["add", "."]);
+        self.run_git(
+            &repo_path,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "initial import",
+            ],
+        );
+    }
+
+    fn commit_all(&self, relative_path: &str, message: &str) {
+        let repo_path = self.path.join(relative_path);
+        self.run_git(&repo_path, &["add", "."]);
+        self.run_git(
+            &repo_path,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                message,
+            ],
+        );
+    }
+
+    fn run_git(&self, repo_path: &Path, args: &[&str]) {
+        let status = ProcessCommand::new("git")
+            .current_dir(repo_path)
+            .env("GIT_AUTHOR_NAME", "Skillctl Tests")
+            .env("GIT_AUTHOR_EMAIL", "skillctl-tests@example.com")
+            .env("GIT_COMMITTER_NAME", "Skillctl Tests")
+            .env("GIT_COMMITTER_EMAIL", "skillctl-tests@example.com")
+            .args(args)
+            .status()
+            .expect("git command launches");
+        assert!(
+            status.success(),
+            "git {:?} failed in {}",
+            args,
+            repo_path.display()
+        );
     }
 }
 
