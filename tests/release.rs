@@ -4,6 +4,7 @@
 mod support;
 
 use assert_cmd::cargo::cargo_bin;
+use serde_yaml::{Mapping, Value};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -182,6 +183,61 @@ fn install_script_rejects_unsupported_linux_arm64_before_download() {
     );
 }
 
+#[test]
+fn release_workflow_manual_dispatch_requires_explicit_release_tag_checkout() {
+    let workflow_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/release.yml");
+    let workflow_source = fs::read_to_string(&workflow_path).expect("release workflow exists");
+    let workflow: Value =
+        serde_yaml::from_str(&workflow_source).expect("release workflow should parse as yaml");
+
+    let on = mapping_entry(root_mapping(&workflow), "on");
+    let workflow_dispatch = mapping_entry(as_mapping(on, "workflow_dispatch"), "workflow_dispatch");
+    let inputs = mapping_entry(as_mapping(workflow_dispatch, "workflow_dispatch"), "inputs");
+    let release_tag = mapping_entry(
+        as_mapping(inputs, "workflow_dispatch.inputs"),
+        "release_tag",
+    );
+    let release_tag = as_mapping(release_tag, "workflow_dispatch.inputs.release_tag");
+
+    assert!(
+        mapping_bool(release_tag, "required"),
+        "workflow_dispatch.release_tag should be required so manual runs cannot start without a release tag"
+    );
+    assert!(
+        mapping_string(release_tag, "description").contains("tag"),
+        "workflow_dispatch.release_tag should explain that operators must supply an existing tag"
+    );
+
+    let jobs = mapping_entry(root_mapping(&workflow), "jobs");
+    let jobs = as_mapping(jobs, "jobs");
+    for job_name in ["build", "publish"] {
+        let job = mapping_entry(jobs, job_name);
+        let job = as_mapping(job, job_name);
+        let checkout = checkout_step(job, job_name);
+        let with = mapping_entry(checkout, "with");
+        let with = as_mapping(with, "actions/checkout.with");
+        let checkout_ref = mapping_string(with, "ref");
+
+        assert!(
+            checkout_ref.contains("workflow_dispatch"),
+            "{job_name} checkout should branch on workflow_dispatch runs"
+        );
+        assert!(
+            checkout_ref.contains("inputs.release_tag"),
+            "{job_name} checkout should use the manual release_tag input"
+        );
+        assert!(
+            checkout_ref.contains("refs/tags/"),
+            "{job_name} checkout should resolve manual dispatches against an explicit tag ref"
+        );
+    }
+
+    assert!(
+        !workflow_source.contains("GITHUB_REF_TYPE"),
+        "release workflow should not reject manual dispatches based on branch-only GITHUB_REF_TYPE"
+    );
+}
+
 fn package_release(binary_path: &Path, output_dir: &Path) -> PathBuf {
     fs::create_dir_all(output_dir).expect("output dir exists");
 
@@ -250,4 +306,55 @@ fn file_url(path: &Path) -> String {
             .expect("release root is canonical")
             .display()
     )
+}
+
+fn root_mapping(value: &Value) -> &Mapping {
+    value.as_mapping().expect("yaml root should be a mapping")
+}
+
+fn as_mapping<'a>(value: &'a Value, context: &str) -> &'a Mapping {
+    value
+        .as_mapping()
+        .unwrap_or_else(|| panic!("{context} should be a yaml mapping"))
+}
+
+fn mapping_entry<'a>(mapping: &'a Mapping, key: &str) -> &'a Value {
+    let string_key = Value::String(key.to_owned());
+    mapping
+        .get(&string_key)
+        .or_else(|| {
+            if key == "on" {
+                mapping.get(Value::Bool(true))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| panic!("missing yaml key {key}"))
+}
+
+fn mapping_bool(mapping: &Mapping, key: &str) -> bool {
+    mapping_entry(mapping, key)
+        .as_bool()
+        .unwrap_or_else(|| panic!("{key} should be a boolean"))
+}
+
+fn mapping_string<'a>(mapping: &'a Mapping, key: &str) -> &'a str {
+    mapping_entry(mapping, key)
+        .as_str()
+        .unwrap_or_else(|| panic!("{key} should be a string"))
+}
+
+fn checkout_step<'a>(job: &'a Mapping, job_name: &str) -> &'a Mapping {
+    let steps = mapping_entry(job, "steps")
+        .as_sequence()
+        .unwrap_or_else(|| panic!("{job_name}.steps should be a sequence"));
+
+    steps
+        .iter()
+        .find_map(|step| {
+            let step = step.as_mapping()?;
+            let uses = step.get(Value::String("uses".to_owned()))?.as_str()?;
+            (uses == "actions/checkout@v4").then_some(step)
+        })
+        .unwrap_or_else(|| panic!("{job_name} should include actions/checkout@v4"))
 }

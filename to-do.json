@@ -860,7 +860,7 @@
       "id": "T032",
       "title": "Fix the broken manual-dispatch path in the release workflow",
       "priority": 2,
-      "status": "todo",
+      "status": "done",
       "details": "The release workflow advertises workflow_dispatch, but both jobs immediately fail unless GITHUB_REF_TYPE is tag and GITHUB_REF_NAME matches v*. Manual runs from the Actions UI execute on a selected branch or ref, so the current dispatch path is dead. Either remove the manual trigger or accept a release tag input and explicitly check out and validate that tag before publishing.",
       "steps": [
         "Decide whether manual releases are supported or whether tag pushes are the only valid entrypoint.",
@@ -873,9 +873,12 @@
         "ops"
       ],
       "files": [
-        ".github/workflows/release.yml"
+        ".github/workflows/release.yml",
+        "tests/release.rs",
+        "to-do.json"
       ],
-      "blockers": []
+      "blockers": [],
+      "updated_at": "2026-03-19T16:44:00Z"
     }
   ]
 }
