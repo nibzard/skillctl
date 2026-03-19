@@ -98,7 +98,21 @@ impl SkillDefinition {
 
         let manifest_path = root.join(SKILL_MANIFEST_FILE);
         let source = read_skill_manifest(&manifest_path)?;
-        let (frontmatter_source, body) = split_frontmatter_sections(&source, &manifest_path)?;
+        let vendor_metadata = load_vendor_metadata(root)?;
+
+        Self::from_source(root, manifest_path, &source, vendor_metadata)
+    }
+
+    /// Parse and validate a skill definition from explicit file contents.
+    pub fn from_source(
+        root: impl AsRef<Path>,
+        manifest_path: impl Into<PathBuf>,
+        source: &str,
+        vendor_metadata: SkillVendorMetadata,
+    ) -> Result<Self, AppError> {
+        let root = root.as_ref();
+        let manifest_path = manifest_path.into();
+        let (frontmatter_source, body) = split_frontmatter_sections(source, &manifest_path)?;
         let fields = parse_frontmatter(&frontmatter_source, &manifest_path)?;
 
         validate_optional_standard_fields(&fields, &manifest_path)?;
@@ -121,7 +135,7 @@ impl SkillDefinition {
                 vendor_fields: extract_vendor_frontmatter(&fields),
                 fields,
             },
-            vendor_metadata: load_vendor_metadata(root)?,
+            vendor_metadata,
         })
     }
 }

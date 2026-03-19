@@ -643,7 +643,7 @@ fn normalized_extraction_root(extract_root: &Path) -> Result<PathBuf, AppError> 
     entries.sort();
     if entries.is_empty() {
         return Err(source_validation(
-            &extract_root.display().to_string(),
+            extract_root.display().to_string(),
             "archive did not contain any files",
         ));
     }

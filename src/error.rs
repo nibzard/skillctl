@@ -96,6 +96,12 @@ pub enum AppError {
         /// Validation message.
         message: String,
     },
+    /// Effective-skill resolution failed validation.
+    #[error("invalid effective skill resolution: {message}")]
+    ResolutionValidation {
+        /// Validation message.
+        message: String,
+    },
     /// JSON output rendering failed.
     #[error("failed to render JSON output: {source}")]
     JsonRender {
@@ -204,6 +210,7 @@ impl AppError {
             | Self::NotYetImplemented { .. }
             | Self::JsonRender { .. } => ExitStatus::OperationalError,
             Self::PlannerValidation { .. }
+            | Self::ResolutionValidation { .. }
             | Self::ManifestParse { .. }
             | Self::ManifestValidation { .. }
             | Self::ManifestSerialize { .. }

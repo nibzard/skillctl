@@ -201,7 +201,7 @@
       "id": "T008",
       "title": "Implement effective-skill resolution, overlay application, and conflict handling",
       "priority": 1,
-      "status": "todo",
+      "status": "done",
       "details": "Resolve canonical local skills, imported skills, and overrides into one effective view per projected name while enforcing the precedence and tie rules in the spec.",
       "steps": [
         "Build a resolver that combines manifest inputs, discovered local skills, imports from the lockfile, and overlays.",
@@ -214,6 +214,14 @@
         "T005",
         "T006",
         "T007"
+      ],
+      "updated_at": "2026-03-19T10:41:56Z",
+      "files": [
+        "src/error.rs",
+        "src/lib.rs",
+        "src/resolver.rs",
+        "src/skill.rs",
+        "src/source.rs"
       ]
     },
     {

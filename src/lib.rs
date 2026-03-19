@@ -15,6 +15,7 @@ pub mod materialize;
 pub mod mcp;
 pub mod overlay;
 pub mod planner;
+pub mod resolver;
 pub mod response;
 pub mod runtime;
 pub mod skill;
