@@ -553,6 +553,11 @@ fn doctor_issues(
         let registry = AdapterRegistry::new();
         for target in &targets {
             if registry.get(*target).install_mode_risk == InstallModeRisk::SymlinkUnstable {
+                let acknowledged = analysis
+                    .manifest
+                    .projection
+                    .allow_unsafe_targets
+                    .contains(target);
                 issues.push(DiagnosticIssue {
                     severity: DiagnosticSeverity::Warning,
                     code: "symlink-risk".to_string(),
@@ -561,11 +566,26 @@ fn doctor_issues(
                     target: Some(*target),
                     path: None,
                     trust: None,
-                    message: format!(
-                        "target '{}' documents unstable symlink behavior; copy mode is safer",
-                        target.as_str()
-                    ),
-                    fix: Some("set projection.mode to copy".to_string()),
+                    message: if acknowledged {
+                        format!(
+                            "target '{}' documents unstable symlink behavior; projection.allow_unsafe_targets explicitly enables symlink mode and copy mode is still safer",
+                            target.as_str()
+                        )
+                    } else {
+                        format!(
+                            "target '{}' documents unstable symlink behavior; projection.allow_unsafe_targets must explicitly acknowledge the risk or copy mode should be used",
+                            target.as_str()
+                        )
+                    },
+                    fix: Some(if acknowledged {
+                        "set projection.mode to copy to return to the default safe mode"
+                            .to_string()
+                    } else {
+                        format!(
+                            "add '{}' to projection.allow_unsafe_targets or set projection.mode to copy",
+                            target.as_str()
+                        )
+                    }),
                 });
             }
         }

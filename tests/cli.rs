@@ -1070,6 +1070,253 @@ fn sync_materializes_generated_copies_without_touching_canonical_skills() {
 }
 
 #[test]
+fn sync_symlink_mode_requires_explicit_override_for_unstable_targets() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "projection:\n",
+        "  mode: symlink\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_lockfile(MINIMAL_LOCKFILE);
+    workspace.write_workspace_skill("release-notes", "Summarize release notes.", &[]);
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .arg("sync")
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(predicate::str::contains("projection.allow_unsafe_targets"))
+        .stderr(predicate::str::contains("claude-code"));
+}
+
+#[test]
+fn sync_symlink_mode_materializes_symlinked_files_and_emits_warnings() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "projection:\n",
+        "  mode: symlink\n",
+        "  allow_unsafe_targets:\n",
+        "    - claude-code\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_lockfile(MINIMAL_LOCKFILE);
+    workspace.write_workspace_skill(
+        "release-notes",
+        "Summarize release notes.",
+        &[("notes.md", "# Notes\n")],
+    );
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .args(["--json", "sync"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::is_empty());
+    let body: Value = serde_json::from_slice(&assert.get_output().stdout).expect("stdout is json");
+
+    assert_eq!(body["command"], "sync");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["data"]["mode"], "symlink");
+    assert!(
+        body["warnings"]
+            .as_array()
+            .expect("warnings array exists")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .expect("warning is a string")
+                .contains("claude-code")),
+        "unexpected warnings: {body:#?}",
+    );
+
+    let projected_manifest = workspace
+        .path()
+        .join(".claude/skills/release-notes/SKILL.md");
+    let projected_notes = workspace
+        .path()
+        .join(".claude/skills/release-notes/notes.md");
+    assert!(
+        fs::symlink_metadata(&projected_manifest)
+            .expect("projected manifest exists")
+            .file_type()
+            .is_symlink(),
+        "symlink mode should project SKILL.md as a symlink",
+    );
+    assert!(
+        fs::symlink_metadata(&projected_notes)
+            .expect("projected notes exist")
+            .file_type()
+            .is_symlink(),
+        "symlink mode should project auxiliary files as symlinks",
+    );
+
+    let metadata: Value = serde_json::from_str(
+        &fs::read_to_string(
+            workspace
+                .path()
+                .join(".claude/skills/release-notes/.skillctl-projection.json"),
+        )
+        .expect("projection metadata exists"),
+    )
+    .expect("projection metadata is valid json");
+    assert_eq!(metadata["generation_mode"], "symlink");
+}
+
+#[test]
+fn sync_symlink_mode_human_output_includes_warning_lines() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "projection:\n",
+        "  mode: symlink\n",
+        "  allow_unsafe_targets:\n",
+        "  - claude-code\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_lockfile(MINIMAL_LOCKFILE);
+    workspace.write_workspace_skill("release-notes", "Summarize release notes.", &[]);
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .arg("sync")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::is_empty())
+        .stdout(predicate::str::contains(
+            "warning: target 'claude-code' documents unstable symlink behavior",
+        ));
+}
+
+#[test]
+fn install_symlink_mode_records_symlink_projection_state_and_warnings() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "projection:\n",
+        "  mode: symlink\n",
+        "  allow_unsafe_targets:\n",
+        "  - claude-code\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_skill_source("shared-skills", "release-notes");
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args([
+            "--json",
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::is_empty());
+    let body: Value = serde_json::from_slice(&assert.get_output().stdout).expect("stdout is json");
+
+    assert_eq!(body["command"], "install");
+    assert!(
+        body["warnings"]
+            .as_array()
+            .expect("warnings array exists")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .expect("warning is a string")
+                .contains("claude-code")),
+        "unexpected warnings: {body:#?}",
+    );
+    assert_eq!(body["data"]["projection"]["mode"], "symlink");
+
+    let projected_manifest = workspace
+        .path()
+        .join(".claude/skills/release-notes/SKILL.md");
+    assert!(
+        fs::symlink_metadata(&projected_manifest)
+            .expect("projected manifest exists")
+            .file_type()
+            .is_symlink(),
+        "install should preserve symlink projection mode",
+    );
+
+    let connection = Connection::open(workspace.home_path().join(".skillctl/state.db"))
+        .expect("state database opens");
+    let generation_mode: String = connection
+        .query_row(
+            "SELECT generation_mode FROM projection_records WHERE skill_id = ?1",
+            params!["release-notes"],
+            |row| row.get(0),
+        )
+        .expect("projection record exists");
+    assert_eq!(generation_mode, "symlink");
+}
+
+#[test]
+fn doctor_reports_symlink_risk_with_override_guidance() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "projection:\n",
+        "  mode: symlink\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .args(["--json", "doctor"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::is_empty());
+    let body: Value = serde_json::from_slice(&assert.get_output().stdout).expect("stdout is json");
+    let issue = body["data"]["issues"]
+        .as_array()
+        .expect("issues array exists")
+        .iter()
+        .find(|issue| issue["code"] == "symlink-risk" && issue["target"] == "claude-code")
+        .expect("symlink risk issue exists");
+
+    assert!(
+        issue["message"]
+            .as_str()
+            .expect("message exists")
+            .contains("projection.allow_unsafe_targets"),
+        "unexpected issue: {issue:#?}",
+    );
+    assert!(
+        issue["fix"]
+            .as_str()
+            .expect("fix exists")
+            .contains("projection.allow_unsafe_targets"),
+        "unexpected issue: {issue:#?}",
+    );
+}
+
+#[test]
 fn doctor_reports_shadowing_and_projection_drift() {
     let workspace = TestWorkspace::new();
     workspace.write_manifest(concat!(

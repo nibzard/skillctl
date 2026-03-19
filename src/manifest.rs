@@ -208,6 +208,7 @@ impl WorkspaceManifest {
         }
 
         let targets = validate_targets(&self.targets, &self.path)?;
+        self.projection.validate(&targets, &self.path)?;
         self.layout.validate(&self.path)?;
         let import_ids = validate_imports(&self.imports, &self.path)?;
         validate_overrides(&self.overrides, &self.layout, &import_ids, &self.path)?;
@@ -265,6 +266,9 @@ pub struct ProjectionConfig {
     /// Materialization mode.
     #[serde(default)]
     pub mode: ProjectionMode,
+    /// Explicit acknowledgement for unstable targets when symlink mode is enabled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_unsafe_targets: Vec<TargetRuntime>,
     /// Whether stale generated roots may be pruned.
     #[serde(default = "default_projection_prune")]
     pub prune: bool,
@@ -278,6 +282,7 @@ impl Default for ProjectionConfig {
         Self {
             policy: ProjectionPolicy::PreferNeutral,
             mode: ProjectionMode::Copy,
+            allow_unsafe_targets: Vec::new(),
             prune: default_projection_prune(),
             git_exclude: GitExcludeMode::Local,
         }
@@ -287,6 +292,37 @@ impl Default for ProjectionConfig {
 impl ProjectionConfig {
     fn is_default(&self) -> bool {
         self == &Self::default()
+    }
+
+    fn validate(
+        &self,
+        enabled_targets: &BTreeSet<TargetRuntime>,
+        manifest_path: &Path,
+    ) -> Result<(), AppError> {
+        let mut seen = BTreeSet::new();
+        for target in &self.allow_unsafe_targets {
+            if !seen.insert(*target) {
+                return Err(manifest_validation(
+                    manifest_path,
+                    format!(
+                        "projection.allow_unsafe_targets contains duplicate runtime '{}'",
+                        target.as_str()
+                    ),
+                ));
+            }
+
+            if !enabled_targets.contains(target) {
+                return Err(manifest_validation(
+                    manifest_path,
+                    format!(
+                        "projection.allow_unsafe_targets includes '{}' but that runtime is not enabled in targets",
+                        target.as_str()
+                    ),
+                ));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1289,6 +1325,29 @@ mod tests {
         "    user_root: auto\n",
     );
 
+    const SYMLINK_OVERRIDE_MANIFEST: &str = concat!(
+        "version: 1\n",
+        "\n",
+        "projection:\n",
+        "  policy: prefer-neutral\n",
+        "  mode: symlink\n",
+        "  allow_unsafe_targets:\n",
+        "  - claude-code\n",
+        "  prune: true\n",
+        "  git_exclude: local\n",
+        "\n",
+        "layout:\n",
+        "  skills_dir: .agents/skills\n",
+        "  overlays_dir: .agents/overlays\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+        "\n",
+        "telemetry:\n",
+        "  enabled: true\n",
+        "  mode: public-only\n",
+    );
+
     const EXPLICIT_DEFAULT_MANIFEST: &str = concat!(
         "version: 1\n",
         "\n",
@@ -1485,6 +1544,25 @@ mod tests {
                 .to_string()
                 .contains("telemetry.enabled cannot be true when telemetry.mode is off"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn symlink_projection_override_targets_roundtrip() {
+        let manifest =
+            WorkspaceManifest::from_yaml_str(DEFAULT_MANIFEST_PATH, SYMLINK_OVERRIDE_MANIFEST)
+                .expect("symlink override manifest parses");
+
+        assert_eq!(manifest.projection.mode, ProjectionMode::Symlink);
+        assert_eq!(
+            manifest.projection.allow_unsafe_targets,
+            vec![TargetRuntime::ClaudeCode]
+        );
+        assert_eq!(
+            manifest
+                .to_yaml_string()
+                .expect("symlink override manifest serializes"),
+            SYMLINK_OVERRIDE_MANIFEST
         );
     }
 

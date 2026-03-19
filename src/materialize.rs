@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::{
-    adapter::{AdapterRegistry, TargetRuntime, TargetScope},
+    adapter::{AdapterRegistry, InstallModeRisk, TargetRuntime, TargetScope},
     app::AppContext,
     cli::Scope,
     error::AppError,
@@ -22,7 +22,9 @@ use crate::{
     resolver::{self, InternalSkillId, ProjectionOutcome, ResolvedSkillCandidate, SkillScope},
     response::AppResponse,
     source::{current_timestamp, imports_store_root},
-    state::{LocalStateStore, ManagedScope, ManagedSkillRef},
+    state::{
+        LocalStateStore, ManagedScope, ManagedSkillRef, ProjectionMode as RecordedProjectionMode,
+    },
 };
 
 /// Metadata file written into generated projection directories.
@@ -38,6 +40,9 @@ pub struct MaterializationReport {
     pub plan: ProjectionPlan,
     /// Projection mode requested by the manifest.
     pub mode: ProjectionMode,
+    /// Non-fatal warnings emitted while materializing projections.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     /// Physical roots reused as canonical sources instead of generated copies.
     pub canonical_roots: Vec<String>,
     /// Generated roots that received copied projections.
@@ -67,22 +72,24 @@ pub struct SyncRequest;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CleanRequest;
 
+impl MaterializationReport {
+    /// Return the recorded generation mode used by projection history and state.
+    pub const fn recorded_generation_mode(&self) -> RecordedProjectionMode {
+        match self.mode {
+            ProjectionMode::Copy => RecordedProjectionMode::Copy,
+            ProjectionMode::Symlink => RecordedProjectionMode::Symlink,
+        }
+    }
+}
+
 /// Compute the materialization report for the current workspace inputs.
 pub fn sync_workspace(context: &AppContext) -> Result<MaterializationReport, AppError> {
     let manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
-    if manifest.projection.mode != ProjectionMode::Copy {
-        return Err(AppError::MaterializationValidation {
-            message: format!(
-                "projection mode '{}' is not implemented yet; use 'copy'",
-                projection_mode_label(manifest.projection.mode)
-            ),
-        });
-    }
-
     let lockfile = load_lockfile_or_default(&context.working_directory)?;
     let scope = sync_scope(context);
     let targets = selected_targets(context, &manifest)?;
     let registry = AdapterRegistry::new();
+    let warnings = symlink_risk_warnings(&registry, &targets, &manifest)?;
     let plan = planner::plan_target_roots(
         &registry,
         scope,
@@ -139,6 +146,7 @@ pub fn sync_workspace(context: &AppContext) -> Result<MaterializationReport, App
             &resolved_root,
             &root.path,
             &root_winners,
+            manifest.projection.mode,
             manifest.projection.prune,
         )?;
         materialized_skills += report.materialized.len();
@@ -149,6 +157,7 @@ pub fn sync_workspace(context: &AppContext) -> Result<MaterializationReport, App
     Ok(MaterializationReport {
         plan,
         mode: manifest.projection.mode,
+        warnings,
         canonical_roots,
         generated_roots,
         materialized_skills,
@@ -160,10 +169,14 @@ pub fn sync_workspace(context: &AppContext) -> Result<MaterializationReport, App
 pub fn handle_sync(context: &AppContext, _request: SyncRequest) -> Result<AppResponse, AppError> {
     let report = sync_workspace(context)?;
     let summary = sync_summary(&report);
-
-    Ok(AppResponse::success("sync")
+    let mut response = AppResponse::success("sync")
         .with_summary(summary)
-        .with_data(serde_json::to_value(report)?))
+        .with_data(serde_json::to_value(&report)?);
+    for warning in &report.warnings {
+        response = response.with_warning(warning.clone());
+    }
+
+    Ok(response)
 }
 
 /// Handle `skillctl clean`.
@@ -626,6 +639,7 @@ fn materialize_generated_root(
     root_path: &Path,
     root_display: &str,
     winners: &[&ResolvedSkillCandidate],
+    mode: ProjectionMode,
     prune: bool,
 ) -> Result<GeneratedRootReport, AppError> {
     let mut report = GeneratedRootReport {
@@ -637,7 +651,7 @@ fn materialize_generated_root(
     let mut desired_names = BTreeSet::new();
     for winner in winners {
         ensure_directory_parent(root_path)?;
-        materialize_projection(root_path, root_display, winner)?;
+        materialize_projection(root_path, root_display, winner, mode)?;
         report
             .materialized
             .push(winner.skill.name.as_str().to_string());
@@ -676,6 +690,7 @@ fn materialize_projection(
     root_path: &Path,
     root_display: &str,
     winner: &ResolvedSkillCandidate,
+    mode: ProjectionMode,
 ) -> Result<(), AppError> {
     let target_dir = root_path.join(winner.skill.name.as_str());
     prepare_target_directory(&target_dir, winner.skill.name.as_str())?;
@@ -697,16 +712,10 @@ fn materialize_projection(
             })?;
         }
 
-        fs::copy(&file.source_path, &destination).map_err(|source| {
-            AppError::FilesystemOperation {
-                action: "copy projected file",
-                path: destination.clone(),
-                source,
-            }
-        })?;
+        materialize_projection_file(&file.source_path, &destination, mode)?;
     }
 
-    write_projection_metadata(&target_dir, root_display, winner)
+    write_projection_metadata(&target_dir, root_display, winner, mode)
 }
 
 fn prepare_target_directory(target_dir: &Path, skill_name: &str) -> Result<(), AppError> {
@@ -833,13 +842,14 @@ fn write_projection_metadata(
     target_dir: &Path,
     root_display: &str,
     winner: &ResolvedSkillCandidate,
+    mode: ProjectionMode,
 ) -> Result<(), AppError> {
     let metadata_path = target_dir.join(PROJECTION_METADATA_FILE);
     let metadata = json!({
         "tool": "skillctl",
         "version": env!("CARGO_PKG_VERSION"),
         "generated_at": projection_timestamp(),
-        "generation_mode": "copy",
+        "generation_mode": projection_mode_label(mode),
         "physical_root": root_display,
         "skill_name": winner.skill.name.as_str(),
         "internal_id": internal_id_label(&winner.internal_id),
@@ -854,6 +864,108 @@ fn write_projection_metadata(
             source,
         }
     })
+}
+
+fn materialize_projection_file(
+    source_path: &Path,
+    destination: &Path,
+    mode: ProjectionMode,
+) -> Result<(), AppError> {
+    match mode {
+        ProjectionMode::Copy => {
+            fs::copy(source_path, destination).map_err(|source| AppError::FilesystemOperation {
+                action: "copy projected file",
+                path: destination.to_path_buf(),
+                source,
+            })?;
+        }
+        ProjectionMode::Symlink => {
+            create_projection_symlink(source_path, destination)?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_projection_symlink(source_path: &Path, destination: &Path) -> Result<(), AppError> {
+    std::os::unix::fs::symlink(source_path, destination).map_err(|source| {
+        AppError::FilesystemOperation {
+            action: "create projected symlink",
+            path: destination.to_path_buf(),
+            source,
+        }
+    })
+}
+
+#[cfg(windows)]
+fn create_projection_symlink(source_path: &Path, destination: &Path) -> Result<(), AppError> {
+    std::os::windows::fs::symlink_file(source_path, destination).map_err(|source| {
+        AppError::FilesystemOperation {
+            action: "create projected symlink",
+            path: destination.to_path_buf(),
+            source,
+        }
+    })
+}
+
+fn symlink_risk_warnings(
+    registry: &AdapterRegistry,
+    targets: &[TargetRuntime],
+    manifest: &WorkspaceManifest,
+) -> Result<Vec<String>, AppError> {
+    if manifest.projection.mode != ProjectionMode::Symlink {
+        return Ok(Vec::new());
+    }
+
+    let mut unstable_targets = targets
+        .iter()
+        .copied()
+        .filter(|target| {
+            registry.get(*target).install_mode_risk == InstallModeRisk::SymlinkUnstable
+        })
+        .collect::<Vec<_>>();
+    unstable_targets.sort_unstable();
+
+    if unstable_targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let acknowledged: BTreeSet<_> = manifest
+        .projection
+        .allow_unsafe_targets
+        .iter()
+        .copied()
+        .collect();
+    let missing = unstable_targets
+        .iter()
+        .copied()
+        .filter(|target| !acknowledged.contains(target))
+        .collect::<Vec<_>>();
+
+    if !missing.is_empty() {
+        return Err(AppError::MaterializationValidation {
+            message: format!(
+                "projection.mode 'symlink' requires explicit projection.allow_unsafe_targets entries for unstable target{} {}; use 'copy' or acknowledge each target",
+                plural_suffix(missing.len()),
+                missing
+                    .iter()
+                    .map(|target| format!("'{}'", target.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        });
+    }
+
+    Ok(unstable_targets
+        .into_iter()
+        .map(|target| {
+            format!(
+                "target '{}' documents unstable symlink behavior; projection.allow_unsafe_targets explicitly enabled symlink mode and copy mode remains safer",
+                target.as_str()
+            )
+        })
+        .collect())
 }
 
 fn projection_source(winner: &ResolvedSkillCandidate) -> serde_json::Value {

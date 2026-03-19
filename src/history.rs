@@ -27,9 +27,9 @@ use crate::{
     },
     state::{
         HistoryDetails, HistoryEntry, HistoryQuery, InstallRecord, LocalModificationRecord,
-        LocalStateStore, ManagedScope, ManagedSkillRef, PinRecord, ProjectionMode,
-        ProjectionRecord, RollbackRecord, TelemetrySettings, UpdateCheckRecord,
-        insert_history_entry_in, insert_local_modification_record_in, insert_rollback_record_in,
+        LocalStateStore, ManagedScope, ManagedSkillRef, PinRecord, ProjectionRecord,
+        RollbackRecord, TelemetrySettings, UpdateCheckRecord, insert_history_entry_in,
+        insert_local_modification_record_in, insert_rollback_record_in,
         insert_update_check_record_in, upsert_install_record_in, upsert_pin_record_in,
         upsert_projection_record_in, upsert_telemetry_settings_in,
     },
@@ -616,7 +616,7 @@ pub fn handle_pin(context: &AppContext, request: PinRequest) -> Result<AppRespon
         ledger.record_projection(&record)?;
     }
 
-    Ok(AppResponse::success("pin")
+    let mut response = AppResponse::success("pin")
         .with_summary(format!(
             "Pinned {} to {}",
             request.skill, checked_out.resolved_revision
@@ -628,7 +628,12 @@ pub fn handle_pin(context: &AppContext, request: PinRequest) -> Result<AppRespon
             "resolved_revision": checked_out.resolved_revision,
             "effective_version_hash": effective_version_hash,
             "projection": sync_report,
-        })))
+        }));
+    for warning in &sync_report.warnings {
+        response = response.with_warning(warning.clone());
+    }
+
+    Ok(response)
 }
 
 /// Handle `skillctl rollback`.
@@ -748,7 +753,7 @@ pub fn handle_rollback(
         ledger.record_projection(&record)?;
     }
 
-    Ok(AppResponse::success("rollback")
+    let mut response = AppResponse::success("rollback")
         .with_summary(format!(
             "Rolled back {} to {}",
             request.skill, checked_out.resolved_revision
@@ -760,7 +765,12 @@ pub fn handle_rollback(
             "resolved_revision": checked_out.resolved_revision,
             "effective_version_hash": effective_version_hash,
             "projection": sync_report,
-        })))
+        }));
+    for warning in &sync_report.warnings {
+        response = response.with_warning(warning.clone());
+    }
+
+    Ok(response)
 }
 
 /// Handle `skillctl history`.
@@ -898,6 +908,7 @@ pub(crate) fn projection_records_for_skill(
         .map(|root| (root.path.clone(), root.targets.clone()))
         .collect();
     let mut records = Vec::new();
+    let generation_mode = sync_report.recorded_generation_mode();
 
     for generated_root in &sync_report.generated_roots {
         if !generated_root
@@ -916,7 +927,7 @@ pub(crate) fn projection_records_for_skill(
             records.push(ProjectionRecord {
                 skill: skill.clone(),
                 target: *target,
-                generation_mode: ProjectionMode::Copy,
+                generation_mode,
                 physical_root: generated_root.path.clone(),
                 projected_path: skill.skill_id.clone(),
                 effective_version_hash: effective_version_hash.to_string(),

@@ -6,7 +6,7 @@ It gives one operating model for canonical workspace skills, imported skills, ov
 
 Current status:
 
-- Implemented today: CLI lifecycle commands, copy-based projections, lockfile and SQLite state, history, telemetry consent, `doctor`, `explain`, `validate`, and JSON output.
+- Implemented today: CLI lifecycle commands, copy-first projections with opt-in symlink mode, lockfile and SQLite state, history, telemetry consent, `doctor`, `explain`, `validate`, and JSON output.
 - Planned but not implemented yet: `skillctl tui` and `skillctl mcp serve`.
 
 The product direction is defined in [spec.md](./spec.md). A focused troubleshooting guide lives in [docs/troubleshooting.md](./docs/troubleshooting.md).
@@ -35,7 +35,7 @@ The release workflow publishes deterministic archives and checksums for Linux `x
 1. Canonical workspace skills live in `.agents/skills/`.
 2. Imported skills are pinned in `.agents/skillctl.lock` and cached under `~/.skillctl/store/imports/`.
 3. Local customizations for imported skills live in `.agents/overlays/<skill>/`.
-4. Effective skills are projected into runtime-visible roots as generated copies.
+4. Effective skills are projected into runtime-visible roots as generated copies by default, or symlinks when explicitly enabled.
 5. Local history, pins, rollbacks, projection records, and telemetry consent live in `~/.skillctl/state.db`.
 
 Important rules:

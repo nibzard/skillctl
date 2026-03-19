@@ -36,8 +36,7 @@ use crate::{
     response::AppResponse,
     skill::{DEFAULT_SKILLS_DIR, SkillDefinition},
     state::{
-        InstallRecord, LocalStateStore, ManagedScope, ManagedSkillRef, PinRecord, ProjectionMode,
-        ProjectionRecord,
+        InstallRecord, LocalStateStore, ManagedScope, ManagedSkillRef, PinRecord, ProjectionRecord,
     },
     telemetry,
     trust::SkillTrust,
@@ -356,6 +355,9 @@ pub fn handle_install(
             "projection": sync_report,
             "telemetry": telemetry,
         }));
+    for warning in &sync_report.warnings {
+        response = response.with_warning(warning.clone());
+    }
     let mut warnings = BTreeSet::new();
     for skill in &installed {
         for warning in &skill.trust.warnings {
@@ -1032,6 +1034,7 @@ fn projection_records_for_install(
         .map(|operation| (operation.installed.name.clone(), operation))
         .collect();
     let mut records = Vec::new();
+    let generation_mode = sync_report.recorded_generation_mode();
 
     for generated_root in &sync_report.generated_roots {
         let Some(targets) = targets_by_root.get(&generated_root.path) else {
@@ -1047,7 +1050,7 @@ fn projection_records_for_install(
                 records.push(ProjectionRecord {
                     skill: ManagedSkillRef::new(scope, skill_name.clone()),
                     target: *target,
-                    generation_mode: ProjectionMode::Copy,
+                    generation_mode,
                     physical_root: generated_root.path.clone(),
                     projected_path: skill_name.clone(),
                     effective_version_hash: operation.installed.effective_version_hash.clone(),

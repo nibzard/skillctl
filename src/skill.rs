@@ -23,7 +23,7 @@ use crate::{
     planner,
     response::AppResponse,
     source::{current_timestamp, imports_store_root},
-    state::{LocalStateStore, ManagedScope, ManagedSkillRef, ProjectionMode, ProjectionRecord},
+    state::{LocalStateStore, ManagedScope, ManagedSkillRef, ProjectionRecord},
 };
 
 /// Default relative path to canonical workspace skills.
@@ -753,7 +753,7 @@ fn toggle_managed_import(
         ledger.record_projection(record)?;
     }
 
-    Ok(AppResponse::success(command)
+    let mut response = AppResponse::success(command)
         .with_summary(format!(
             "{} {} in {} scope.",
             if enabled { "Enabled" } else { "Disabled" },
@@ -766,7 +766,12 @@ fn toggle_managed_import(
             "enabled": enabled,
             "changed": changed,
             "projection": sync_report,
-        })))
+        }));
+    for warning in &sync_report.warnings {
+        response = response.with_warning(warning.clone());
+    }
+
+    Ok(response)
 }
 
 fn rebuild_projection_records_for_scope(
@@ -788,6 +793,7 @@ fn rebuild_projection_records_for_scope(
         .map(|root| (root.path.clone(), root.targets.clone()))
         .collect();
     let mut records = Vec::new();
+    let generation_mode = sync_report.recorded_generation_mode();
 
     for generated_root in &sync_report.generated_roots {
         let Some(targets) = targets_by_root.get(&generated_root.path) else {
@@ -803,7 +809,7 @@ fn rebuild_projection_records_for_scope(
                 records.push(ProjectionRecord {
                     skill: install.skill.clone(),
                     target: *target,
-                    generation_mode: ProjectionMode::Copy,
+                    generation_mode,
                     physical_root: generated_root.path.clone(),
                     projected_path: skill_name.clone(),
                     effective_version_hash: install.effective_version_hash.clone(),

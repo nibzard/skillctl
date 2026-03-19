@@ -446,7 +446,7 @@
       "id": "T017",
       "title": "Implement opt-in symlink mode with adapter-specific warnings and safeguards",
       "priority": 4,
-      "status": "todo",
+      "status": "done",
       "details": "Keep copy mode as the default while supporting explicit symlink projection where the user opts in and the adapter deems it safe enough.",
       "steps": [
         "Add projection-mode handling for `copy` and `symlink` in the planner and materializer.",
@@ -457,7 +457,20 @@
         "T006",
         "T009",
         "T016"
-      ]
+      ],
+      "updated_at": "2026-03-19T15:18:00Z",
+      "files": [
+        "README.md",
+        "src/doctor.rs",
+        "src/history.rs",
+        "src/manifest.rs",
+        "src/materialize.rs",
+        "src/skill.rs",
+        "src/source.rs",
+        "tests/cli.rs",
+        "to-do.json"
+      ],
+      "blockers": []
     },
     {
       "id": "T018",
@@ -696,7 +709,7 @@
         "T019",
         "T025"
       ],
-      "updated_at": "2026-03-19T14:51:47Z",
+      "updated_at": "2026-03-19T14:52:36Z",
       "files": [
         ".github/workflows/release.yml",
         ".gitignore",
@@ -730,7 +743,7 @@
         "T022",
         "T023"
       ],
-      "updated_at": "2026-03-19T15:02:36Z",
+      "updated_at": "2026-03-19T15:04:31Z",
       "files": [
         "README.md",
         "docs/troubleshooting.md",
