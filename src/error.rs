@@ -102,6 +102,12 @@ pub enum AppError {
         /// Validation message.
         message: String,
     },
+    /// Projection materialization failed validation.
+    #[error("invalid projection materialization: {message}")]
+    MaterializationValidation {
+        /// Validation message.
+        message: String,
+    },
     /// JSON output rendering failed.
     #[error("failed to render JSON output: {source}")]
     JsonRender {
@@ -211,6 +217,7 @@ impl AppError {
             | Self::JsonRender { .. } => ExitStatus::OperationalError,
             Self::PlannerValidation { .. }
             | Self::ResolutionValidation { .. }
+            | Self::MaterializationValidation { .. }
             | Self::ManifestParse { .. }
             | Self::ManifestValidation { .. }
             | Self::ManifestSerialize { .. }

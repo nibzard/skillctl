@@ -112,7 +112,7 @@
         "T001",
         "T003"
       ],
-      "updated_at": "2026-03-19T09:37:09Z",
+      "updated_at": "2026-03-19T09:37:48Z",
       "files": [
         "src/error.rs",
         "src/lib.rs",
@@ -139,7 +139,7 @@
       "depends_on": [
         "T001"
       ],
-      "updated_at": "2026-03-19T09:47:26Z",
+      "updated_at": "2026-03-19T09:49:08Z",
       "files": [
         "src/error.rs",
         "src/skill.rs",
@@ -162,7 +162,7 @@
         "T001",
         "T003"
       ],
-      "updated_at": "2026-03-19T10:04:33Z",
+      "updated_at": "2026-03-19T10:07:10Z",
       "files": [
         "src/adapter.rs",
         "src/error.rs",
@@ -186,7 +186,7 @@
         "T001",
         "T005"
       ],
-      "updated_at": "2026-03-19T10:24:02Z",
+      "updated_at": "2026-03-19T10:26:11Z",
       "files": [
         "Cargo.lock",
         "Cargo.toml",
@@ -215,7 +215,7 @@
         "T006",
         "T007"
       ],
-      "updated_at": "2026-03-19T10:41:56Z",
+      "updated_at": "2026-03-19T10:43:13Z",
       "files": [
         "src/error.rs",
         "src/lib.rs",
@@ -228,7 +228,7 @@
       "id": "T009",
       "title": "Implement copy-first projection materialization and the `sync` command",
       "priority": 1,
-      "status": "todo",
+      "status": "done",
       "details": "Materialize effective skills into runtime-visible roots using deterministic copy mode by default, emit provenance metadata, and prune only prior `skillctl` outputs.",
       "steps": [
         "Compute physical roots from the planner and materialize generated copies without touching canonical authoring directories.",
@@ -237,7 +237,15 @@
       ],
       "depends_on": [
         "T008"
-      ]
+      ],
+      "updated_at": "2026-03-19T10:55:43Z",
+      "files": [
+        "src/error.rs",
+        "src/materialize.rs",
+        "tests/cli.rs",
+        "to-do.json"
+      ],
+      "blockers": []
     },
     {
       "id": "T010",

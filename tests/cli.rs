@@ -295,6 +295,193 @@ fn init_json_output_describes_created_and_skipped_items() {
     );
 }
 
+#[test]
+fn sync_materializes_generated_copies_without_touching_canonical_skills() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "targets:\n",
+        "  - codex\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_lockfile(MINIMAL_LOCKFILE);
+    workspace.write_workspace_skill(
+        "release-notes",
+        "Summarize release notes.",
+        &[("notes.md", "# Notes\n")],
+    );
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .arg("sync")
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty())
+        .stdout(predicate::str::contains(
+            "Materialized 1 generated projection",
+        ));
+
+    let generated_skill = workspace
+        .path()
+        .join(".claude/skills/release-notes/SKILL.md");
+    assert_eq!(
+        fs::read_to_string(&generated_skill).expect("generated skill exists"),
+        fs::read_to_string(
+            workspace
+                .path()
+                .join(".agents/skills/release-notes/SKILL.md")
+        )
+        .expect("canonical skill exists")
+    );
+    assert_eq!(
+        fs::read_to_string(
+            workspace
+                .path()
+                .join(".claude/skills/release-notes/notes.md")
+        )
+        .expect("generated note exists"),
+        "# Notes\n"
+    );
+    assert!(
+        !workspace
+            .path()
+            .join(".agents/skills/release-notes/.skillctl-projection.json")
+            .exists(),
+        "canonical authoring directory must not receive generated metadata",
+    );
+
+    let metadata: Value = serde_json::from_str(
+        &fs::read_to_string(
+            workspace
+                .path()
+                .join(".claude/skills/release-notes/.skillctl-projection.json"),
+        )
+        .expect("projection metadata exists"),
+    )
+    .expect("projection metadata is valid json");
+    assert_eq!(metadata["tool"], "skillctl");
+    assert_eq!(metadata["generation_mode"], "copy");
+    assert_eq!(metadata["physical_root"], ".claude/skills");
+    assert_eq!(metadata["skill_name"], "release-notes");
+    assert_eq!(metadata["source"]["kind"], "canonical-local");
+    assert_eq!(metadata["source"]["scope"], "workspace");
+    assert_eq!(
+        metadata["source"]["relative_path"],
+        ".agents/skills/release-notes"
+    );
+    assert!(metadata["generated_at"].is_string());
+}
+
+#[test]
+fn sync_prunes_only_prior_skillctl_generated_projections() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_lockfile(MINIMAL_LOCKFILE);
+    workspace.write_workspace_skill("release-notes", "Summarize release notes.", &[]);
+    workspace.write_file(
+        ".claude/skills/stale-skill/SKILL.md",
+        concat!(
+            "---\n",
+            "name: stale-skill\n",
+            "description: Old generated projection.\n",
+            "---\n",
+            "\n",
+            "# Stale\n"
+        ),
+    );
+    workspace.write_file(
+        ".claude/skills/stale-skill/.skillctl-projection.json",
+        concat!(
+            "{\n",
+            "  \"tool\": \"skillctl\",\n",
+            "  \"generation_mode\": \"copy\",\n",
+            "  \"physical_root\": \".claude/skills\"\n",
+            "}\n"
+        ),
+    );
+    workspace.write_file(
+        ".claude/skills/manual-skill/SKILL.md",
+        concat!(
+            "---\n",
+            "name: manual-skill\n",
+            "description: Hand-authored runtime skill.\n",
+            "---\n",
+            "\n",
+            "# Manual\n"
+        ),
+    );
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .arg("sync")
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty())
+        .stdout(predicate::str::contains("Pruned 1 stale projection"));
+
+    assert!(
+        !workspace.path().join(".claude/skills/stale-skill").exists(),
+        "stale generated projection should be pruned",
+    );
+    assert!(
+        workspace
+            .path()
+            .join(".claude/skills/manual-skill")
+            .is_dir(),
+        "hand-authored runtime directories must be preserved",
+    );
+    assert!(
+        workspace
+            .path()
+            .join(".claude/skills/release-notes")
+            .is_dir(),
+        "current projection should be materialized",
+    );
+}
+
+#[test]
+fn sync_refuses_to_overwrite_hand_authored_runtime_skill_directories() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_lockfile(MINIMAL_LOCKFILE);
+    workspace.write_workspace_skill("release-notes", "Summarize release notes.", &[]);
+    workspace.write_file(
+        ".claude/skills/release-notes/SKILL.md",
+        concat!(
+            "---\n",
+            "name: release-notes\n",
+            "description: Manual runtime copy.\n",
+            "---\n",
+            "\n",
+            "# Manual\n"
+        ),
+    );
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .arg("sync")
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "refusing to overwrite hand-authored runtime skill directory",
+        ));
+}
+
 struct TestWorkspace {
     path: PathBuf,
 }
@@ -313,6 +500,56 @@ impl TestWorkspace {
 
     fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn write_manifest(&self, contents: &str) {
+        self.write_file(".agents/skillctl.yaml", contents);
+    }
+
+    fn write_lockfile(&self, contents: &str) {
+        self.write_file(".agents/skillctl.lock", contents);
+    }
+
+    fn write_workspace_skill(
+        &self,
+        skill_name: &str,
+        description: &str,
+        extra_files: &[(&str, &str)],
+    ) {
+        let skill_root = self.path.join(".agents/skills").join(skill_name);
+        fs::create_dir_all(&skill_root).expect("skill source root exists");
+        fs::write(
+            skill_root.join("SKILL.md"),
+            format!(
+                concat!(
+                    "---\n",
+                    "name: {skill_name}\n",
+                    "description: {description}\n",
+                    "---\n",
+                    "\n",
+                    "# {skill_name}\n"
+                ),
+                skill_name = skill_name,
+                description = description,
+            ),
+        )
+        .expect("skill manifest exists");
+
+        for (relative_path, contents) in extra_files {
+            let path = skill_root.join(relative_path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("extra file parent exists");
+            }
+            fs::write(path, contents).expect("extra file written");
+        }
+    }
+
+    fn write_file(&self, relative_path: &str, contents: &str) {
+        let path = self.path.join(relative_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("parent directory exists");
+        }
+        fs::write(path, contents).expect("file written");
     }
 
     fn write_skill_source(&self, source_dir: &str, skill_name: &str) {
