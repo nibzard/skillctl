@@ -238,7 +238,7 @@
       "depends_on": [
         "T008"
       ],
-      "updated_at": "2026-03-19T10:55:43Z",
+      "updated_at": "2026-03-19T10:56:27Z",
       "files": [
         "src/error.rs",
         "src/materialize.rs",
@@ -251,7 +251,7 @@
       "id": "T010",
       "title": "Implement the SQLite local state store and history ledger",
       "priority": 1,
-      "status": "todo",
+      "status": "done",
       "details": "Create `~/.skillctl/state.db` as the local system of record for installs, projections, modification detection, telemetry consent, pins, rollbacks, and history events.",
       "steps": [
         "Design a versioned SQLite schema for install records, projection records, update checks, local modifications, pins, rollbacks, and telemetry settings.",
@@ -261,7 +261,17 @@
       "depends_on": [
         "T001",
         "T004"
-      ]
+      ],
+      "updated_at": "2026-03-19T11:17:38Z",
+      "files": [
+        "Cargo.lock",
+        "Cargo.toml",
+        "src/error.rs",
+        "src/history.rs",
+        "src/state.rs",
+        "to-do.json"
+      ],
+      "blockers": []
     },
     {
       "id": "T011",

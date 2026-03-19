@@ -201,6 +201,37 @@ pub enum AppError {
         #[source]
         source: io::Error,
     },
+    /// No usable home directory could be determined for local state.
+    #[error("failed to determine a home directory for local state")]
+    HomeDirectoryUnavailable,
+    /// Opening or bootstrapping the local state store failed.
+    #[error("failed to open local state store '{path}': {source}")]
+    LocalStateOpen {
+        /// Path to the SQLite database.
+        path: PathBuf,
+        /// SQLite error.
+        #[source]
+        source: rusqlite::Error,
+    },
+    /// A local state store query or write failed.
+    #[error("failed to {operation} in local state store '{path}': {source}")]
+    LocalStateQuery {
+        /// Path to the SQLite database.
+        path: PathBuf,
+        /// Operation that failed.
+        operation: &'static str,
+        /// SQLite error.
+        #[source]
+        source: rusqlite::Error,
+    },
+    /// Local state validation or schema verification failed.
+    #[error("local state store '{path}' is invalid: {message}")]
+    LocalStateValidation {
+        /// Path to the SQLite database.
+        path: PathBuf,
+        /// Validation message.
+        message: String,
+    },
 }
 
 impl AppError {
@@ -226,8 +257,12 @@ impl AppError {
             | Self::LockfileSerialize { .. }
             | Self::SkillParse { .. }
             | Self::SkillValidation { .. }
-            | Self::SourceValidation { .. } => ExitStatus::ValidationFailure,
-            Self::ExternalCommand { .. } => ExitStatus::OperationalError,
+            | Self::SourceValidation { .. }
+            | Self::LocalStateValidation { .. } => ExitStatus::ValidationFailure,
+            Self::ExternalCommand { .. }
+            | Self::HomeDirectoryUnavailable
+            | Self::LocalStateOpen { .. }
+            | Self::LocalStateQuery { .. } => ExitStatus::OperationalError,
             Self::InputRequired { .. } => ExitStatus::InputRequired,
         }
     }
