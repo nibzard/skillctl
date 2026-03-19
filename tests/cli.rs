@@ -5121,7 +5121,7 @@ fn snapshot_path(path: &Path) -> PathSnapshot {
                     path.display()
                 )
             });
-        entries.sort_by_key(|entry| entry.file_name());
+        entries.sort_by_key(std::fs::DirEntry::file_name);
         for entry in entries {
             let name = entry.file_name().to_string_lossy().into_owned();
             children.insert(name, snapshot_path(&entry.path()));

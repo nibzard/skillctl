@@ -403,11 +403,10 @@ fn build_bundled_explain_report(context: &AppContext) -> Result<ExplainReport, A
         scope: ManagedScope::User.as_str().to_string(),
         internal_id: "builtin:user:skillctl".to_string(),
         source_class: "bundled".to_string(),
-        root: snapshot
-            .install
-            .as_ref()
-            .map(|install| install.source_url.clone())
-            .unwrap_or_else(|| "builtin://skillctl".to_string()),
+        root: snapshot.install.as_ref().map_or_else(
+            || "builtin://skillctl".to_string(),
+            |install| install.source_url.clone(),
+        ),
         why: "skillctl manages the bundled user-scope asset directly".to_string(),
         import_id: None,
         overlay_root: None,
@@ -426,22 +425,23 @@ fn build_bundled_explain_report(context: &AppContext) -> Result<ExplainReport, A
 
     let targets = bundled_explain_targets(context, &plan, status)?;
     let active_projection_matches_winner = if managed_state_present {
-        plan.assignments.iter().all(|assignment| {
-            let root = planner::resolve_runtime_root_path(context, &assignment.root).expect("root");
-            builtin::projection_difference(context, &root.join("skillctl"))
-                .expect("bundled projection inspection succeeds")
-                .is_none()
-        })
+        plan.assignments
+            .iter()
+            .try_fold(true, |matches, assignment| {
+                let root = planner::resolve_runtime_root_path(context, &assignment.root)?;
+                let differs = builtin::projection_difference(context, &root.join("skillctl"))?;
+                Ok::<_, AppError>(matches && differs.is_none())
+            })?
     } else {
         false
     };
 
     let active_differs_from_pinned_source = match (status, managed_effective_version.as_ref()) {
-        (ExplainStatus::Selected, Some(_)) => !active_projection_matches_winner,
-        (ExplainStatus::Selected, None) => !active_projection_matches_winner,
+        (ExplainStatus::Selected, Some(_)) | (ExplainStatus::Selected, None) => {
+            !active_projection_matches_winner
+        }
         (ExplainStatus::Missing, Some(_)) => true,
-        (ExplainStatus::Missing, None) => false,
-        (ExplainStatus::Conflict, _) => false,
+        (ExplainStatus::Missing, None) | (ExplainStatus::Conflict, _) => false,
     };
 
     Ok(ExplainReport {
@@ -623,7 +623,7 @@ fn collect_validation_issues(
                     path: skills_root.clone(),
                     source,
                 })?;
-            entries.sort_by_key(|entry| entry.path());
+            entries.sort_by_key(std::fs::DirEntry::path);
 
             for entry in entries {
                 let root = entry.path();
@@ -639,7 +639,10 @@ fn collect_validation_issues(
                     issues.push(DiagnosticIssue {
                         severity: DiagnosticSeverity::Error,
                         code: "invalid-skill-root".to_string(),
-                        skill: entry.file_name().to_str().map(|name| name.to_string()),
+                        skill: entry
+                            .file_name()
+                            .to_str()
+                            .map(std::string::ToString::to_string),
                         scope: Some(ManagedScope::Workspace.as_str().to_string()),
                         target: None,
                         path: Some(planner::display_path(context, &root)),
@@ -789,7 +792,7 @@ fn validate_import(
 
     match SkillDefinition::from_source(
         &skill_root,
-        manifest_path.clone(),
+        manifest_path,
         &manifest_source,
         load_effective_vendor_metadata(&effective_files)?,
     ) {
@@ -1264,28 +1267,34 @@ fn build_explain_report(
     )?;
     let active_projection_matches_winner = match (winner.as_ref(), target_plan.as_ref()) {
         (Some(_winner), Some(plan)) => {
-            let winner_candidate = graph
+            let Some(winner_candidate) = graph
                 .projection_for(skill_name)
                 .and_then(|projection| projection.winner())
-                .expect("winner exists for selected explain state");
-            plan.assignments.iter().all(|assignment| {
-                let root =
-                    planner::resolve_runtime_root_path(context, &assignment.root).expect("root");
-                first_projection_difference(context, &root.join(skill_name), winner_candidate)
-                    .expect("projection diff succeeds")
-                    .is_none()
-            })
+            else {
+                return Err(AppError::ResolutionValidation {
+                    message: format!(
+                        "selected explain state for '{skill_name}' is missing a winning candidate"
+                    ),
+                });
+            };
+            plan.assignments
+                .iter()
+                .try_fold(true, |matches, assignment| {
+                    let root = planner::resolve_runtime_root_path(context, &assignment.root)?;
+                    let differs = first_projection_difference(
+                        context,
+                        &root.join(skill_name),
+                        winner_candidate,
+                    )?;
+                    Ok::<_, AppError>(matches && differs.is_none())
+                })?
         }
         (Some(_), None) => true,
         _ => false,
     };
     let active_differs_from_pinned_source = match (&winner, managed_effective_version.as_ref()) {
         (Some(winner), Some(effective_version_hash)) => {
-            winner
-                .effective_version_hash
-                .as_ref()
-                .map(|hash| hash != effective_version_hash)
-                .unwrap_or(true)
+            (winner.effective_version_hash.as_ref() != Some(effective_version_hash))
                 || !active_projection_matches_winner
         }
         (Some(_), None) => false,
@@ -1395,11 +1404,9 @@ fn explain_candidate(
 
 fn explain_winner_reason(trace: &resolver::ResolutionTrace) -> String {
     match trace.decisive_stage {
-        ResolutionStage::ManifestPriority => format!(
-            "manifest priority {} selected the active winner",
-            trace
-                .manifest_priority
-                .expect("manifest priority exists when the stage is manifest-priority")
+        ResolutionStage::ManifestPriority => trace.manifest_priority.map_or_else(
+            || "manifest priority selected the active winner".to_string(),
+            |priority| format!("manifest priority {priority} selected the active winner"),
         ),
         ResolutionStage::SourceClass => match trace.source_class {
             SkillSourceClass::CanonicalLocal => {
@@ -1572,8 +1579,7 @@ fn explain_summary(report: &ExplainReport) -> String {
             report
                 .winner
                 .as_ref()
-                .map(|winner| winner.root.as_str())
-                .unwrap_or("the active winner")
+                .map_or("the active winner", |winner| winner.root.as_str())
         ),
         ExplainStatus::Conflict => format!(
             "{} has a same-name conflict and no single active winner.",
@@ -1934,7 +1940,7 @@ fn collect_directory_files(
             path: current.to_path_buf(),
             source,
         })?;
-    entries.sort_by_key(|entry| entry.path());
+    entries.sort_by_key(std::fs::DirEntry::path);
 
     for entry in entries {
         let path = entry.path();
@@ -1949,10 +1955,16 @@ fn collect_directory_files(
         if metadata.is_dir() {
             collect_directory_files(root, &path, kind, files)?;
         } else if metadata.is_file() {
-            let relative_path = normalize_relative_path(
-                path.strip_prefix(root)
-                    .expect("nested path remains inside the root"),
-            )?;
+            let relative_path =
+                normalize_relative_path(path.strip_prefix(root).map_err(|_| {
+                    AppError::ResolutionValidation {
+                        message: format!(
+                            "{kind} path '{}' escaped the root '{}'",
+                            path.display(),
+                            root.display()
+                        ),
+                    }
+                })?)?;
             files.insert(relative_path, path);
         } else {
             return Err(AppError::ResolutionValidation {
@@ -2086,7 +2098,7 @@ fn collect_projection_files(
             path: current.to_path_buf(),
             source,
         })?;
-    entries.sort_by_key(|entry| entry.path());
+    entries.sort_by_key(std::fs::DirEntry::path);
 
     for entry in entries {
         let path = entry.path();
@@ -2104,7 +2116,13 @@ fn collect_projection_files(
 
         files.push(
             path.strip_prefix(root)
-                .expect("projection entry remains under the root")
+                .map_err(|_| AppError::ResolutionValidation {
+                    message: format!(
+                        "projected path '{}' escaped the root '{}'",
+                        path.display(),
+                        root.display()
+                    ),
+                })?
                 .to_path_buf(),
         );
     }
@@ -2174,7 +2192,7 @@ fn skill_error_issue(
         skill: root
             .file_name()
             .and_then(|segment| segment.to_str())
-            .map(|segment| segment.to_string()),
+            .map(std::string::ToString::to_string),
         scope: Some(scope.as_str().to_string()),
         target: None,
         path: Some(path_for_error(context, &error, root)),

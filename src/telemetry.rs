@@ -365,9 +365,10 @@ fn status_view(
     let effective = effective_settings(workspace, persisted);
 
     TelemetryStatusView {
-        consent: persisted
-            .map(|settings| settings.consent.as_str().to_string())
-            .unwrap_or_else(|| TelemetryConsent::Unknown.as_str().to_string()),
+        consent: persisted.map_or_else(
+            || TelemetryConsent::Unknown.as_str().to_string(),
+            |settings| settings.consent.as_str().to_string(),
+        ),
         notice_seen: persisted
             .and_then(|settings| settings.notice_seen_at.as_ref())
             .is_some(),
@@ -423,9 +424,8 @@ fn effective_settings(
     persisted: Option<&PersistedTelemetrySettings>,
 ) -> TelemetrySettings {
     let mode = telemetry_mode_from_manifest(workspace.mode);
-    let consent_enabled = persisted
-        .map(|settings| settings.consent == TelemetryConsent::Enabled)
-        .unwrap_or(false);
+    let consent_enabled =
+        persisted.is_some_and(|settings| settings.consent == TelemetryConsent::Enabled);
 
     TelemetrySettings {
         enabled: workspace.enabled && matches!(mode, TelemetryMode::PublicOnly) && consent_enabled,
@@ -502,14 +502,12 @@ fn classify_git_source_visibility(source: &NormalizedInstallSource) -> SourceVis
         return SourceVisibility::SuppressedPrivate;
     }
 
-    let parsed = match Url::parse(source.url.as_str()) {
-        Ok(parsed) => parsed,
-        Err(_) => return SourceVisibility::SuppressedPrivate,
+    let Ok(parsed) = Url::parse(source.url.as_str()) else {
+        return SourceVisibility::SuppressedPrivate;
     };
 
     match parsed.scheme() {
         "file" => SourceVisibility::SuppressedLocal,
-        "ssh" => SourceVisibility::SuppressedPrivate,
         "http" | "https" | "git" => {
             if !parsed.username().is_empty() {
                 return SourceVisibility::SuppressedPrivate;
@@ -522,8 +520,7 @@ fn classify_git_source_visibility(source: &NormalizedInstallSource) -> SourceVis
                 }
                 // Remote Git URLs can represent private repositories even on public forges.
                 // Keep them suppressed until visibility is proven by an explicit allowlist.
-                Some(_) => SourceVisibility::SuppressedPrivate,
-                None => SourceVisibility::SuppressedPrivate,
+                Some(_) | None => SourceVisibility::SuppressedPrivate,
             }
         }
         _ => SourceVisibility::SuppressedPrivate,

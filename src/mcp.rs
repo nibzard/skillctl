@@ -262,9 +262,11 @@ impl McpServer {
 
     fn handle_tools_list(&self, params: Value) -> Result<Value, RpcError> {
         let _: EmptyParams = parse_params_or_default(params)?;
-        let version = self
-            .negotiated_version
-            .expect("tools/list requires an initialized protocol version");
+        let Some(version) = self.negotiated_version else {
+            return Err(RpcError::invalid_request(
+                "tools/list requires protocol initialization".to_string(),
+            ));
+        };
 
         Ok(json!({
             "tools": tool_definitions(version)
@@ -273,9 +275,11 @@ impl McpServer {
 
     fn handle_tools_call(&self, params: Value) -> Result<Value, RpcError> {
         let params: ToolCallParams = parse_params(params)?;
-        let version = self
-            .negotiated_version
-            .expect("tools/call requires an initialized protocol version");
+        let Some(version) = self.negotiated_version else {
+            return Err(RpcError::invalid_request(
+                "tools/call requires protocol initialization".to_string(),
+            ));
+        };
         let arguments = object_arguments(params.arguments)?;
         let invocation = parse_tool_invocation(&params.name, arguments)?;
         let response = run_tool_command(&self.context, invocation);

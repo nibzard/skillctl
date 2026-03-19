@@ -824,7 +824,7 @@ fn collect_projection_files(
             path: current.to_path_buf(),
             source,
         })?;
-    entries.sort_by_key(|entry| entry.path());
+    entries.sort_by_key(std::fs::DirEntry::path);
 
     for entry in entries {
         let path = entry.path();
@@ -900,9 +900,10 @@ fn home_directory() -> Result<PathBuf, AppError> {
 }
 
 pub(crate) fn display_path(context: &AppContext, path: &Path) -> String {
-    path.strip_prefix(&context.working_directory)
-        .map(|relative| relative.display().to_string())
-        .unwrap_or_else(|_| path.display().to_string())
+    path.strip_prefix(&context.working_directory).map_or_else(
+        |_| path.display().to_string(),
+        |relative| relative.display().to_string(),
+    )
 }
 
 fn deduplicate_notes(notes: Vec<String>) -> Vec<String> {

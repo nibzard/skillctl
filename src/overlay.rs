@@ -569,7 +569,7 @@ fn copy_tree_contents(source_root: &Path, destination_root: &Path) -> Result<(),
             path: source_root.to_path_buf(),
             source,
         })?;
-    entries.sort_by_key(|entry| entry.file_name());
+    entries.sort_by_key(std::fs::DirEntry::file_name);
 
     for entry in entries {
         let source_path = entry.path();
@@ -736,7 +736,7 @@ fn collect_overlay_files(
             path: current.to_path_buf(),
             source,
         })?;
-    entries.sort_by_key(|entry| entry.path());
+    entries.sort_by_key(std::fs::DirEntry::path);
 
     for entry in entries {
         let path = entry.path();
@@ -753,7 +753,13 @@ fn collect_overlay_files(
         } else if metadata.is_file() {
             files.push(
                 path.strip_prefix(root)
-                    .expect("overlay file remains under the overlay root")
+                    .map_err(|_| AppError::ResolutionValidation {
+                        message: format!(
+                            "overlay path '{}' escaped the overlay root '{}'",
+                            path.display(),
+                            root.display()
+                        ),
+                    })?
                     .to_path_buf(),
             );
         } else {

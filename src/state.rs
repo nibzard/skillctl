@@ -1616,7 +1616,7 @@ fn validate_required_tables(connection: &Connection, path: &Path) -> Result<(), 
 
 fn local_state_schema_sql() -> String {
     format!(
-        r#"
+        r"
 CREATE TABLE install_records (
     scope TEXT NOT NULL CHECK (scope IN ('workspace', 'user')),
     skill_id TEXT NOT NULL,
@@ -1743,7 +1743,7 @@ CREATE INDEX idx_history_events_skill_time
     ON history_events (scope, skill_id, occurred_at DESC, id DESC);
 
 PRAGMA user_version = {version};
-"#,
+",
         version = CURRENT_LOCAL_STATE_VERSION
     )
 }

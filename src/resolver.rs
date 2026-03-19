@@ -549,8 +549,8 @@ fn resolve_projection(
 
     if let Some(best_priority) = manifest_priority {
         filtered.retain(|candidate| candidate.manifest_priority == Some(best_priority));
-        if filtered.len() == 1 {
-            let winner = filtered.into_iter().next().expect("winner exists");
+        if let [winner] = filtered.as_slice() {
+            let winner = winner.clone();
             let mut shadowed: Vec<_> = contenders
                 .into_iter()
                 .filter(|candidate| candidate.internal_id != winner.internal_id)
@@ -576,11 +576,11 @@ fn resolve_projection(
         .iter()
         .map(|candidate| candidate.source_class)
         .min()
-        .expect("projection contenders are never empty");
+        .unwrap_or(SkillSourceClass::CanonicalLocal);
     filtered.retain(|candidate| candidate.source_class == best_source_class);
 
-    if filtered.len() == 1 {
-        let winner = filtered.into_iter().next().expect("winner exists");
+    if let [winner] = filtered.as_slice() {
+        let winner = winner.clone();
         let mut shadowed: Vec<_> = contenders
             .into_iter()
             .filter(|candidate| candidate.internal_id != winner.internal_id)
@@ -646,7 +646,7 @@ fn collect_directory_files(
             path: current.to_path_buf(),
             source,
         })?;
-    entries.sort_by_key(|left| left.path());
+    entries.sort_by_key(std::fs::DirEntry::path);
 
     for entry in entries {
         let path = entry.path();
@@ -661,9 +661,16 @@ fn collect_directory_files(
         if metadata.is_dir() {
             collect_directory_files(root, &path, kind, files)?;
         } else if metadata.is_file() {
-            let relative_path = normalize_relative_filesystem_path(
-                path.strip_prefix(root).expect("path is nested"),
-            )?;
+            let relative_path =
+                normalize_relative_filesystem_path(path.strip_prefix(root).map_err(|_| {
+                    AppError::ResolutionValidation {
+                        message: format!(
+                            "{kind} path '{}' escaped the root '{}'",
+                            path.display(),
+                            root.display()
+                        ),
+                    }
+                })?)?;
             files.insert(
                 relative_path.clone(),
                 EffectiveSkillFile {

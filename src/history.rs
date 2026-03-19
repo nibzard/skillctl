@@ -766,7 +766,7 @@ pub fn handle_rollback(
             id: None,
             skill: managed_skill.clone(),
             rolled_back_at: timestamp.clone(),
-            from_reference: install_record.resolved_revision.clone(),
+            from_reference: install_record.resolved_revision,
             to_reference: request.version_or_commit.clone(),
         };
 
@@ -896,10 +896,14 @@ fn resolve_history_skill(
                 0 => Err(AppError::ResolutionValidation {
                     message: format!("skill '{}' has no recorded history", skill_name),
                 }),
-                1 => Ok(ManagedSkillRef::new(
-                    *matches.values().next().expect("one history scope exists"),
-                    skill_name,
-                )),
+                1 => matches.values().next().copied().map_or_else(
+                    || {
+                        Err(AppError::ResolutionValidation {
+                            message: format!("skill '{skill_name}' has no recorded history"),
+                        })
+                    },
+                    |scope| Ok(ManagedSkillRef::new(scope, skill_name)),
+                ),
                 _ => Err(AppError::ResolutionValidation {
                     message: format!(
                         "skill '{}' has recorded history in multiple scopes; re-run with --scope",

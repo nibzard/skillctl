@@ -348,19 +348,13 @@ pub fn handle_clean(context: &AppContext, _request: CleanRequest) -> Result<AppR
             let mut ledger = HistoryLedger::new(&mut store);
 
             for cleaned in &cleaned_projections {
-                let skill = cleaned.skill.as_ref().and_then(|skill_id| {
-                    installs
-                        .get(&(
-                            cleaned.scope.expect("projection cleanup includes a scope"),
-                            skill_id.clone(),
-                        ))
+                let skill = match (cleaned.scope, cleaned.skill.as_ref()) {
+                    (Some(scope), Some(skill_id)) => installs
+                        .get(&(scope, skill_id.clone()))
                         .cloned()
-                        .or_else(|| {
-                            cleaned
-                                .scope
-                                .map(|scope| ManagedSkillRef::new(scope, skill_id))
-                        })
-                });
+                        .or_else(|| Some(ManagedSkillRef::new(scope, skill_id))),
+                    _ => None,
+                };
                 ledger.record_cleanup(skill.as_ref(), &cleaned.path, &timestamp)?;
             }
 

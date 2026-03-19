@@ -94,7 +94,7 @@ fn workspace_copy_mode_matrix_matches_spec_target_combinations() {
             collect_paths(&body["data"]["plan"]["physical_roots"]),
             case.expected_roots
                 .iter()
-                .map(|root| root.to_string())
+                .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>(),
             "unexpected workspace roots for {}",
             case.name
@@ -117,7 +117,7 @@ fn workspace_copy_mode_matrix_matches_spec_target_combinations() {
             collect_strings(&body["data"]["canonical_roots"]),
             expected_canonical_roots
                 .iter()
-                .map(|root| root.to_string())
+                .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>(),
             "unexpected canonical roots for {}",
             case.name
@@ -126,7 +126,7 @@ fn workspace_copy_mode_matrix_matches_spec_target_combinations() {
             collect_paths(&body["data"]["generated_roots"]),
             expected_generated_roots
                 .iter()
-                .map(|root| root.to_string())
+                .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>(),
             "unexpected generated roots for {}",
             case.name
@@ -246,7 +246,7 @@ fn user_copy_mode_matrix_matches_spec_target_combinations() {
             collect_paths(&body["data"]["projection"]["plan"]["physical_roots"]),
             case.expected_roots
                 .iter()
-                .map(|root| root.to_string())
+                .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>(),
             "unexpected user roots for {}",
             case.name

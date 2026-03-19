@@ -210,12 +210,7 @@ fn render_human_response(verbosity: Verbosity, response: AppResponse) -> Rendere
         }
 
         if matches!(verbosity, Verbosity::Verbose) && has_data {
-            let _ = writeln!(
-                stdout,
-                "{}",
-                serde_json::to_string_pretty(&response.data)
-                    .expect("serializing a JSON value should never fail")
-            );
+            let _ = writeln!(stdout, "{}", render_response_data(&response.data));
         }
 
         RenderedOutput {
@@ -230,12 +225,7 @@ fn render_human_response(verbosity: Verbosity, response: AppResponse) -> Rendere
         }
 
         if matches!(verbosity, Verbosity::Verbose) && has_data {
-            let _ = writeln!(
-                stderr,
-                "{}",
-                serde_json::to_string_pretty(&response.data)
-                    .expect("serializing a JSON value should never fail")
-            );
+            let _ = writeln!(stderr, "{}", render_response_data(&response.data));
         }
 
         RenderedOutput {
@@ -243,6 +233,12 @@ fn render_human_response(verbosity: Verbosity, response: AppResponse) -> Rendere
             stderr,
         }
     }
+}
+
+fn render_response_data(data: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(data).unwrap_or_else(|error| {
+        format!("{{\"render_error\":\"failed to serialize structured response data: {error}\"}}")
+    })
 }
 
 fn render_parse_error(
@@ -405,9 +401,11 @@ fn response_has_data(response: &AppResponse) -> bool {
 fn help_text() -> String {
     let mut command = Cli::command();
     let mut buffer = Vec::new();
-    command.write_long_help(&mut buffer).expect("write help");
+    if command.write_long_help(&mut buffer).is_err() {
+        return "failed to render help text\n".to_string();
+    }
 
-    let mut help = String::from_utf8(buffer).expect("clap help is valid utf-8");
+    let mut help = String::from_utf8_lossy(&buffer).into_owned();
     help.push('\n');
     help
 }

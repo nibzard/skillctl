@@ -795,12 +795,10 @@ fn build_install_operation(
     let effective_version_hash =
         compute_effective_version_hash(&revision.resolved, &content_hash, &overlay_hash);
     let stored_source_root = context.imports_root.join(&import_id);
-    let first_installed_at = context
-        .lockfile
-        .imports
-        .get(&import_id)
-        .map(|entry| entry.timestamps.first_installed_at.clone())
-        .unwrap_or_else(|| LockfileTimestamp::new(context.install_timestamp.to_string()));
+    let first_installed_at = context.lockfile.imports.get(&import_id).map_or_else(
+        || LockfileTimestamp::new(context.install_timestamp.to_string()),
+        |entry| entry.timestamps.first_installed_at.clone(),
+    );
 
     Ok(InstallOperation {
         installed: InstalledSkill {
@@ -922,7 +920,7 @@ fn copy_directory_contents(source_root: &Path, destination_root: &Path) -> Resul
             path: source_root.to_path_buf(),
             source,
         })?;
-    entries.sort_by_key(|entry| entry.file_name());
+    entries.sort_by_key(std::fs::DirEntry::file_name);
 
     for entry in entries {
         let source_path = entry.path();
@@ -986,10 +984,10 @@ fn record_install_state(
 
     for operation in operations {
         let skill = ManagedSkillRef::new(managed_scope, operation.installed.name.clone());
-        let installed_at = store
-            .install_record(&skill)?
-            .map(|record| record.installed_at)
-            .unwrap_or_else(|| install_timestamp.to_string());
+        let installed_at = store.install_record(&skill)?.map_or_else(
+            || install_timestamp.to_string(),
+            |record| record.installed_at,
+        );
         installed_at_by_skill.insert(operation.installed.name.clone(), installed_at);
 
         store.upsert_pin_record(&PinRecord {
@@ -1099,8 +1097,7 @@ fn install_summary(installed: &[InstalledSkill], sync_report: &MaterializationRe
         plural_suffix(count),
         installed
             .first()
-            .map(|skill| skill.scope.as_str())
-            .unwrap_or("workspace")
+            .map_or("workspace", |skill| skill.scope.as_str())
     );
 
     if sync_report.materialized_skills == 0 {
@@ -1144,7 +1141,7 @@ pub(crate) fn current_timestamp() -> String {
 
     OffsetDateTime::now_utc()
         .format(format)
-        .expect("current timestamp formats as RFC3339")
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
 pub(crate) fn compute_effective_version_hash(
@@ -1342,29 +1339,31 @@ fn prepare_source(source: &ResolvedInstallSource) -> Result<PreparedSource, AppE
 }
 
 fn prepare_local_path(source: &ResolvedInstallSource) -> Result<PreparedSource, AppError> {
-    let path = source
-        .local_path
-        .as_ref()
-        .expect("local path sources always carry a path")
-        .clone();
+    let Some(path) = source.local_path.as_ref() else {
+        return Err(source_validation(
+            &source.normalized.raw,
+            "local path sources must carry a canonical local path",
+        ));
+    };
 
     Ok(PreparedSource {
         source: source.normalized.clone(),
         revision: SourceRevision {
-            resolved: hash_directory_contents(&path)?,
+            resolved: hash_directory_contents(path)?,
             upstream: None,
         },
-        root: path,
+        root: path.clone(),
         _staging_dir: None,
     })
 }
 
 fn prepare_archive(source: &ResolvedInstallSource) -> Result<PreparedSource, AppError> {
-    let archive_path = source
-        .local_path
-        .as_ref()
-        .expect("archive sources always carry a path")
-        .clone();
+    let Some(archive_path) = source.local_path.as_ref() else {
+        return Err(source_validation(
+            &source.normalized.raw,
+            "archive sources must carry a canonical archive path",
+        ));
+    };
     let staging_dir = TempDir::new().map_err(|source| AppError::FilesystemOperation {
         action: "create archive staging directory",
         path: std::env::temp_dir(),
@@ -1377,13 +1376,13 @@ fn prepare_archive(source: &ResolvedInstallSource) -> Result<PreparedSource, App
         source,
     })?;
 
-    extract_archive(&archive_path, &extract_root, &source.normalized.raw)?;
+    extract_archive(archive_path, &extract_root, &source.normalized.raw)?;
     let root = normalized_extraction_root(&extract_root)?;
 
     Ok(PreparedSource {
         source: source.normalized.clone(),
         revision: SourceRevision {
-            resolved: hash_file_contents(&archive_path)?,
+            resolved: hash_file_contents(archive_path)?,
             upstream: None,
         },
         root,
@@ -1780,7 +1779,14 @@ fn collect_relative_paths(
         let path = entry.path();
         let relative = path
             .strip_prefix(root)
-            .expect("path is under root")
+            .map_err(|_| AppError::SourceValidation {
+                input: root.display().to_string(),
+                message: format!(
+                    "path '{}' escaped the hashed source root '{}'",
+                    path.display(),
+                    root.display()
+                ),
+            })?
             .to_path_buf();
         entries.push(relative.clone());
 

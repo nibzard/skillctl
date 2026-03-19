@@ -71,7 +71,7 @@ impl LifecycleTransaction {
         Ok(())
     }
 
-    fn rollback(&mut self) -> Result<(), AppError> {
+    fn rollback(&self) -> Result<(), AppError> {
         let mut paths = self.tracked_paths.keys().cloned().collect::<Vec<_>>();
         paths.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
 
@@ -250,7 +250,7 @@ fn copy_tree(source: &Path, destination: &Path, action: &'static str) -> Result<
                 path: source.to_path_buf(),
                 source: source_error,
             })?;
-        entries.sort_by_key(|entry| entry.file_name());
+        entries.sort_by_key(std::fs::DirEntry::file_name);
         for entry in entries {
             copy_tree(&entry.path(), &destination.join(entry.file_name()), action)?;
         }

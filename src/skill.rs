@@ -585,7 +585,7 @@ pub fn handle_path(context: &AppContext, request: PathRequest) -> Result<AppResp
                     .join(request.skill.as_str());
                 fs::metadata(&local_root)
                     .ok()
-                    .filter(|metadata| metadata.is_dir())
+                    .filter(std::fs::Metadata::is_dir)
                     .map(|_| planner::display_path(context, &local_root))
             } else {
                 None

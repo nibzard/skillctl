@@ -179,7 +179,7 @@ fn ensure_bundled_skill_inner(context: &AppContext, force: bool) -> Result<bool,
         requested_reference: env!("CARGO_PKG_VERSION").to_string(),
         resolved_revision: env!("CARGO_PKG_VERSION").to_string(),
         effective_version_hash: Some(effective_version_hash),
-        pinned_at: timestamp.clone(),
+        pinned_at: timestamp,
     })?;
 
     let mut ledger = HistoryLedger::new(&mut store);
@@ -480,9 +480,8 @@ fn builtin_projection_state(path: &Path) -> Result<BundledProjectionState, AppEr
             });
         }
     };
-    let parsed = match serde_json::from_str::<Value>(&contents) {
-        Ok(parsed) => parsed,
-        Err(_) => return Ok(BundledProjectionState::Conflict),
+    let Ok(parsed) = serde_json::from_str::<Value>(&contents) else {
+        return Ok(BundledProjectionState::Conflict);
     };
 
     let is_bundled = parsed.get("tool").and_then(Value::as_str) == Some("skillctl")
@@ -549,7 +548,7 @@ fn collect_projected_files(
             path: root.to_path_buf(),
             source,
         })?;
-    entries.sort_by_key(|entry| entry.file_name());
+    entries.sort_by_key(std::fs::DirEntry::file_name);
 
     for entry in entries {
         let file_name = entry.file_name().to_string_lossy().into_owned();
@@ -686,9 +685,10 @@ fn install_record_from_state(
         content_hash: content_hash.to_string(),
         overlay_hash: NO_OVERLAY_HASH.to_string(),
         effective_version_hash: effective_version_hash.to_string(),
-        installed_at: existing
-            .map(|record| record.installed_at.clone())
-            .unwrap_or_else(|| timestamp.to_string()),
+        installed_at: existing.map_or_else(
+            || timestamp.to_string(),
+            |record| record.installed_at.clone(),
+        ),
         updated_at: timestamp.to_string(),
         detached: false,
         forked: false,
