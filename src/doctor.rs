@@ -27,6 +27,7 @@ use crate::{
     },
     source::imports_store_root,
     state::{LocalStateStore, ManagedScope, ManagedSkillRef},
+    trust::SkillTrust,
 };
 use serde::Serialize;
 
@@ -71,6 +72,9 @@ pub struct DiagnosticIssue {
     /// Related filesystem path when applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Trust decision associated with the issue, when relevant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust: Option<SkillTrust>,
     /// Plain-English explanation.
     pub message: String,
     /// Suggested next action.
@@ -221,6 +225,7 @@ pub fn handle_doctor(
                 scope: Some("user".to_string()),
                 target: None,
                 path: diagnostic.path,
+                trust: None,
                 message: diagnostic.message,
                 fix: diagnostic.fix,
             }),
@@ -297,6 +302,7 @@ fn analyze_workspace(context: &AppContext) -> Result<WorkspaceAnalysis, AppError
                     scope: None,
                     target: None,
                     path: None,
+                    trust: None,
                     message: error.to_string(),
                     fix: Some(
                         "fix validation errors in the manifest, lockfile, overlays, or stored imports"
@@ -361,6 +367,7 @@ fn collect_validation_issues(
                         scope: Some(ManagedScope::Workspace.as_str().to_string()),
                         target: None,
                         path: Some(planner::display_path(context, &root)),
+                        trust: None,
                         message: format!(
                             "canonical skills root '{}' contains a non-directory entry",
                             planner::display_path(context, &root)
@@ -396,6 +403,7 @@ fn collect_validation_issues(
                 scope: Some(ManagedScope::Workspace.as_str().to_string()),
                 target: None,
                 path: Some(planner::display_path(context, &skills_root)),
+                trust: None,
                 message: format!(
                     "canonical skills root '{}' must be a directory",
                     planner::display_path(context, &skills_root)
@@ -441,6 +449,7 @@ fn validate_import(
             scope: Some(scope.as_str().to_string()),
             target: None,
             path: Some(lockfile.path.display().to_string()),
+            trust: None,
             message: format!(
                 "enabled import '{}' is missing from the lockfile",
                 import.id
@@ -551,6 +560,7 @@ fn doctor_issues(
                     scope: Some(scope.as_str().to_string()),
                     target: Some(*target),
                     path: None,
+                    trust: None,
                     message: format!(
                         "target '{}' documents unstable symlink behavior; copy mode is safer",
                         target.as_str()
@@ -614,6 +624,7 @@ fn graph_shadowing_issues(
             scope: Some(scope.as_str().to_string()),
             target: None,
             path: None,
+            trust: None,
             message: format!(
                 "'{}' resolves to {} and shadows {}",
                 projection.name,
@@ -652,6 +663,7 @@ fn graph_conflict_issues(scope: ManagedScope, graph: &EffectiveSkillGraph) -> Ve
             scope: Some(scope.as_str().to_string()),
             target: None,
             path: None,
+            trust: None,
             message: format!(
                 "same-name conflict remains for '{}' across {}",
                 conflict.name,
@@ -712,6 +724,7 @@ fn script_risk_issues(scope: ManagedScope, graph: &EffectiveSkillGraph) -> Vec<D
             scope: Some(scope.as_str().to_string()),
             target: None,
             path: Some(candidate.skill.root.display().to_string()),
+            trust: Some(crate::trust::trust_for_candidate(candidate)),
             message: format!(
                 "imported skill '{}' contains files under scripts/ and should be reviewed before use",
                 candidate.skill.name.as_str()
@@ -752,6 +765,7 @@ fn projection_record_issues(
                 scope: Some(scope.as_str().to_string()),
                 target: Some(record.target),
                 path: Some(record.physical_root.clone()),
+                trust: None,
                 message: format!(
                     "target '{}' is projected into '{}' but the manifest now plans '{}'",
                     record.target.as_str(),
@@ -784,6 +798,7 @@ fn projection_record_issues(
                     scope: Some(scope.as_str().to_string()),
                     target: Some(assignment.target),
                     path: Some(path),
+                    trust: None,
                     message: format!(
                         "target '{}' currently materializes a copy that does not match the active winner",
                         assignment.target.as_str()
@@ -817,6 +832,7 @@ fn stale_lockfile_issues(
             scope: None,
             target: None,
             path: Some(lockfile.path.display().to_string()),
+            trust: None,
             message: format!(
                 "lockfile entry '{}' no longer has a matching manifest import",
                 id
@@ -926,6 +942,7 @@ fn build_explain_report(
                     scope: Some(scope.as_str().to_string()),
                     target: None,
                     path: None,
+                    trust: None,
                     message: format!("same-name conflict remains for '{}'", skill_name),
                     fix: Some(
                         "adjust manifest priorities or remove one of the conflicting skill sources"
@@ -1132,6 +1149,7 @@ fn missing_skill_issues(
             scope: Some(scope.as_str().to_string()),
             target: None,
             path: Some(analysis.manifest.path.display().to_string()),
+            trust: None,
             message: format!("manifest import '{}' exists but is disabled", skill_name),
             fix: Some(format!("run skillctl enable {skill_name}")),
         });
@@ -1145,6 +1163,7 @@ fn missing_skill_issues(
             scope: Some(scope.as_str().to_string()),
             target: None,
             path: Some(analysis.lockfile.path.display().to_string()),
+            trust: None,
             message: format!(
                 "lockfile still contains '{}' even though no active candidate resolves for it",
                 skill_name
@@ -1297,6 +1316,7 @@ fn skill_target_compatibility_issues(
                 scope: None,
                 target: None,
                 path: path.clone(),
+                trust: None,
                 message: format!(
                     "skill '{}' includes {} but enabled targets {} may ignore it",
                     skill.name.as_str(),
@@ -1340,6 +1360,7 @@ fn skill_target_compatibility_issues(
                 scope: None,
                 target: None,
                 path,
+                trust: None,
                 message: format!(
                     "skill '{}' uses Claude-specific frontmatter fields {} that enabled targets {} may ignore",
                     skill.name.as_str(),
@@ -1423,6 +1444,7 @@ fn ensure_directory_issue(
             scope: Some(scope.as_str().to_string()),
             target: None,
             path: Some(planner::display_path(context, path)),
+            trust: None,
             message: format!(
                 "{} '{}' must be a directory",
                 label,
@@ -1437,6 +1459,7 @@ fn ensure_directory_issue(
             scope: Some(scope.as_str().to_string()),
             target: None,
             path: Some(planner::display_path(context, path)),
+            trust: None,
             message: format!(
                 "{} '{}' does not exist",
                 label,
@@ -1451,6 +1474,7 @@ fn ensure_directory_issue(
             scope: Some(scope.as_str().to_string()),
             target: None,
             path: Some(planner::display_path(context, path)),
+            trust: None,
             message: format!(
                 "failed to inspect '{}': {}",
                 planner::display_path(context, path),
@@ -1482,6 +1506,7 @@ fn apply_overlay_validation(
                 scope: Some(ManagedScope::Workspace.as_str().to_string()),
                 target: None,
                 path: Some(planner::display_path(context, &overlay_root)),
+                trust: None,
                 message: format!(
                     "overlay root '{}' must be a directory",
                     planner::display_path(context, &overlay_root)
@@ -1499,6 +1524,7 @@ fn apply_overlay_validation(
                 scope: Some(ManagedScope::Workspace.as_str().to_string()),
                 target: None,
                 path: Some(planner::display_path(context, &overlay_root)),
+                trust: None,
                 message: format!(
                     "overlay root '{}' does not exist",
                     planner::display_path(context, &overlay_root)
@@ -1531,6 +1557,7 @@ fn apply_overlay_validation(
                     scope: Some(ManagedScope::Workspace.as_str().to_string()),
                     target: None,
                     path: Some(planner::display_path(context, &source_path)),
+                    trust: None,
                     message: error.to_string(),
                     fix: Some("remove the invalid overlay path or normalize it".to_string()),
                 });
@@ -1546,6 +1573,7 @@ fn apply_overlay_validation(
                 scope: Some(ManagedScope::Workspace.as_str().to_string()),
                 target: None,
                 path: Some(planner::display_path(context, &source_path)),
+                trust: None,
                 message: format!(
                     "overlay file '{}' does not map to a file in the imported skill",
                     planner::display_path(context, &source_path)
@@ -1854,6 +1882,7 @@ fn skill_error_issue(
         scope: Some(scope.as_str().to_string()),
         target: None,
         path: Some(path_for_error(context, &error, root)),
+        trust: None,
         message: error.to_string(),
         fix: Some("fix the SKILL.md contents or remove the malformed skill".to_string()),
     }

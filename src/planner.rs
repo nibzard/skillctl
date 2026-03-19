@@ -27,6 +27,7 @@ use crate::{
         ManagedScope, ManagedSkillRef, ProjectionRecord, UpdateCheckOutcome, UpdateCheckRecord,
     },
     telemetry,
+    trust::SkillTrust,
 };
 
 /// Reusable projection-root plan shared by sync, doctor, explain, and JSON output.
@@ -137,7 +138,10 @@ pub fn handle_update(
 
         {
             let mut ledger = HistoryLedger::new(&mut store);
-            ledger.record_update_check(&prepared.update_check)?;
+            ledger.record_update_check_with_trust(
+                &prepared.update_check,
+                prepared.plan.trust.as_ref(),
+            )?;
             for modification in &prepared.local_modification_records {
                 ledger.record_local_modification(modification)?;
             }
@@ -152,12 +156,25 @@ pub fn handle_update(
         summary.push('\n');
         summary.push_str(notice);
     }
-    Ok(AppResponse::success("update")
+    let mut response = AppResponse::success("update")
         .with_summary(summary)
         .with_data(json!({
             "plans": plans,
             "telemetry": telemetry,
-        })))
+        }));
+    let mut warnings = BTreeSet::new();
+    for plan in &plans {
+        if let Some(trust) = &plan.trust {
+            for warning in &trust.warnings {
+                warnings.insert(warning.clone());
+            }
+        }
+    }
+    for warning in warnings {
+        response = response.with_warning(warning);
+    }
+
+    Ok(response)
 }
 
 /// Planner recommendation for how to respond to one update result.
@@ -231,6 +248,9 @@ pub struct SkillUpdatePlan {
     pub available_actions: Vec<UpdateAction>,
     /// Structured local-change details discovered during the check.
     pub modifications: Vec<PlannedModification>,
+    /// Trust decision for the effective skill during this update check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust: Option<SkillTrust>,
     /// Additional explanatory notes for humans and agents.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
@@ -258,6 +278,10 @@ fn prepare_update_plan(
     let mut modifications = Vec::new();
     let mut local_modification_records = Vec::new();
     let mut notes = Vec::new();
+    let mut trust = match candidate {
+        Some(candidate) => crate::trust::trust_for_candidate(candidate),
+        None => crate::trust::trust_for_install_record(install, false, None)?,
+    };
 
     if install.detached || install.forked {
         let detail = if install.forked {
@@ -317,6 +341,7 @@ fn prepare_update_plan(
                 recommended_action: UpdateAction::Skip,
                 available_actions: vec![UpdateAction::Skip],
                 modifications,
+                trust: Some(trust),
                 notes,
             },
             update_check,
@@ -345,8 +370,8 @@ fn prepare_update_plan(
     let overlay_detected = overlay_state.is_some();
     let latest_revision;
     let outcome;
-    let recommended_action;
-    let available_actions;
+    let mut recommended_action;
+    let mut available_actions;
 
     match install.source_kind {
         SourceKind::LocalPath | SourceKind::Archive => {
@@ -435,6 +460,18 @@ fn prepare_update_plan(
                             notes.push("pinned revision already matches upstream".to_string());
                         }
                     }
+
+                    if update_available && !local_modification_detected {
+                        trust = trust.block_apply_update(install.skill.skill_id.as_str());
+                        if !trust.blocked_actions.is_empty() {
+                            recommended_action = UpdateAction::Skip;
+                            available_actions = vec![UpdateAction::Skip];
+                            notes.push(format!(
+                                "trust gate is blocking apply for '{}' until the import is reviewed or forked",
+                                install.skill.skill_id
+                            ));
+                        }
+                    }
                 }
                 Err(message) => {
                     latest_revision = None;
@@ -486,6 +523,7 @@ fn prepare_update_plan(
             recommended_action,
             available_actions,
             modifications,
+            trust: Some(trust),
             notes,
         },
         update_check,

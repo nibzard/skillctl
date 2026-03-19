@@ -697,6 +697,7 @@ mod tests {
             content_hash: "sha256:content".to_string(),
             overlay_hash: "sha256:none".to_string(),
             effective_version_hash: "sha256:effective".to_string(),
+            trust: crate::trust::SkillTrust::local(false),
         };
         let update = SkillUpdatePlan {
             skill: "release-notes".to_string(),
@@ -715,6 +716,7 @@ mod tests {
             recommended_action: UpdateAction::Apply,
             available_actions: vec![UpdateAction::Apply, UpdateAction::Skip],
             modifications: Vec::new(),
+            trust: Some(crate::trust::SkillTrust::local(false)),
             notes: Vec::new(),
         };
 
@@ -773,6 +775,7 @@ mod tests {
             recommended_action: UpdateAction::Apply,
             available_actions: vec![UpdateAction::Apply],
             modifications: Vec::new(),
+            trust: Some(crate::trust::SkillTrust::local(false)),
             notes: Vec::new(),
         };
 

@@ -25,6 +25,7 @@ pub mod skill;
 pub mod source;
 pub mod state;
 pub mod telemetry;
+pub mod trust;
 pub mod tui;
 
 pub use runtime::{run, run_from_args};

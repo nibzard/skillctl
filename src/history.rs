@@ -33,6 +33,7 @@ use crate::{
         insert_update_check_record_in, upsert_install_record_in, upsert_pin_record_in,
         upsert_projection_record_in, upsert_telemetry_settings_in,
     },
+    trust::SkillTrust,
 };
 
 /// Kinds of history events the ledger can record.
@@ -121,6 +122,23 @@ impl<'store> HistoryLedger<'store> {
 
     /// Record a newly installed skill and append a matching history entry.
     pub fn record_install(&mut self, record: &InstallRecord) -> Result<i64, AppError> {
+        self.record_install_with_optional_trust(record, None)
+    }
+
+    /// Record a newly installed skill and attach trust details to local history.
+    pub fn record_install_with_trust(
+        &mut self,
+        record: &InstallRecord,
+        trust: &SkillTrust,
+    ) -> Result<i64, AppError> {
+        self.record_install_with_optional_trust(record, Some(trust))
+    }
+
+    fn record_install_with_optional_trust(
+        &mut self,
+        record: &InstallRecord,
+        trust: Option<&SkillTrust>,
+    ) -> Result<i64, AppError> {
         let entry = HistoryEntry {
             id: None,
             kind: HistoryEventKind::Install,
@@ -132,7 +150,7 @@ impl<'store> HistoryLedger<'store> {
                 "Installed {} at {}",
                 record.skill.skill_id, record.resolved_revision
             ),
-            details: install_details(record),
+            details: install_details(record, trust),
         };
 
         self.store
@@ -144,6 +162,15 @@ impl<'store> HistoryLedger<'store> {
 
     /// Record an upstream update check and append a matching history entry.
     pub fn record_update_check(&mut self, record: &UpdateCheckRecord) -> Result<i64, AppError> {
+        self.record_update_check_with_trust(record, None)
+    }
+
+    /// Record an upstream update check with trust details.
+    pub fn record_update_check_with_trust(
+        &mut self,
+        record: &UpdateCheckRecord,
+        trust: Option<&SkillTrust>,
+    ) -> Result<i64, AppError> {
         let entry = HistoryEntry {
             id: None,
             kind: HistoryEventKind::UpdateCheck,
@@ -152,7 +179,7 @@ impl<'store> HistoryLedger<'store> {
             target: None,
             occurred_at: record.checked_at.clone(),
             summary: format!("Checked {} for updates", record.skill.skill_id),
-            details: update_check_details(record),
+            details: update_check_details(record, trust),
         };
 
         self.store
@@ -168,7 +195,7 @@ impl<'store> HistoryLedger<'store> {
         previous_revision: &str,
         record: &InstallRecord,
     ) -> Result<i64, AppError> {
-        let mut details = install_details(record);
+        let mut details = install_details(record, None);
         details.insert("previous_revision".to_string(), json!(previous_revision));
 
         let entry = HistoryEntry {
@@ -317,7 +344,7 @@ impl<'store> HistoryLedger<'store> {
             });
         }
 
-        let mut details = install_details(record);
+        let mut details = install_details(record, None);
         details.insert("local_root".to_string(), json!(local_root));
 
         let entry = HistoryEntry {
@@ -351,7 +378,7 @@ impl<'store> HistoryLedger<'store> {
             });
         }
 
-        let mut details = install_details(record);
+        let mut details = install_details(record, None);
         details.insert("local_root".to_string(), json!(local_root));
 
         let entry = HistoryEntry {
@@ -1182,7 +1209,7 @@ fn history_string(details: &HistoryDetails, key: &str) -> Option<String> {
     details.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
-fn install_details(record: &InstallRecord) -> HistoryDetails {
+fn install_details(record: &InstallRecord, trust: Option<&SkillTrust>) -> HistoryDetails {
     let mut details = BTreeMap::new();
     details.insert("scope".to_string(), json!(record.skill.scope.as_str()));
     details.insert("source_kind".to_string(), json!(record_source_kind(record)));
@@ -1203,6 +1230,9 @@ fn install_details(record: &InstallRecord) -> HistoryDetails {
     );
     details.insert("detached".to_string(), json!(record.detached));
     details.insert("forked".to_string(), json!(record.forked));
+    if let Some(trust) = trust {
+        details.insert("trust".to_string(), json!(trust));
+    }
     details
 }
 
@@ -1222,7 +1252,7 @@ fn projection_details(record: &ProjectionRecord) -> HistoryDetails {
     details
 }
 
-fn update_check_details(record: &UpdateCheckRecord) -> HistoryDetails {
+fn update_check_details(record: &UpdateCheckRecord, trust: Option<&SkillTrust>) -> HistoryDetails {
     let mut details = BTreeMap::new();
     details.insert("pinned_revision".to_string(), json!(record.pinned_revision));
     if let Some(latest_revision) = &record.latest_revision {
@@ -1239,6 +1269,9 @@ fn update_check_details(record: &UpdateCheckRecord) -> HistoryDetails {
     );
     if let Some(notes) = &record.notes {
         details.insert("notes".to_string(), json!(notes));
+    }
+    if let Some(trust) = trust {
+        details.insert("trust".to_string(), json!(trust));
     }
     details
 }

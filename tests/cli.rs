@@ -500,6 +500,55 @@ fn install_shows_a_first_run_telemetry_notice_and_persists_default_consent() {
 }
 
 #[test]
+fn install_warns_and_reports_trust_for_unreviewed_script_imports() {
+    let workspace = TestWorkspace::new();
+    workspace.write_skill_source("shared-skills", "release-notes");
+    workspace.write_file(
+        "shared-skills/.agents/skills/release-notes/scripts/release.sh",
+        "#!/bin/sh\necho release\n",
+    );
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args([
+            "--json",
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::is_empty());
+
+    let body: Value =
+        serde_json::from_slice(&assert.get_output().stdout).expect("stdout is valid json");
+    let trust = &body["data"]["installed"][0]["trust"];
+
+    assert_eq!(body["command"], "install");
+    assert_eq!(body["ok"], true);
+    assert!(
+        body["warnings"]
+            .as_array()
+            .expect("warnings array exists")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .expect("warning exists")
+                .contains("contains scripts and remains unreviewed")),
+        "unexpected warnings: {body:#?}",
+    );
+    assert_eq!(trust["source_state"], "imported-unreviewed");
+    assert_eq!(trust["effective_state"], "imported-unreviewed");
+    assert_eq!(trust["risk_level"], "elevated");
+    assert_eq!(trust["contains_scripts"], true);
+    assert_eq!(trust["review_required"], true);
+}
+
+#[test]
 fn telemetry_status_enable_and_disable_use_the_local_state_store() {
     let workspace = TestWorkspace::new();
 
@@ -1035,6 +1084,54 @@ fn doctor_reports_stale_lockfile_entries() {
             .any(|issue| issue["code"] == "stale-lockfile-entry" && issue["skill"] == "stale-skill"),
         "unexpected issues: {body:#?}",
     );
+}
+
+#[test]
+fn doctor_reports_trust_details_for_unreviewed_script_imports() {
+    let workspace = TestWorkspace::new();
+    workspace.write_skill_source("shared-skills", "release-notes");
+    workspace.write_file(
+        "shared-skills/.agents/skills/release-notes/scripts/release.sh",
+        "#!/bin/sh\necho release\n",
+    );
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::is_empty());
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--json", "doctor"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::is_empty());
+
+    let body: Value =
+        serde_json::from_slice(&assert.get_output().stdout).expect("stdout is valid json");
+    let issue = body["data"]["issues"]
+        .as_array()
+        .expect("issues array exists")
+        .iter()
+        .find(|issue| issue["code"] == "script-risk" && issue["skill"] == "release-notes")
+        .expect("script-risk issue exists");
+
+    assert_eq!(issue["trust"]["source_state"], "imported-unreviewed");
+    assert_eq!(issue["trust"]["effective_state"], "imported-unreviewed");
+    assert_eq!(issue["trust"]["risk_level"], "elevated");
+    assert_eq!(issue["trust"]["contains_scripts"], true);
 }
 
 #[test]
@@ -1713,6 +1810,85 @@ fn update_blocks_when_a_projected_copy_was_edited_directly() {
         .collect::<Result<_, _>>()
         .expect("modification rows decode");
     assert_eq!(modification_kinds, vec!["projected-copy".to_string()]);
+}
+
+#[test]
+fn update_downgrades_apply_recommendations_for_unreviewed_script_imports() {
+    let workspace = TestWorkspace::new();
+    workspace.write_skill_source("git-source", "release-notes");
+    workspace.write_file(
+        "git-source/.agents/skills/release-notes/scripts/release.sh",
+        "#!/bin/sh\necho release\n",
+    );
+    workspace.init_git_repo("git-source");
+    let repo_url = workspace.git_repo_url("git-source");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            repo_url.as_str(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::is_empty());
+
+    workspace.write_skill_source_at(
+        "git-source",
+        ".agents/skills/release-notes",
+        "release-notes",
+        "Updated upstream release notes helper.",
+    );
+    workspace.commit_all("git-source", "update release notes");
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--json", "update", "release-notes"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::is_empty());
+
+    let body: Value =
+        serde_json::from_slice(&assert.get_output().stdout).expect("stdout is valid json");
+    let plan = &body["data"]["plans"][0];
+    let trust = &plan["trust"];
+
+    assert_eq!(plan["outcome"], "update-available");
+    assert_eq!(plan["recommended_action"], "skip");
+    assert_eq!(plan["available_actions"], json!(["skip"]));
+    assert_eq!(trust["source_state"], "imported-unreviewed");
+    assert_eq!(trust["risk_level"], "elevated");
+    assert_eq!(trust["contains_scripts"], true);
+    assert_eq!(trust["blocked_actions"], json!(["apply-update"]));
+    assert!(
+        plan["notes"]
+            .as_array()
+            .expect("notes array exists")
+            .iter()
+            .any(|note| note.as_str().expect("note exists").contains("trust gate")),
+        "unexpected notes: {body:#?}",
+    );
+
+    let connection = Connection::open(workspace.home_path().join(".skillctl/state.db"))
+        .expect("state database opens");
+    let details_json: String = connection
+        .query_row(
+            "SELECT details_json FROM history_events \
+             WHERE skill_id = ?1 AND kind = ?2 ORDER BY occurred_at DESC, id DESC LIMIT 1",
+            params!["release-notes", "update-check"],
+            |row| row.get(0),
+        )
+        .expect("update-check history exists");
+    let details: Value = serde_json::from_str(&details_json).expect("details json is valid");
+    assert_eq!(details["trust"]["risk_level"], "elevated");
+    assert_eq!(details["trust"]["blocked_actions"], json!(["apply-update"]));
 }
 
 #[test]

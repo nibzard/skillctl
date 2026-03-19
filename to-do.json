@@ -501,7 +501,7 @@
         "T011",
         "T018"
       ],
-      "updated_at": "2026-03-19T14:20:58Z",
+      "updated_at": "2026-03-19T14:21:50Z",
       "files": [
         "assets/bundled/skillctl/SKILL.md",
         "src/builtin.rs",
@@ -548,7 +548,7 @@
       "id": "T021",
       "title": "Implement trust states and security warnings for untrusted or risky skills",
       "priority": 3,
-      "status": "todo",
+      "status": "done",
       "details": "Add the trust model needed to identify risky installs, script-bearing skills from untrusted sources, and operations that should be blocked or downgraded.",
       "steps": [
         "Model trust state for sources and effective skills so install, update, and doctor can reason about risk.",
@@ -560,6 +560,17 @@
         "T013",
         "T016",
         "T018"
+      ],
+      "updated_at": "2026-03-19T14:39:51Z",
+      "files": [
+        "src/trust.rs",
+        "src/source.rs",
+        "src/planner.rs",
+        "src/doctor.rs",
+        "src/history.rs",
+        "src/lib.rs",
+        "src/telemetry.rs",
+        "tests/cli.rs"
       ]
     },
     {

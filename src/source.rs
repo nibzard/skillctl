@@ -40,6 +40,7 @@ use crate::{
         ProjectionRecord,
     },
     telemetry,
+    trust::SkillTrust,
 };
 
 const DETECTION_ROOTS: &[DetectionRoot] = &[
@@ -148,6 +149,8 @@ pub struct InstallCandidate {
     pub compatible_targets: Vec<TargetRuntime>,
     /// Human-readable hints about the detected layout.
     pub compatibility_hints: Vec<String>,
+    /// Trust decision for installing this candidate.
+    pub trust: SkillTrust,
 }
 
 /// Structured result of source inspection for `install`.
@@ -240,6 +243,8 @@ pub struct InstalledSkill {
     pub overlay_hash: String,
     /// Effective version hash derived from the pinned inputs.
     pub effective_version_hash: String,
+    /// Trust decision for the installed effective skill.
+    pub trust: SkillTrust,
 }
 
 #[derive(Clone, Debug)]
@@ -340,7 +345,7 @@ pub fn handle_install(
         summary.push_str(notice);
     }
 
-    Ok(AppResponse::success("install")
+    let mut response = AppResponse::success("install")
         .with_summary(summary)
         .with_data(json!({
             "source": inspection.source,
@@ -350,7 +355,18 @@ pub fn handle_install(
             "installed": installed,
             "projection": sync_report,
             "telemetry": telemetry,
-        })))
+        }));
+    let mut warnings = BTreeSet::new();
+    for skill in &installed {
+        for warning in &skill.trust.warnings {
+            warnings.insert(warning.clone());
+        }
+    }
+    for warning in warnings {
+        response = response.with_warning(warning);
+    }
+
+    Ok(response)
 }
 
 fn prepare_install_source(
@@ -780,6 +796,7 @@ fn build_install_operation(
             content_hash: content_hash.clone(),
             overlay_hash: overlay_hash.clone(),
             effective_version_hash: effective_version_hash.clone(),
+            trust: candidate.trust.clone(),
         },
         import: ImportDefinition {
             id: import_id,
@@ -970,7 +987,7 @@ fn record_install_state(
     let mut ledger = HistoryLedger::new(&mut store);
 
     for operation in operations {
-        ledger.record_install(&InstallRecord {
+        let install_record = InstallRecord {
             skill: ManagedSkillRef::new(managed_scope, operation.installed.name.clone()),
             source_kind: operation.locked_import.source.kind,
             source_url: operation.locked_import.source.url.clone(),
@@ -987,7 +1004,8 @@ fn record_install_state(
             updated_at: install_timestamp.to_string(),
             detached: false,
             forked: false,
-        })?;
+        };
+        ledger.record_install_with_trust(&install_record, &operation.installed.trust)?;
     }
 
     for record in projection_records {
@@ -1444,6 +1462,7 @@ fn detect_install_candidates(
         for skill_root in skill_directories {
             let skill = SkillDefinition::load_from_dir(&skill_root)?;
             let selected_subpath = relative_path_string(root, &skill.root, raw_source)?;
+            let contains_scripts = crate::trust::directory_contains_scripts(&skill.root)?;
             candidates.push(InstallCandidate {
                 display_name: skill.name.as_str().to_string(),
                 name: skill.name.as_str().to_string(),
@@ -1451,6 +1470,10 @@ fn detect_install_candidates(
                 selected_subpath,
                 compatible_targets: detection_root.compatible_targets.to_vec(),
                 compatibility_hints: build_compatibility_hints(detection_root),
+                trust: crate::trust::SkillTrust::imported_unreviewed(
+                    skill.name.as_str(),
+                    contains_scripts,
+                ),
             });
         }
     }
@@ -1973,6 +1996,7 @@ mod tests {
                     "opencode-native workspace skill root".to_string(),
                     "documented for opencode".to_string(),
                 ],
+                trust: SkillTrust::imported_unreviewed("ai-sdk", false),
             }]
         );
     }
