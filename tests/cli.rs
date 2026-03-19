@@ -56,7 +56,7 @@ fn install_help_is_available() {
 }
 
 #[test]
-fn root_help_describes_the_operating_model_and_placeholder_surfaces() {
+fn root_help_describes_the_operating_model_and_current_mcp_surface() {
     let mut cmd = Command::cargo_bin("skillctl").expect("binary exists");
 
     cmd.arg("--help")
@@ -69,7 +69,7 @@ fn root_help_describes_the_operating_model_and_placeholder_surfaces() {
             "Local history and telemetry consent live in ~/.skillctl/state.db.",
         ))
         .stdout(predicate::str::contains(
-            "'tui' and 'mcp serve' are placeholder commands today.",
+            "'tui' is a placeholder command today.",
         ));
 }
 
@@ -139,10 +139,10 @@ fn tui_and_mcp_help_point_to_current_cli_equivalents() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "The MCP bridge is a placeholder today.",
+            "The MCP server exposes the same lifecycle operations and JSON envelopes as the CLI.",
         ))
         .stdout(predicate::str::contains(
-            "skills_update -> skillctl update [skill] --json",
+            "skills_override_create -> skillctl override <skill> --json",
         ));
 }
 

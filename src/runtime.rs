@@ -7,7 +7,7 @@ use clap::{CommandFactory, Parser, error::ErrorKind};
 use crate::{
     app::{AppContext, OutputMode, Verbosity},
     builtin,
-    cli::{Cli, Command},
+    cli::{Cli, Command, McpCommand},
     doctor,
     error::{AppError, ExitStatus},
     history, manifest, materialize, mcp, overlay, planner,
@@ -57,17 +57,26 @@ pub fn run(cli: Cli) -> Result<RunResult, AppError> {
             },
             exit_status: ExitStatus::Success,
         }),
-        Some(command) => {
-            if let Err(error) = builtin::ensure_bundled_skill(&context, false) {
-                return render_failure(output_mode, verbosity, command.name(), error);
-            }
-            run_command(command, &context)
-        }
+        Some(command) => run_command(command, &context),
     }
 }
 
 fn run_command(command: Command, context: &AppContext) -> Result<RunResult, AppError> {
-    match dispatch(&command, context) {
+    if matches!(
+        command,
+        Command::Mcp {
+            command: McpCommand::Serve
+        }
+    ) {
+        builtin::ensure_bundled_skill(context, false)?;
+        mcp::serve(context)?;
+        return Ok(RunResult {
+            output: RenderedOutput::default(),
+            exit_status: ExitStatus::Success,
+        });
+    }
+
+    match execute_command(&command, context) {
         Ok(response) => {
             let exit_status = response.exit_status();
             let output = render_response(context.output_mode, context.verbosity, response)?;
@@ -84,6 +93,12 @@ fn run_command(command: Command, context: &AppContext) -> Result<RunResult, AppE
             error,
         ),
     }
+}
+
+/// Execute one parsed command through the shared lifecycle layer.
+pub fn execute_command(command: &Command, context: &AppContext) -> Result<AppResponse, AppError> {
+    builtin::ensure_bundled_skill(context, false)?;
+    dispatch(command, context)
 }
 
 fn dispatch(command: &Command, context: &AppContext) -> Result<AppResponse, AppError> {

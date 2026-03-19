@@ -458,7 +458,7 @@
         "T009",
         "T016"
       ],
-      "updated_at": "2026-03-19T15:18:00Z",
+      "updated_at": "2026-03-19T15:18:45Z",
       "files": [
         "README.md",
         "src/doctor.rs",
@@ -591,7 +591,7 @@
       "id": "T022",
       "title": "Implement the MCP server and v1 tool parity",
       "priority": 4,
-      "status": "todo",
+      "status": "done",
       "details": "Expose the lifecycle manager to agents through MCP with the same behavior and structured output as the CLI.",
       "steps": [
         "Implement `mcp serve` and the v1 tools: `skills_list`, `skills_install`, `skills_remove`, `skills_sync`, `skills_update`, `skills_rollback`, `skills_history`, `skills_explain`, `skills_override_create`, `skills_validate`, `skills_doctor`, and `skills_telemetry_status`.",
@@ -606,6 +606,16 @@
         "T016",
         "T018",
         "T020"
+      ],
+      "updated_at": "2026-03-19T15:35:40Z",
+      "files": [
+        "src/mcp.rs",
+        "src/runtime.rs",
+        "src/cli.rs",
+        "tests/mcp.rs",
+        "tests/cli.rs",
+        "tests/support/mod.rs",
+        "README.md"
       ]
     },
     {

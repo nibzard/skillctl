@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
 
 const ROOT_LONG_ABOUT: &str = "\
 skillctl manages the local lifecycle of open SKILL.md skills across multiple agent runtimes.
@@ -37,8 +38,8 @@ Supported runtimes:
   codex, claude-code, github-copilot, gemini-cli, amp, opencode
 
 Status:
-  'tui' and 'mcp serve' are placeholder commands today.
-  Use the CLI plus --json as the current non-interactive control plane.";
+  'tui' is a placeholder command today.
+  'mcp serve' exposes the same lifecycle operations to agents over MCP.";
 
 const INIT_LONG_ABOUT: &str = "\
 Create the default .agents workspace layout for skillctl.
@@ -296,24 +297,27 @@ Disable remote telemetry while keeping local history, pins, and diagnostics full
 const MCP_LONG_ABOUT: &str = "\
 Run the MCP surface for skillctl.
 
-Status:
-  The MCP bridge is a placeholder today.
-  Use the CLI plus --json as the current agent-safe non-interactive surface.";
+The MCP server exposes the same lifecycle operations and JSON envelopes as the CLI.";
 
 const MCP_AFTER_LONG_HELP: &str = "\
-Current CLI equivalents:
+Available v1 tools:
   skills_list -> skillctl list --json
   skills_install -> skillctl install <source> --json
+  skills_remove -> skillctl remove <skill> --json
+  skills_sync -> skillctl sync --json
   skills_update -> skillctl update [skill] --json
+  skills_rollback -> skillctl rollback <skill> <version-or-commit> --json
   skills_history -> skillctl history [skill] --json
-  skills_explain -> skillctl explain <skill> --json";
+  skills_explain -> skillctl explain <skill> --json
+  skills_override_create -> skillctl override <skill> --json
+  skills_validate -> skillctl validate --json
+  skills_doctor -> skillctl doctor --json
+  skills_telemetry_status -> skillctl telemetry status --json";
 
 const MCP_SERVE_LONG_ABOUT: &str = "\
 Start the MCP server process.
 
-Status:
-  This command is not implemented yet.
-  Use the CLI plus --json for automation in the current release.";
+This command serves newline-delimited JSON-RPC over stdin/stdout and exposes the v1 lifecycle tools.";
 
 /// Top-level CLI parser for `skillctl`.
 #[derive(Debug, Parser)]
@@ -383,7 +387,8 @@ pub struct GlobalArgs {
 }
 
 /// Supported execution scopes for runtime planning.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
 pub enum Scope {
     /// Workspace-local scope.
     Workspace,

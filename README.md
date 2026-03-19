@@ -6,8 +6,8 @@ It gives one operating model for canonical workspace skills, imported skills, ov
 
 Current status:
 
-- Implemented today: CLI lifecycle commands, copy-first projections with opt-in symlink mode, lockfile and SQLite state, history, telemetry consent, `doctor`, `explain`, `validate`, and JSON output.
-- Planned but not implemented yet: `skillctl tui` and `skillctl mcp serve`.
+- Implemented today: CLI lifecycle commands, copy-first projections with opt-in symlink mode, lockfile and SQLite state, history, telemetry consent, `doctor`, `explain`, `validate`, JSON output, and `skillctl mcp serve`.
+- Planned but not implemented yet: `skillctl tui`.
 
 The product direction is defined in [spec.md](./spec.md). A focused troubleshooting guide lives in [docs/troubleshooting.md](./docs/troubleshooting.md).
 
@@ -147,10 +147,10 @@ Telemetry commands:
 - `skillctl telemetry enable`
 - `skillctl telemetry disable`
 
-Placeholder commands:
+Additional surfaces:
 
 - `skillctl tui`: planned terminal UI
-- `skillctl mcp serve`: planned MCP bridge
+- `skillctl mcp serve`: stdio MCP bridge with v1 tool parity
 
 ## Common Workflows
 
@@ -188,15 +188,20 @@ skillctl explain ai-sdk --json
 skillctl doctor --json
 ```
 
-Current equivalent for planned MCP usage:
+MCP v1 tools:
 
-```bash
-skillctl list --json
-skillctl install ../shared-skills --name release-notes --scope workspace --json
-skillctl update release-notes --json
-skillctl history release-notes --json
-skillctl explain release-notes --json
-```
+- `skills_list`
+- `skills_install`
+- `skills_remove`
+- `skills_sync`
+- `skills_update`
+- `skills_rollback`
+- `skills_history`
+- `skills_explain`
+- `skills_override_create`
+- `skills_validate`
+- `skills_doctor`
+- `skills_telemetry_status`
 
 Current equivalent for the planned TUI:
 
