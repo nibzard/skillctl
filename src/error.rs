@@ -149,6 +149,23 @@ pub enum AppError {
         #[source]
         source: serde_yaml::Error,
     },
+    /// Skill frontmatter parsing failed.
+    #[error("failed to parse skill '{path}': {source}")]
+    SkillParse {
+        /// Path to the skill manifest file.
+        path: PathBuf,
+        /// Serialization error.
+        #[source]
+        source: serde_yaml::Error,
+    },
+    /// Skill validation failed.
+    #[error("skill '{path}' is invalid: {message}")]
+    SkillValidation {
+        /// Path to the skill manifest file or invalid overlay path.
+        path: PathBuf,
+        /// Validation message.
+        message: String,
+    },
 }
 
 impl AppError {
@@ -168,7 +185,9 @@ impl AppError {
             | Self::ManifestSerialize { .. }
             | Self::LockfileParse { .. }
             | Self::LockfileValidation { .. }
-            | Self::LockfileSerialize { .. } => ExitStatus::ValidationFailure,
+            | Self::LockfileSerialize { .. }
+            | Self::SkillParse { .. }
+            | Self::SkillValidation { .. } => ExitStatus::ValidationFailure,
             Self::InputRequired { .. } => ExitStatus::InputRequired,
         }
     }

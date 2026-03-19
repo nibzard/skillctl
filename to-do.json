@@ -129,7 +129,7 @@
       "id": "T005",
       "title": "Implement skill parsing and validation for `SKILL.md` plus vendor-specific metadata passthrough",
       "priority": 1,
-      "status": "todo",
+      "status": "done",
       "details": "Parse skills as directories containing `SKILL.md`, validate the open Agent Skills contract, and preserve vendor-specific extensions without mutating them.",
       "steps": [
         "Validate that `SKILL.md` exists and that required fields such as name and description are present.",
@@ -138,7 +138,14 @@
       ],
       "depends_on": [
         "T001"
-      ]
+      ],
+      "updated_at": "2026-03-19T09:47:26Z",
+      "files": [
+        "src/error.rs",
+        "src/skill.rs",
+        "to-do.json"
+      ],
+      "blockers": []
     },
     {
       "id": "T006",
