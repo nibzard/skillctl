@@ -132,6 +132,9 @@ fn tui_and_mcp_help_point_to_current_cli_equivalents() {
         .stdout(predicate::str::contains(
             "The terminal inspection UI is a read-only dashboard",
         ))
+        .stdout(predicate::str::contains(
+            "Opening it does not bootstrap bundled skills",
+        ))
         .stdout(predicate::str::contains("installed versions"))
         .stdout(predicate::str::contains(
             "refresh update state: skillctl update [skill]",
@@ -3949,6 +3952,46 @@ fn bundled_skill_appears_in_user_scope_explain_doctor_and_tui() {
     assert_eq!(
         tui_body["data"]["skills"][0]["visibility"]["drift"]["active_projection_matches_winner"],
         true
+    );
+}
+
+#[test]
+fn tui_does_not_bootstrap_bundled_skill_on_a_fresh_home() {
+    let workspace = TestWorkspace::new();
+    let home_path = workspace.home_path();
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", &home_path)
+        .args(["--json", "tui"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+    let body: Value = serde_json::from_slice(&assert.get_output().stdout).expect("stdout is json");
+
+    assert_eq!(body["command"], "tui");
+    assert_eq!(body["ok"], true);
+    assert!(
+        body["data"]["skills"]
+            .as_array()
+            .expect("skills array exists")
+            .is_empty(),
+        "unexpected TUI payload: {body:#?}",
+    );
+    assert!(
+        !home_path.join(".agents/skills/skillctl/SKILL.md").exists(),
+        "tui should not bootstrap the bundled skill into the neutral user root",
+    );
+    assert!(
+        !home_path.join(".claude/skills/skillctl/SKILL.md").exists(),
+        "tui should not bootstrap the bundled skill into the claude-compatible user root",
+    );
+    assert!(
+        !home_path
+            .join(".config/agents/skills/skillctl/SKILL.md")
+            .exists(),
+        "tui should not bootstrap the bundled skill into the amp-compatible user root",
     );
 }
 

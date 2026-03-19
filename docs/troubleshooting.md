@@ -241,7 +241,7 @@ Remember:
 
 ## `tui` Looks Empty Or Shows Unexpected State
 
-`skillctl tui` is implemented. It opens a read-only dashboard over the same install, update, explain, and history state used by the CLI, and opening it does not write new history entries.
+`skillctl tui` is implemented. It opens a read-only dashboard over the same install, update, explain, and history state used by the CLI, and opening it does not bootstrap bundled skills or write new history entries.
 
 Run:
 

@@ -1060,6 +1060,27 @@
         "to-do.json"
       ],
       "updated_at": "2026-03-19T18:33:51Z"
+    },
+    {
+      "id": "T041",
+      "title": "Reconcile the TUI's read-only contract with bundled bootstrap side effects",
+      "status": "done",
+      "priority": 3,
+      "details": "`skillctl tui` is documented and tested as a read-only dashboard, but on a fresh home it still installs the bundled user-scope skill before rendering because runtime dispatch bootstraps built-ins for every command. Decide whether TUI should remain truly read-only or whether the help and docs should explicitly call out this first-run mutation, then add regression coverage for the chosen behavior.",
+      "tags": [
+        "review-followup",
+        "tui",
+        "ux"
+      ],
+      "files": [
+        "src/runtime.rs",
+        "src/cli.rs",
+        "tests/cli.rs",
+        "README.md",
+        "docs/troubleshooting.md",
+        "to-do.json"
+      ],
+      "updated_at": "2026-03-19T18:40:12Z"
     }
   ]
 }

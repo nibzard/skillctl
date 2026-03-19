@@ -150,7 +150,7 @@ Telemetry commands:
 
 Additional surfaces:
 
-- `skillctl tui`: read-only terminal dashboard for inspection, update context, and history
+- `skillctl tui`: read-only terminal dashboard for inspection, update context, and history; opening it does not bootstrap bundled skills or write new history entries
 - `skillctl mcp serve`: stdio MCP bridge with v1 tool parity
 
 ## Common Workflows

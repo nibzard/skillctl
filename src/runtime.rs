@@ -97,8 +97,14 @@ fn run_command(command: Command, context: &AppContext) -> Result<RunResult, AppE
 
 /// Execute one parsed command through the shared lifecycle layer.
 pub fn execute_command(command: &Command, context: &AppContext) -> Result<AppResponse, AppError> {
-    builtin::ensure_bundled_skill(context, false)?;
+    if should_bootstrap_bundled_skill(command) {
+        builtin::ensure_bundled_skill(context, false)?;
+    }
     dispatch(command, context)
+}
+
+fn should_bootstrap_bundled_skill(command: &Command) -> bool {
+    !matches!(command, Command::Tui)
 }
 
 fn dispatch(command: &Command, context: &AppContext) -> Result<AppResponse, AppError> {

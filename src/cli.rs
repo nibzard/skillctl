@@ -39,6 +39,7 @@ Supported runtimes:
 
 Status:
   'tui' opens a read-only dashboard over the same state and inspection model as the CLI.
+  Opening it does not bootstrap bundled skills or write new history entries.
   'mcp serve' exposes the same lifecycle operations to agents over MCP.";
 
 const INIT_LONG_ABOUT: &str = "\
@@ -266,6 +267,8 @@ Open the terminal inspection UI.
 The terminal inspection UI is a read-only dashboard for installed versions,
 update availability, overlays, local modifications, target visibility, pin or
 rollback context, and recent history.
+
+Opening it does not bootstrap bundled skills or write new history entries.
 
 Every suggested action maps to a documented CLI command.";
 
