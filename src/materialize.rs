@@ -1,7 +1,7 @@
 //! Projection materialization and cleanup domain entry points.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env, fs, io,
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -16,6 +16,7 @@ use crate::{
     cli::Scope,
     error::AppError,
     history::HistoryLedger,
+    lifecycle,
     lockfile::WorkspaceLockfile,
     manifest::{AdapterRoot, ProjectionMode, WorkspaceManifest},
     planner::{self, ProjectionPlan},
@@ -24,6 +25,7 @@ use crate::{
     source::{current_timestamp, imports_store_root},
     state::{
         LocalStateStore, ManagedScope, ManagedSkillRef, ProjectionMode as RecordedProjectionMode,
+        ProjectionRecord,
     },
 };
 
@@ -190,18 +192,116 @@ pub(crate) fn planned_physical_root_paths(
         .collect()
 }
 
-/// Handle `skillctl sync`.
-pub fn handle_sync(context: &AppContext, _request: SyncRequest) -> Result<AppResponse, AppError> {
-    let report = sync_workspace(context)?;
-    let summary = sync_summary(&report);
-    let mut response = AppResponse::success("sync")
-        .with_summary(summary)
-        .with_data(serde_json::to_value(&report)?);
-    for warning in &report.warnings {
-        response = response.with_warning(warning.clone());
+pub(crate) fn rebuild_projection_records_for_scope(
+    store: &mut LocalStateStore,
+    scope: ManagedScope,
+    sync_report: &MaterializationReport,
+    generated_at: &str,
+) -> Result<Vec<ProjectionRecord>, AppError> {
+    let installs_by_skill: BTreeMap<_, _> = store
+        .list_install_records()?
+        .into_iter()
+        .filter(|record| record.skill.scope == scope)
+        .map(|record| (record.skill.skill_id.clone(), record))
+        .collect();
+    let targets_by_root: BTreeMap<_, _> = sync_report
+        .plan
+        .physical_roots
+        .iter()
+        .map(|root| (root.path.clone(), root.targets.clone()))
+        .collect();
+    let mut records = Vec::new();
+    let generation_mode = sync_report.recorded_generation_mode();
+
+    for generated_root in &sync_report.generated_roots {
+        let Some(targets) = targets_by_root.get(&generated_root.path) else {
+            continue;
+        };
+
+        for skill_name in &generated_root.materialized {
+            let Some(install) = installs_by_skill.get(skill_name) else {
+                continue;
+            };
+
+            for target in targets {
+                records.push(ProjectionRecord {
+                    skill: install.skill.clone(),
+                    target: *target,
+                    generation_mode,
+                    physical_root: generated_root.path.clone(),
+                    projected_path: skill_name.clone(),
+                    effective_version_hash: install.effective_version_hash.clone(),
+                    generated_at: generated_at.to_string(),
+                });
+            }
+        }
     }
 
-    Ok(response)
+    store.replace_projection_records_for_scope(scope, &records)?;
+    Ok(records)
+}
+
+pub(crate) fn record_pruned_projection_history(
+    ledger: &mut HistoryLedger<'_>,
+    context: &AppContext,
+    scope: ManagedScope,
+    sync_report: &MaterializationReport,
+    occurred_at: &str,
+) -> Result<(), AppError> {
+    for generated_root in &sync_report.generated_roots {
+        let root = planner::resolve_runtime_root_path(context, &generated_root.path)?;
+        for skill_name in &generated_root.pruned {
+            let skill = ManagedSkillRef::new(scope, skill_name.clone());
+            let path = planner::display_path(context, &root.join(skill_name));
+            ledger.record_prune(Some(&skill), &path, occurred_at)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle `skillctl sync`.
+pub fn handle_sync(context: &AppContext, _request: SyncRequest) -> Result<AppResponse, AppError> {
+    lifecycle::run_transaction("sync", |transaction| {
+        let manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
+        let scope = sync_scope(context);
+        transaction.track_state_database()?;
+        for root in planned_physical_root_paths(context, &manifest, scope)? {
+            transaction.track_path(root)?;
+        }
+
+        let report = sync_workspace(context)?;
+        let timestamp = current_timestamp();
+        let mut store = LocalStateStore::open_default()?;
+        let current_projections = rebuild_projection_records_for_scope(
+            &mut store,
+            managed_scope(scope),
+            &report,
+            &timestamp,
+        )?;
+        let mut ledger = HistoryLedger::new(&mut store);
+        record_pruned_projection_history(
+            &mut ledger,
+            context,
+            managed_scope(scope),
+            &report,
+            &timestamp,
+        )?;
+        for record in &current_projections {
+            ledger.record_projection(record)?;
+        }
+        transaction.checkpoint("after-state")?;
+
+        let summary = sync_summary(&report);
+        let mut response = AppResponse::success("sync")
+            .with_summary(summary)
+            .with_data(serde_json::to_value(&report)?);
+        for warning in &report.warnings {
+            response = response.with_warning(warning.clone());
+        }
+
+        Ok(response)
+    })
 }
 
 /// Handle `skillctl clean`.

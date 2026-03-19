@@ -1502,6 +1502,156 @@ fn sync_symlink_mode_requires_explicit_override_for_unstable_targets() {
 }
 
 #[test]
+fn sync_refreshes_projection_state_and_history_when_targets_move_generated_roots() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "projection:\n",
+        "  policy: prefer-native\n",
+        "\n",
+        "targets:\n",
+        "  - opencode\n",
+    ));
+    workspace.write_skill_source("shared-skills", "release-notes");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770000000")
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let manifest_path = workspace.path().join(".agents/skillctl.yaml");
+    let manifest_after_install =
+        fs::read_to_string(&manifest_path).expect("manifest exists after install");
+    fs::write(
+        &manifest_path,
+        manifest_after_install.replace("  - opencode\n", "  - claude-code\n"),
+    )
+    .expect("manifest target updates");
+    workspace.write_file(
+        ".claude/skills/stale-skill/SKILL.md",
+        concat!(
+            "---\n",
+            "name: stale-skill\n",
+            "description: Old generated projection.\n",
+            "---\n",
+            "\n",
+            "# Stale\n"
+        ),
+    );
+    workspace.write_file(
+        ".claude/skills/stale-skill/.skillctl-projection.json",
+        concat!(
+            "{\n",
+            "  \"tool\": \"skillctl\",\n",
+            "  \"generation_mode\": \"copy\",\n",
+            "  \"physical_root\": \".claude/skills\"\n",
+            "}\n"
+        ),
+    );
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770001234")
+        .arg("sync")
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty())
+        .stdout(predicate::str::contains(
+            "Materialized 1 generated projection",
+        ))
+        .stdout(predicate::str::contains("Pruned 1 stale projection"));
+
+    assert!(
+        workspace
+            .path()
+            .join(".claude/skills/release-notes/SKILL.md")
+            .is_file(),
+        "sync should project the managed skill into the new runtime root",
+    );
+    assert!(
+        !workspace.path().join(".claude/skills/stale-skill").exists(),
+        "sync should prune stale generated projections in the active root",
+    );
+
+    let path_assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--json", "path", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+    let path_body: Value =
+        serde_json::from_slice(&path_assert.get_output().stdout).expect("stdout is valid json");
+    assert_eq!(path_body["data"]["projections"][0]["target"], "claude-code");
+    assert_eq!(
+        path_body["data"]["projections"][0]["root"],
+        ".claude/skills"
+    );
+
+    let connection = Connection::open(workspace.home_path().join(".skillctl/state.db"))
+        .expect("state database opens");
+    let projection_rows: Vec<(String, String, String)> = connection
+        .prepare(
+            "SELECT target, physical_root, projected_path \
+             FROM projection_records WHERE skill_id = ?1 ORDER BY target ASC",
+        )
+        .expect("statement prepares")
+        .query_map(params!["release-notes"], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .expect("projection query succeeds")
+        .collect::<Result<_, _>>()
+        .expect("projection rows decode");
+    assert_eq!(
+        projection_rows,
+        vec![(
+            "claude-code".to_string(),
+            ".claude/skills".to_string(),
+            "release-notes".to_string(),
+        )]
+    );
+
+    let projection_targets: Vec<String> = connection
+        .prepare(
+            "SELECT target FROM history_events \
+             WHERE skill_id = ?1 AND kind = ?2 ORDER BY occurred_at ASC, id ASC",
+        )
+        .expect("statement prepares")
+        .query_map(params!["release-notes", "projection"], |row| row.get(0))
+        .expect("history query succeeds")
+        .collect::<Result<_, _>>()
+        .expect("history rows decode");
+    assert_eq!(
+        projection_targets,
+        vec!["opencode".to_string(), "claude-code".to_string()]
+    );
+
+    let prune_events: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM history_events WHERE skill_id = ?1 AND kind = ?2",
+            params!["stale-skill", "prune"],
+            |row| row.get(0),
+        )
+        .expect("prune history query succeeds");
+    assert_eq!(prune_events, 1);
+}
+
+#[test]
 fn sync_symlink_mode_materializes_symlinked_files_and_emits_warnings() {
     let workspace = TestWorkspace::new();
     workspace.write_manifest(concat!(
@@ -4008,6 +4158,44 @@ fn enable_rolls_back_when_the_transaction_fails_after_state_write() {
         "enable:after-state",
         "1770002468",
         &["enable", "release-notes"],
+        &snapshot,
+    );
+}
+
+#[test]
+fn sync_rolls_back_when_the_transaction_fails_after_state_write() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_skill_source("shared-skills", "release-notes");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770000000")
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let snapshot = workspace.snapshot_paths(&["home/.skillctl/state.db", ".claude/skills"]);
+
+    assert_transaction_rolled_back(
+        &workspace,
+        "sync:after-state",
+        "1770001234",
+        &["sync"],
         &snapshot,
     );
 }

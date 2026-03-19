@@ -20,8 +20,7 @@ use crate::{
     lifecycle,
     lockfile::WorkspaceLockfile,
     manifest::{ImportDefinition, ManifestScope, WorkspaceManifest},
-    materialize::{self, MaterializationReport},
-    planner,
+    materialize, planner,
     response::AppResponse,
     source::{current_timestamp, imports_store_root},
     state::{LocalStateStore, ManagedScope, ManagedSkillRef, ProjectionRecord},
@@ -441,7 +440,7 @@ pub fn handle_remove(
 
         {
             let mut ledger = HistoryLedger::new(&mut store);
-            record_pruned_projection_history(
+            materialize::record_pruned_projection_history(
                 &mut ledger,
                 context,
                 managed_skill.scope,
@@ -454,7 +453,7 @@ pub fn handle_remove(
         }
 
         store.delete_current_skill_state(&managed_skill)?;
-        rebuild_projection_records_for_scope(
+        materialize::rebuild_projection_records_for_scope(
             &mut store,
             managed_skill.scope,
             &sync_report,
@@ -759,7 +758,7 @@ fn toggle_managed_import(
 
         let timestamp = current_timestamp();
         let sync_report = materialize::sync_workspace(&scoped_context)?;
-        let current_projections = rebuild_projection_records_for_scope(
+        let current_projections = materialize::rebuild_projection_records_for_scope(
             &mut store,
             managed_skill.scope,
             &sync_report,
@@ -767,7 +766,7 @@ fn toggle_managed_import(
         )?;
 
         let mut ledger = HistoryLedger::new(&mut store);
-        record_pruned_projection_history(
+        materialize::record_pruned_projection_history(
             &mut ledger,
             context,
             managed_skill.scope,
@@ -802,74 +801,6 @@ fn toggle_managed_import(
 
         Ok(response)
     })
-}
-
-fn rebuild_projection_records_for_scope(
-    store: &mut LocalStateStore,
-    scope: ManagedScope,
-    sync_report: &MaterializationReport,
-    generated_at: &str,
-) -> Result<Vec<ProjectionRecord>, AppError> {
-    let installs_by_skill: BTreeMap<_, _> = store
-        .list_install_records()?
-        .into_iter()
-        .filter(|record| record.skill.scope == scope)
-        .map(|record| (record.skill.skill_id.clone(), record))
-        .collect();
-    let targets_by_root: BTreeMap<_, _> = sync_report
-        .plan
-        .physical_roots
-        .iter()
-        .map(|root| (root.path.clone(), root.targets.clone()))
-        .collect();
-    let mut records = Vec::new();
-    let generation_mode = sync_report.recorded_generation_mode();
-
-    for generated_root in &sync_report.generated_roots {
-        let Some(targets) = targets_by_root.get(&generated_root.path) else {
-            continue;
-        };
-
-        for skill_name in &generated_root.materialized {
-            let Some(install) = installs_by_skill.get(skill_name) else {
-                continue;
-            };
-
-            for target in targets {
-                records.push(ProjectionRecord {
-                    skill: install.skill.clone(),
-                    target: *target,
-                    generation_mode,
-                    physical_root: generated_root.path.clone(),
-                    projected_path: skill_name.clone(),
-                    effective_version_hash: install.effective_version_hash.clone(),
-                    generated_at: generated_at.to_string(),
-                });
-            }
-        }
-    }
-
-    store.replace_projection_records_for_scope(scope, &records)?;
-    Ok(records)
-}
-
-fn record_pruned_projection_history(
-    ledger: &mut HistoryLedger<'_>,
-    context: &AppContext,
-    scope: ManagedScope,
-    sync_report: &MaterializationReport,
-    occurred_at: &str,
-) -> Result<(), AppError> {
-    for generated_root in &sync_report.generated_roots {
-        let root = planner::resolve_runtime_root_path(context, &generated_root.path)?;
-        for skill_name in &generated_root.pruned {
-            let skill = ManagedSkillRef::new(scope, skill_name.clone());
-            let path = planner::display_path(context, &root.join(skill_name));
-            ledger.record_prune(Some(&skill), &path, occurred_at)?;
-        }
-    }
-
-    Ok(())
 }
 
 fn remove_directory_if_exists(path: &Path, action: &'static str) -> Result<bool, AppError> {
