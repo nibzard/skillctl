@@ -714,6 +714,41 @@ impl LocalStateStore {
         upsert_projection_record_in(&self.connection, &self.path, record)
     }
 
+    /// Replace the current projection records for one scope atomically.
+    pub fn replace_projection_records_for_scope(
+        &mut self,
+        scope: ManagedScope,
+        records: &[ProjectionRecord],
+    ) -> Result<(), AppError> {
+        self.with_transaction("replace projection records", |connection, path| {
+            connection
+                .execute(
+                    "DELETE FROM projection_records WHERE scope = ?1",
+                    params![scope.as_str()],
+                )
+                .map_err(|source| {
+                    local_state_query(path, "delete projection records for scope", source)
+                })?;
+
+            for record in records {
+                if record.skill.scope != scope {
+                    return Err(AppError::LocalStateValidation {
+                        path: path.to_path_buf(),
+                        message: format!(
+                            "projection record for '{}' used scope '{}' during a '{}' replacement",
+                            record.skill.skill_id,
+                            record.skill.scope.as_str(),
+                            scope.as_str()
+                        ),
+                    });
+                }
+                upsert_projection_record_in(connection, path, record)?;
+            }
+
+            Ok(())
+        })
+    }
+
     /// List update checks ordered newest first, optionally filtered to one skill.
     pub fn update_checks(
         &self,
@@ -962,6 +997,36 @@ impl LocalStateStore {
         upsert_pin_record_in(&self.connection, &self.path, record)
     }
 
+    /// Delete the mutable install, pin, and projection rows for one managed skill.
+    pub fn delete_current_skill_state(&mut self, skill: &ManagedSkillRef) -> Result<(), AppError> {
+        validate_skill_ref(&self.path, skill)?;
+
+        self.with_transaction("delete current skill state", |connection, path| {
+            connection
+                .execute(
+                    "DELETE FROM projection_records WHERE scope = ?1 AND skill_id = ?2",
+                    params![skill.scope.as_str(), skill.skill_id],
+                )
+                .map_err(|source| {
+                    local_state_query(path, "delete projection records for skill", source)
+                })?;
+            connection
+                .execute(
+                    "DELETE FROM pins WHERE scope = ?1 AND skill_id = ?2",
+                    params![skill.scope.as_str(), skill.skill_id],
+                )
+                .map_err(|source| local_state_query(path, "delete pin record", source))?;
+            connection
+                .execute(
+                    "DELETE FROM install_records WHERE scope = ?1 AND skill_id = ?2",
+                    params![skill.scope.as_str(), skill.skill_id],
+                )
+                .map_err(|source| local_state_query(path, "delete install record", source))?;
+
+            Ok(())
+        })
+    }
+
     /// List rollback records ordered newest first.
     pub fn rollback_records(
         &self,
@@ -1082,6 +1147,16 @@ impl LocalStateStore {
     /// Append one immutable history entry to the local ledger.
     pub fn append_history_entry(&mut self, entry: &HistoryEntry) -> Result<i64, AppError> {
         insert_history_entry_in(&self.connection, &self.path, entry)
+    }
+
+    /// Remove every current projection record across all scopes.
+    pub fn clear_projection_records(&mut self) -> Result<(), AppError> {
+        self.connection
+            .execute("DELETE FROM projection_records", [])
+            .map_err(|source| {
+                local_state_query(&self.path, "delete all projection records", source)
+            })?;
+        Ok(())
     }
 
     /// Query history entries in deterministic newest-first order.

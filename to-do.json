@@ -322,7 +322,7 @@
         "T009",
         "T010"
       ],
-      "updated_at": "2026-03-19T11:54:41Z",
+      "updated_at": "2026-03-19T11:55:21Z",
       "files": [
         "src/manifest.rs",
         "src/materialize.rs",
@@ -349,7 +349,7 @@
         "T011",
         "T012"
       ],
-      "updated_at": "2026-03-19T12:07:48Z",
+      "updated_at": "2026-03-19T12:09:22Z",
       "files": [
         "src/planner.rs",
         "tests/cli.rs",
@@ -374,7 +374,7 @@
         "T012",
         "T013"
       ],
-      "updated_at": "2026-03-19T12:25:41Z",
+      "updated_at": "2026-03-19T12:27:28Z",
       "files": [
         "src/history.rs",
         "src/materialize.rs",
@@ -390,7 +390,7 @@
       "id": "T015",
       "title": "Implement the remaining lifecycle and inventory commands",
       "priority": 2,
-      "status": "todo",
+      "status": "done",
       "details": "Fill out the day-to-day command surface for managed-skill visibility and maintenance.",
       "steps": [
         "Implement `list`, `history`, and `path` using the manifest, lockfile, projections, and local state store.",
@@ -401,7 +401,18 @@
         "T009",
         "T010",
         "T011"
-      ]
+      ],
+      "updated_at": "2026-03-19T12:46:50Z",
+      "files": [
+        "src/history.rs",
+        "src/materialize.rs",
+        "src/planner.rs",
+        "src/skill.rs",
+        "src/state.rs",
+        "tests/cli.rs",
+        "to-do.json"
+      ],
+      "blockers": []
     },
     {
       "id": "T016",

@@ -6,9 +6,23 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+use serde_json::json;
 use serde_yaml::Value;
 
-use crate::{app::AppContext, error::AppError, response::AppResponse};
+use crate::{
+    adapter::{AdapterRegistry, TargetScope},
+    app::AppContext,
+    cli::Scope,
+    error::AppError,
+    history::{self, HistoryLedger},
+    lockfile::WorkspaceLockfile,
+    manifest::{ImportDefinition, ManifestScope, WorkspaceManifest},
+    materialize::{self, MaterializationReport},
+    planner,
+    response::AppResponse,
+    source::{current_timestamp, imports_store_root},
+    state::{LocalStateStore, ManagedScope, ManagedSkillRef, ProjectionMode, ProjectionRecord},
+};
 
 /// Default relative path to canonical workspace skills.
 pub const DEFAULT_SKILLS_DIR: &str = ".agents/skills";
@@ -266,16 +280,178 @@ impl PathRequest {
 }
 
 /// Handle `skillctl list`.
-pub fn handle_list(_context: &AppContext, _request: ListRequest) -> Result<AppResponse, AppError> {
-    Err(AppError::NotYetImplemented { command: "list" })
+pub fn handle_list(context: &AppContext, _request: ListRequest) -> Result<AppResponse, AppError> {
+    let store = LocalStateStore::open_default()?;
+    let installs = store.list_install_records()?;
+    if installs.is_empty() {
+        return Ok(AppResponse::success("list")
+            .with_summary("No managed skills are installed.")
+            .with_data(json!({ "skills": [] })));
+    }
+
+    let manifest = load_manifest_or_default(&context.working_directory)?;
+    let lockfile = load_lockfile_or_default(&context.working_directory)?;
+    let mut skills = Vec::with_capacity(installs.len());
+
+    for install in installs {
+        let managed_import = managed_import(&manifest, &install.skill);
+        let lockfile_entry = managed_import.and_then(|import| lockfile.imports.get(&import.id));
+        let snapshot = store.skill_snapshot(&install.skill)?;
+
+        skills.push(json!({
+            "skill": install.skill.skill_id,
+            "scope": install.skill.scope.as_str(),
+            "managed_import": managed_import.is_some(),
+            "managed_import_enabled": managed_import.map(|import| import.enabled),
+            "source": {
+                "type": install.source_kind,
+                "url": install.source_url,
+                "subpath": install.source_subpath,
+            },
+            "resolved_revision": install.resolved_revision,
+            "effective_version_hash": install.effective_version_hash,
+            "detached": install.detached,
+            "forked": install.forked,
+            "overlay_root": managed_import
+                .and_then(|import| manifest.overrides.get(&import.id))
+                .map(|path| path.as_str().to_string()),
+            "stored_source_root": lockfile_entry
+                .map(|_| imports_store_root())
+                .transpose()?
+                .map(|root| root.join(&install.skill.skill_id).display().to_string()),
+            "active_source_root": lockfile_entry
+                .map(|entry| imports_store_root().map(|root| root.join(&install.skill.skill_id).join(entry.source.subpath.as_str())))
+                .transpose()?
+                .map(|path| path.display().to_string()),
+            "pinned_reference": snapshot.pin.as_ref().map(|pin| pin.requested_reference.clone()),
+            "latest_update": snapshot.latest_update_check.as_ref().map(|check| json!({
+                "outcome": check.outcome,
+                "checked_at": check.checked_at,
+            })),
+            "local_modification_count": snapshot.local_modifications.len(),
+            "rollback_count": snapshot.rollbacks.len(),
+            "projections": snapshot
+                .projections
+                .iter()
+                .map(|projection| projection_view(context, projection))
+                .collect::<Result<Vec<_>, _>>()?,
+        }));
+    }
+
+    let count = skills.len();
+    Ok(AppResponse::success("list")
+        .with_summary(format!(
+            "Listed {count} managed skill{}.",
+            if count == 1 { "" } else { "s" }
+        ))
+        .with_data(json!({ "skills": skills })))
 }
 
 /// Handle `skillctl remove`.
 pub fn handle_remove(
-    _context: &AppContext,
-    _request: RemoveRequest,
+    context: &AppContext,
+    request: RemoveRequest,
 ) -> Result<AppResponse, AppError> {
-    Err(AppError::NotYetImplemented { command: "remove" })
+    let mut manifest = load_manifest_or_default(&context.working_directory)?;
+    let mut lockfile = load_lockfile_or_default(&context.working_directory)?;
+    let mut store = LocalStateStore::open_default()?;
+    let managed_skill =
+        resolve_installed_skill(&store, request.skill.as_str(), context.selector.scope)?;
+    let install_record =
+        store
+            .install_record(&managed_skill)?
+            .ok_or_else(|| AppError::ResolutionValidation {
+                message: format!(
+                    "skill '{}' does not have an installed state record",
+                    request.skill.as_str()
+                ),
+            })?;
+    let timestamp = current_timestamp();
+    let mut removed_paths = Vec::new();
+    let mut retained_paths = Vec::new();
+
+    if let Some(import_index) = manifest_import_index(&manifest, &managed_skill) {
+        manifest.imports.remove(import_index);
+        if let Some(overlay_path) = manifest.overrides.remove(request.skill.as_str()) {
+            retained_paths.push(overlay_path.as_str().to_string());
+        }
+        manifest.write_to_path()?;
+
+        lockfile.imports.remove(request.skill.as_str());
+        lockfile.write_to_path()?;
+    } else if !(install_record.detached || install_record.forked) {
+        return Err(AppError::ResolutionValidation {
+            message: format!(
+                "skill '{}' is not a managed import in the workspace manifest",
+                request.skill.as_str()
+            ),
+        });
+    }
+
+    if managed_skill.scope == ManagedScope::Workspace
+        && (install_record.detached || install_record.forked)
+    {
+        let local_root = context
+            .working_directory
+            .join(manifest.layout.skills_dir.as_str())
+            .join(request.skill.as_str());
+        if remove_directory_if_exists(&local_root, "remove canonical workspace skill")? {
+            removed_paths.push(planner::display_path(context, &local_root));
+        }
+    }
+
+    let stored_source_root = imports_store_root()?.join(request.skill.as_str());
+    if remove_directory_if_exists(&stored_source_root, "remove stored import root")? {
+        removed_paths.push(stored_source_root.display().to_string());
+    }
+
+    let sync_report =
+        materialize::sync_workspace(&history::context_for_scope(context, managed_skill.scope))?;
+
+    {
+        let mut ledger = HistoryLedger::new(&mut store);
+        record_pruned_projection_history(
+            &mut ledger,
+            context,
+            managed_skill.scope,
+            &sync_report,
+            &timestamp,
+        )?;
+        for removed_path in &removed_paths {
+            ledger.record_cleanup(Some(&managed_skill), removed_path, &timestamp)?;
+        }
+    }
+
+    store.delete_current_skill_state(&managed_skill)?;
+    rebuild_projection_records_for_scope(
+        &mut store,
+        managed_skill.scope,
+        &sync_report,
+        &timestamp,
+    )?;
+
+    let mut response = AppResponse::success("remove")
+        .with_summary(format!(
+            "Removed {} from {} scope.",
+            request.skill.as_str(),
+            managed_skill.scope.as_str()
+        ))
+        .with_data(json!({
+            "skill": request.skill.as_str(),
+            "scope": managed_skill.scope.as_str(),
+            "removed_paths": removed_paths,
+            "retained_paths": retained_paths,
+            "projection": sync_report,
+        }));
+
+    for retained_path in &retained_paths {
+        response = response.with_warning(format!(
+            "retained overlay directory '{}' for manual reuse",
+            retained_path
+        ));
+    }
+
+    Ok(response)
 }
 
 /// Handle `skillctl explain`.
@@ -288,23 +464,378 @@ pub fn handle_explain(
 
 /// Handle `skillctl enable`.
 pub fn handle_enable(
-    _context: &AppContext,
-    _request: EnableRequest,
+    context: &AppContext,
+    request: EnableRequest,
 ) -> Result<AppResponse, AppError> {
-    Err(AppError::NotYetImplemented { command: "enable" })
+    toggle_managed_import(context, request.skill.as_str(), true, "enable")
 }
 
 /// Handle `skillctl disable`.
 pub fn handle_disable(
-    _context: &AppContext,
-    _request: DisableRequest,
+    context: &AppContext,
+    request: DisableRequest,
 ) -> Result<AppResponse, AppError> {
-    Err(AppError::NotYetImplemented { command: "disable" })
+    toggle_managed_import(context, request.skill.as_str(), false, "disable")
 }
 
 /// Handle `skillctl path`.
-pub fn handle_path(_context: &AppContext, _request: PathRequest) -> Result<AppResponse, AppError> {
-    Err(AppError::NotYetImplemented { command: "path" })
+pub fn handle_path(context: &AppContext, request: PathRequest) -> Result<AppResponse, AppError> {
+    let manifest = load_manifest_or_default(&context.working_directory)?;
+    let lockfile = load_lockfile_or_default(&context.working_directory)?;
+    let store = LocalStateStore::open_default()?;
+    let managed_skill =
+        resolve_installed_skill(&store, request.skill.as_str(), context.selector.scope)?;
+    let install_record =
+        store
+            .install_record(&managed_skill)?
+            .ok_or_else(|| AppError::ResolutionValidation {
+                message: format!(
+                    "skill '{}' does not have an installed state record",
+                    request.skill.as_str()
+                ),
+            })?;
+    let snapshot = store.skill_snapshot(&managed_skill)?;
+    let managed_import = managed_import(&manifest, &managed_skill);
+    let lockfile_entry = managed_import.and_then(|import| lockfile.imports.get(&import.id));
+    let planned_roots = planned_root_views(
+        context,
+        &manifest,
+        managed_skill.scope,
+        request.skill.as_str(),
+    )?;
+
+    Ok(AppResponse::success("path")
+        .with_summary(format!("Resolved filesystem paths for {}.", request.skill.as_str()))
+        .with_data(json!({
+            "skill": request.skill.as_str(),
+            "scope": managed_skill.scope.as_str(),
+            "managed_import": managed_import.is_some(),
+            "managed_import_enabled": managed_import.map(|import| import.enabled),
+            "stored_source_root": lockfile_entry
+                .map(|_| imports_store_root())
+                .transpose()?
+                .map(|root| root.join(request.skill.as_str()).display().to_string()),
+            "active_source_root": lockfile_entry
+                .map(|entry| imports_store_root().map(|root| root.join(request.skill.as_str()).join(entry.source.subpath.as_str())))
+                .transpose()?
+                .map(|path| path.display().to_string()),
+            "overlay_root": managed_import
+                .and_then(|import| manifest.overrides.get(&import.id))
+                .map(|path| path.as_str().to_string()),
+            "canonical_root": if managed_import.is_none() && managed_skill.scope == ManagedScope::Workspace {
+                let local_root = context
+                    .working_directory
+                    .join(manifest.layout.skills_dir.as_str())
+                    .join(request.skill.as_str());
+                fs::metadata(&local_root)
+                    .ok()
+                    .filter(|metadata| metadata.is_dir())
+                    .map(|_| planner::display_path(context, &local_root))
+            } else {
+                None
+            },
+            "source": {
+                "type": install_record.source_kind,
+                "url": install_record.source_url,
+                "subpath": install_record.source_subpath,
+            },
+            "resolved_revision": install_record.resolved_revision,
+            "effective_version_hash": install_record.effective_version_hash,
+            "planned_roots": planned_roots,
+            "projections": snapshot
+                .projections
+                .iter()
+                .map(|projection| projection_view(context, projection))
+                .collect::<Result<Vec<_>, _>>()?,
+        })))
+}
+
+fn load_manifest_or_default(working_directory: &Path) -> Result<WorkspaceManifest, AppError> {
+    match WorkspaceManifest::load_from_workspace(working_directory) {
+        Ok(manifest) => Ok(manifest),
+        Err(AppError::FilesystemOperation {
+            action: "read manifest",
+            path,
+            source,
+        }) if source.kind() == io::ErrorKind::NotFound => Ok(WorkspaceManifest::default_at(path)),
+        Err(error) => Err(error),
+    }
+}
+
+fn load_lockfile_or_default(working_directory: &Path) -> Result<WorkspaceLockfile, AppError> {
+    match WorkspaceLockfile::load_from_workspace(working_directory) {
+        Ok(lockfile) => Ok(lockfile),
+        Err(AppError::FilesystemOperation {
+            action: "read lockfile",
+            path,
+            source,
+        }) if source.kind() == io::ErrorKind::NotFound => Ok(WorkspaceLockfile::default_at(path)),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn resolve_installed_skill(
+    store: &LocalStateStore,
+    skill: &str,
+    scope: Option<Scope>,
+) -> Result<ManagedSkillRef, AppError> {
+    let scopes = match scope {
+        Some(Scope::Workspace) => vec![ManagedScope::Workspace],
+        Some(Scope::User) => vec![ManagedScope::User],
+        None => vec![ManagedScope::Workspace, ManagedScope::User],
+    };
+    let mut matches = Vec::new();
+
+    for managed_scope in scopes {
+        let candidate = ManagedSkillRef::new(managed_scope, skill);
+        if store.install_record(&candidate)?.is_some() {
+            matches.push(candidate);
+        }
+    }
+
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => Err(AppError::ResolutionValidation {
+            message: format!("skill '{}' is not installed", skill),
+        }),
+        _ => Err(AppError::ResolutionValidation {
+            message: format!(
+                "skill '{}' exists in multiple scopes; re-run with --scope",
+                skill
+            ),
+        }),
+    }
+}
+
+fn projection_view(
+    context: &AppContext,
+    projection: &ProjectionRecord,
+) -> Result<serde_json::Value, AppError> {
+    let root = planner::resolve_runtime_root_path(context, &projection.physical_root)?;
+    let projected = root.join(&projection.projected_path);
+
+    Ok(json!({
+        "target": projection.target,
+        "root": planner::display_path(context, &root),
+        "path": planner::display_path(context, &projected),
+        "generated_at": projection.generated_at,
+        "effective_version_hash": projection.effective_version_hash,
+    }))
+}
+
+fn planned_root_views(
+    context: &AppContext,
+    manifest: &WorkspaceManifest,
+    scope: ManagedScope,
+    skill: &str,
+) -> Result<Vec<serde_json::Value>, AppError> {
+    if manifest.targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let plan = planner::plan_target_roots(
+        &AdapterRegistry::new(),
+        target_scope(scope),
+        manifest.projection.policy,
+        &manifest.targets,
+        &manifest.adapters,
+    )?;
+
+    plan.assignments
+        .into_iter()
+        .map(|assignment| {
+            let root = planner::resolve_runtime_root_path(context, &assignment.root)?;
+            let path = root.join(skill);
+            Ok(json!({
+                "target": assignment.target,
+                "root": planner::display_path(context, &root),
+                "path": planner::display_path(context, &path),
+                "source": assignment.source,
+            }))
+        })
+        .collect()
+}
+
+fn toggle_managed_import(
+    context: &AppContext,
+    skill: &str,
+    enabled: bool,
+    command: &'static str,
+) -> Result<AppResponse, AppError> {
+    let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
+    let mut store = LocalStateStore::open_default()?;
+    let managed_skill = resolve_installed_skill(&store, skill, context.selector.scope)?;
+    let import_index = manifest_import_index(&manifest, &managed_skill).ok_or_else(|| {
+        AppError::ResolutionValidation {
+            message: format!(
+                "skill '{}' is not a managed import in the workspace manifest",
+                skill
+            ),
+        }
+    })?;
+    let changed = manifest.imports[import_index].enabled != enabled;
+    manifest.imports[import_index].enabled = enabled;
+    manifest.write_to_path()?;
+
+    let timestamp = current_timestamp();
+    let sync_report =
+        materialize::sync_workspace(&history::context_for_scope(context, managed_skill.scope))?;
+    let current_projections = rebuild_projection_records_for_scope(
+        &mut store,
+        managed_skill.scope,
+        &sync_report,
+        &timestamp,
+    )?;
+
+    let mut ledger = HistoryLedger::new(&mut store);
+    record_pruned_projection_history(
+        &mut ledger,
+        context,
+        managed_skill.scope,
+        &sync_report,
+        &timestamp,
+    )?;
+    for record in current_projections
+        .iter()
+        .filter(|record| record.skill == managed_skill)
+    {
+        ledger.record_projection(record)?;
+    }
+
+    Ok(AppResponse::success(command)
+        .with_summary(format!(
+            "{} {} in {} scope.",
+            if enabled { "Enabled" } else { "Disabled" },
+            skill,
+            managed_skill.scope.as_str()
+        ))
+        .with_data(json!({
+            "skill": skill,
+            "scope": managed_skill.scope.as_str(),
+            "enabled": enabled,
+            "changed": changed,
+            "projection": sync_report,
+        })))
+}
+
+fn rebuild_projection_records_for_scope(
+    store: &mut LocalStateStore,
+    scope: ManagedScope,
+    sync_report: &MaterializationReport,
+    generated_at: &str,
+) -> Result<Vec<ProjectionRecord>, AppError> {
+    let installs_by_skill: BTreeMap<_, _> = store
+        .list_install_records()?
+        .into_iter()
+        .filter(|record| record.skill.scope == scope)
+        .map(|record| (record.skill.skill_id.clone(), record))
+        .collect();
+    let targets_by_root: BTreeMap<_, _> = sync_report
+        .plan
+        .physical_roots
+        .iter()
+        .map(|root| (root.path.clone(), root.targets.clone()))
+        .collect();
+    let mut records = Vec::new();
+
+    for generated_root in &sync_report.generated_roots {
+        let Some(targets) = targets_by_root.get(&generated_root.path) else {
+            continue;
+        };
+
+        for skill_name in &generated_root.materialized {
+            let Some(install) = installs_by_skill.get(skill_name) else {
+                continue;
+            };
+
+            for target in targets {
+                records.push(ProjectionRecord {
+                    skill: install.skill.clone(),
+                    target: *target,
+                    generation_mode: ProjectionMode::Copy,
+                    physical_root: generated_root.path.clone(),
+                    projected_path: skill_name.clone(),
+                    effective_version_hash: install.effective_version_hash.clone(),
+                    generated_at: generated_at.to_string(),
+                });
+            }
+        }
+    }
+
+    store.replace_projection_records_for_scope(scope, &records)?;
+    Ok(records)
+}
+
+fn record_pruned_projection_history(
+    ledger: &mut HistoryLedger<'_>,
+    context: &AppContext,
+    scope: ManagedScope,
+    sync_report: &MaterializationReport,
+    occurred_at: &str,
+) -> Result<(), AppError> {
+    for generated_root in &sync_report.generated_roots {
+        let root = planner::resolve_runtime_root_path(context, &generated_root.path)?;
+        for skill_name in &generated_root.pruned {
+            let skill = ManagedSkillRef::new(scope, skill_name.clone());
+            let path = planner::display_path(context, &root.join(skill_name));
+            ledger.record_prune(Some(&skill), &path, occurred_at)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn remove_directory_if_exists(path: &Path, action: &'static str) -> Result<bool, AppError> {
+    match fs::metadata(path) {
+        Ok(metadata) if !metadata.is_dir() => Err(AppError::PathConflict {
+            path: path.to_path_buf(),
+            expected: "directory",
+        }),
+        Ok(_) => {
+            fs::remove_dir_all(path).map_err(|source| AppError::FilesystemOperation {
+                action,
+                path: path.to_path_buf(),
+                source,
+            })?;
+            Ok(true)
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(AppError::FilesystemOperation {
+            action: "inspect directory",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn managed_import<'a>(
+    manifest: &'a WorkspaceManifest,
+    skill: &ManagedSkillRef,
+) -> Option<&'a ImportDefinition> {
+    manifest
+        .imports
+        .iter()
+        .find(|import| import.id == skill.skill_id && import.scope == manifest_scope(skill.scope))
+}
+
+fn manifest_import_index(manifest: &WorkspaceManifest, skill: &ManagedSkillRef) -> Option<usize> {
+    manifest.imports.iter().position(|import| {
+        import.id == skill.skill_id && import.scope == manifest_scope(skill.scope)
+    })
+}
+
+fn manifest_scope(scope: ManagedScope) -> ManifestScope {
+    match scope {
+        ManagedScope::Workspace => ManifestScope::Workspace,
+        ManagedScope::User => ManifestScope::User,
+    }
+}
+
+fn target_scope(scope: ManagedScope) -> TargetScope {
+    match scope {
+        ManagedScope::Workspace => TargetScope::Workspace,
+        ManagedScope::User => TargetScope::User,
+    }
 }
 
 fn ensure_directory(path: &Path) -> Result<(), AppError> {

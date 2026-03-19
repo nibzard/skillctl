@@ -15,11 +15,14 @@ use crate::{
     app::AppContext,
     cli::Scope,
     error::AppError,
+    history::HistoryLedger,
     lockfile::WorkspaceLockfile,
-    manifest::{ProjectionMode, WorkspaceManifest},
+    manifest::{AdapterRoot, ProjectionMode, WorkspaceManifest},
     planner::{self, ProjectionPlan},
     resolver::{self, InternalSkillId, ProjectionOutcome, ResolvedSkillCandidate, SkillScope},
     response::AppResponse,
+    source::{current_timestamp, imports_store_root},
+    state::{LocalStateStore, ManagedScope, ManagedSkillRef},
 };
 
 /// Metadata file written into generated projection directories.
@@ -164,11 +167,297 @@ pub fn handle_sync(context: &AppContext, _request: SyncRequest) -> Result<AppRes
 }
 
 /// Handle `skillctl clean`.
-pub fn handle_clean(
-    _context: &AppContext,
-    _request: CleanRequest,
-) -> Result<AppResponse, AppError> {
-    Err(AppError::NotYetImplemented { command: "clean" })
+pub fn handle_clean(context: &AppContext, _request: CleanRequest) -> Result<AppResponse, AppError> {
+    let manifest = load_manifest_or_default(&context.working_directory)?;
+    let lockfile = load_lockfile_or_default(&context.working_directory)?;
+    let mut store = LocalStateStore::open_default()?;
+    let installs = store.list_install_records()?;
+    let timestamp = current_timestamp();
+    let mut cleaned_projections = Vec::new();
+    let mut cleaned_state = Vec::new();
+
+    for (scope, root) in cleanup_candidate_roots(context, &manifest)? {
+        cleaned_projections.extend(clean_generated_projections_at(context, scope, &root)?);
+    }
+
+    cleaned_state.extend(clean_unused_import_state(context, &manifest, &lockfile)?);
+
+    store.clear_projection_records()?;
+
+    {
+        let installs = installs
+            .into_iter()
+            .map(|record| {
+                (
+                    (record.skill.scope, record.skill.skill_id.clone()),
+                    record.skill,
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut ledger = HistoryLedger::new(&mut store);
+
+        for cleaned in &cleaned_projections {
+            let skill = cleaned.skill.as_ref().and_then(|skill_id| {
+                installs
+                    .get(&(
+                        cleaned.scope.expect("projection cleanup includes a scope"),
+                        skill_id.clone(),
+                    ))
+                    .cloned()
+                    .or_else(|| {
+                        cleaned
+                            .scope
+                            .map(|scope| ManagedSkillRef::new(scope, skill_id))
+                    })
+            });
+            ledger.record_cleanup(skill.as_ref(), &cleaned.path, &timestamp)?;
+        }
+
+        for cleaned in &cleaned_state {
+            ledger.record_cleanup(None, &cleaned.path, &timestamp)?;
+        }
+    }
+
+    let summary = if cleaned_projections.is_empty() && cleaned_state.is_empty() {
+        "No generated projections or cached state needed cleanup.".to_string()
+    } else {
+        format!(
+            "Removed {} generated projection{} and {} generated state entr{}.",
+            cleaned_projections.len(),
+            if cleaned_projections.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+            cleaned_state.len(),
+            if cleaned_state.len() == 1 { "y" } else { "ies" },
+        )
+    };
+
+    Ok(AppResponse::success("clean")
+        .with_summary(summary)
+        .with_data(json!({
+            "cleaned_projections": cleaned_projections,
+            "cleaned_state": cleaned_state,
+        })))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct CleanedPath {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<ManagedScope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skill: Option<String>,
+    path: String,
+}
+
+fn load_manifest_or_default(working_directory: &Path) -> Result<WorkspaceManifest, AppError> {
+    match WorkspaceManifest::load_from_workspace(working_directory) {
+        Ok(manifest) => Ok(manifest),
+        Err(AppError::FilesystemOperation {
+            action: "read manifest",
+            path,
+            source,
+        }) if source.kind() == io::ErrorKind::NotFound => Ok(WorkspaceManifest::default_at(path)),
+        Err(error) => Err(error),
+    }
+}
+
+fn cleanup_candidate_roots(
+    context: &AppContext,
+    manifest: &WorkspaceManifest,
+) -> Result<Vec<(ManagedScope, PathBuf)>, AppError> {
+    let registry = AdapterRegistry::new();
+    let mut roots = BTreeSet::new();
+
+    for adapter in registry.all() {
+        for root in adapter.discovery_roots {
+            roots.insert((
+                managed_scope(root.scope),
+                planner::resolve_runtime_root_path(context, root.path)?,
+            ));
+        }
+    }
+
+    for (target, override_config) in &manifest.adapters {
+        let _ = target;
+        if let Some(AdapterRoot::Path(path)) = &override_config.workspace_root {
+            roots.insert((
+                ManagedScope::Workspace,
+                planner::resolve_runtime_root_path(context, path)?,
+            ));
+        }
+        if let Some(AdapterRoot::Path(path)) = &override_config.user_root {
+            roots.insert((
+                ManagedScope::User,
+                planner::resolve_runtime_root_path(context, path)?,
+            ));
+        }
+    }
+
+    Ok(roots.into_iter().collect())
+}
+
+fn clean_generated_projections_at(
+    context: &AppContext,
+    scope: ManagedScope,
+    root: &Path,
+) -> Result<Vec<CleanedPath>, AppError> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(AppError::FilesystemOperation {
+                action: "read projection root",
+                path: root.to_path_buf(),
+                source,
+            });
+        }
+    };
+
+    let mut cleaned = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| AppError::FilesystemOperation {
+            action: "read projection root entry",
+            path: root.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        let metadata = entry
+            .file_type()
+            .map_err(|source| AppError::FilesystemOperation {
+                action: "inspect projection root entry",
+                path: path.clone(),
+                source,
+            })?;
+        if !metadata.is_dir() || !is_skillctl_generated_directory(&path)? {
+            continue;
+        }
+
+        fs::remove_dir_all(&path).map_err(|source| AppError::FilesystemOperation {
+            action: "remove generated projection",
+            path: path.clone(),
+            source,
+        })?;
+        cleaned.push(CleanedPath {
+            scope: Some(scope),
+            skill: Some(entry.file_name().to_string_lossy().into_owned()),
+            path: planner::display_path(context, &path),
+        });
+    }
+
+    cleaned.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.skill.cmp(&right.skill))
+    });
+    Ok(cleaned)
+}
+
+fn clean_unused_import_state(
+    context: &AppContext,
+    manifest: &WorkspaceManifest,
+    lockfile: &WorkspaceLockfile,
+) -> Result<Vec<CleanedPath>, AppError> {
+    let mut cleaned = Vec::new();
+    let imports_root = imports_store_root()?;
+    let referenced_imports: BTreeSet<_> = manifest
+        .imports
+        .iter()
+        .map(|import| import.id.clone())
+        .chain(lockfile.imports.keys().cloned())
+        .collect();
+
+    let entries = match fs::read_dir(&imports_root) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(cleaned),
+        Err(source) => {
+            return Err(AppError::FilesystemOperation {
+                action: "read imports store root",
+                path: imports_root,
+                source,
+            });
+        }
+    };
+
+    for entry in entries {
+        let entry = entry.map_err(|source| AppError::FilesystemOperation {
+            action: "read imports store entry",
+            path: imports_root.clone(),
+            source,
+        })?;
+        let path = entry.path();
+        let metadata = entry
+            .file_type()
+            .map_err(|source| AppError::FilesystemOperation {
+                action: "inspect imports store entry",
+                path: path.clone(),
+                source,
+            })?;
+        if !metadata.is_dir() {
+            continue;
+        }
+
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if referenced_imports.contains(&name) {
+            continue;
+        }
+
+        fs::remove_dir_all(&path).map_err(|source| AppError::FilesystemOperation {
+            action: "remove unused import state",
+            path: path.clone(),
+            source,
+        })?;
+        cleaned.push(CleanedPath {
+            scope: None,
+            skill: None,
+            path: path.display().to_string(),
+        });
+    }
+
+    let placeholder = context
+        .working_directory
+        .join(UNUSED_IMPORTS_PLACEHOLDER_DIR);
+    if remove_directory_if_exists(&placeholder, "remove unused imports placeholder")? {
+        cleaned.push(CleanedPath {
+            scope: None,
+            skill: None,
+            path: planner::display_path(context, &placeholder),
+        });
+    }
+
+    cleaned.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(cleaned)
+}
+
+fn remove_directory_if_exists(path: &Path, action: &'static str) -> Result<bool, AppError> {
+    match fs::metadata(path) {
+        Ok(metadata) if !metadata.is_dir() => Err(AppError::PathConflict {
+            path: path.to_path_buf(),
+            expected: "directory",
+        }),
+        Ok(_) => {
+            fs::remove_dir_all(path).map_err(|source| AppError::FilesystemOperation {
+                action,
+                path: path.to_path_buf(),
+                source,
+            })?;
+            Ok(true)
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(AppError::FilesystemOperation {
+            action: "inspect directory",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn managed_scope(scope: TargetScope) -> ManagedScope {
+    match scope {
+        TargetScope::Workspace => ManagedScope::Workspace,
+        TargetScope::User => ManagedScope::User,
+    }
 }
 
 fn load_lockfile_or_default(working_directory: &Path) -> Result<WorkspaceLockfile, AppError> {

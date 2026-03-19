@@ -761,7 +761,10 @@ fn file_contents_equal(left: &Path, right: &Path) -> Result<bool, AppError> {
     Ok(left_contents == right_contents)
 }
 
-fn resolve_runtime_root_path(context: &AppContext, root: &str) -> Result<PathBuf, AppError> {
+pub(crate) fn resolve_runtime_root_path(
+    context: &AppContext,
+    root: &str,
+) -> Result<PathBuf, AppError> {
     if let Some(suffix) = root.strip_prefix("~/") {
         return Ok(home_directory()?.join(suffix));
     }
@@ -784,7 +787,7 @@ fn home_directory() -> Result<PathBuf, AppError> {
         .ok_or(AppError::HomeDirectoryUnavailable)
 }
 
-fn display_path(context: &AppContext, path: &Path) -> String {
+pub(crate) fn display_path(context: &AppContext, path: &Path) -> String {
     path.strip_prefix(&context.working_directory)
         .map(|relative| relative.display().to_string())
         .unwrap_or_else(|_| path.display().to_string())

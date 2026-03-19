@@ -20,6 +20,7 @@ use crate::{
     materialize::{self, MaterializationReport},
     overlay::{NO_OVERLAY_HASH, hash_overlay_root},
     response::AppResponse,
+    skill,
     source::{
         SourceKind, compute_effective_version_hash, copy_source_tree, current_timestamp,
         hash_directory_contents, imports_store_root,
@@ -737,10 +738,115 @@ pub fn handle_rollback(
 
 /// Handle `skillctl history`.
 pub fn handle_history(
-    _context: &AppContext,
-    _request: HistoryRequest,
+    context: &AppContext,
+    request: HistoryRequest,
 ) -> Result<AppResponse, AppError> {
-    Err(AppError::NotYetImplemented { command: "history" })
+    let requested_skill = match (&request.skill, &context.selector.skill_name) {
+        (Some(positional), Some(global)) if positional != global => {
+            return Err(AppError::ResolutionValidation {
+                message: format!(
+                    "conflicting skill selectors '{}'(argument) and '{}'(--name)",
+                    positional, global
+                ),
+            });
+        }
+        (Some(positional), _) => Some(positional.clone()),
+        (None, Some(global)) => Some(global.clone()),
+        (None, None) => None,
+    };
+    let store = LocalStateStore::open_default()?;
+
+    let (query, filter) = match requested_skill {
+        Some(skill_name) => {
+            let managed_skill = resolve_history_skill(&store, &skill_name, context.selector.scope)?;
+            (
+                HistoryQuery::for_skill(managed_skill.clone()),
+                Some(managed_skill),
+            )
+        }
+        None => (HistoryQuery::default(), None),
+    };
+    let entries = store.history_entries(&query)?;
+
+    let summary = match &filter {
+        Some(skill) if entries.is_empty() => {
+            format!("No history entries recorded for {}.", skill.skill_id)
+        }
+        Some(skill) => format!(
+            "Showing {} history entr{} for {}.",
+            entries.len(),
+            if entries.len() == 1 { "y" } else { "ies" },
+            skill.skill_id
+        ),
+        None => format!(
+            "Showing {} history entr{}.",
+            entries.len(),
+            if entries.len() == 1 { "y" } else { "ies" }
+        ),
+    };
+
+    Ok(AppResponse::success("history")
+        .with_summary(summary)
+        .with_data(json!({
+            "skill": filter.as_ref().map(|skill| skill.skill_id.clone()),
+            "scope": filter.as_ref().map(|skill| skill.scope.as_str()),
+            "entries": entries,
+        })))
+}
+
+fn resolve_history_skill(
+    store: &LocalStateStore,
+    skill_name: &str,
+    scope: Option<Scope>,
+) -> Result<ManagedSkillRef, AppError> {
+    match skill::resolve_installed_skill(store, skill_name, scope) {
+        Ok(skill) => Ok(skill),
+        Err(AppError::ResolutionValidation { .. }) => {
+            let entries = store.history_entries(&HistoryQuery::default())?;
+            let mut matches = BTreeMap::new();
+
+            for entry in entries {
+                let Some(entry_skill) = entry.skill_id.as_deref() else {
+                    continue;
+                };
+                if entry_skill != skill_name {
+                    continue;
+                }
+
+                let Some(entry_scope) = entry.scope else {
+                    continue;
+                };
+                if scope.is_some_and(|scope| entry_scope != cli_scope(scope)) {
+                    continue;
+                }
+                matches.insert(entry_scope.as_str().to_string(), entry_scope);
+            }
+
+            match matches.len() {
+                0 => Err(AppError::ResolutionValidation {
+                    message: format!("skill '{}' has no recorded history", skill_name),
+                }),
+                1 => Ok(ManagedSkillRef::new(
+                    *matches.values().next().expect("one history scope exists"),
+                    skill_name,
+                )),
+                _ => Err(AppError::ResolutionValidation {
+                    message: format!(
+                        "skill '{}' has recorded history in multiple scopes; re-run with --scope",
+                        skill_name
+                    ),
+                }),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn cli_scope(scope: Scope) -> ManagedScope {
+    match scope {
+        Scope::Workspace => ManagedScope::Workspace,
+        Scope::User => ManagedScope::User,
+    }
 }
 
 pub(crate) fn context_for_scope(context: &AppContext, scope: ManagedScope) -> AppContext {
