@@ -239,15 +239,43 @@ Remember:
 - only public-source install and update events are eligible for remote emission
 - private repositories, local paths, skill contents, and arbitrary diffs are never sent remotely
 
-## `tui` And `mcp serve` Return Not Implemented
+## `tui` Looks Empty Or Shows Unexpected State
 
-These commands are placeholders in the current release.
+`skillctl tui` is implemented. It opens a read-only dashboard over the same install, update, explain, and history state used by the CLI, and opening it does not write new history entries.
 
-Use these equivalents today:
+Run:
 
-- installed skills: `skillctl list`
-- update inspection: `skillctl update [skill]`
-- winner and target visibility: `skillctl explain <skill>`
-- filesystem locations: `skillctl path <skill>`
-- history and rollback context: `skillctl history [skill]`
-- agent-safe automation: any CLI command with `--json`
+```bash
+skillctl tui
+skillctl --scope workspace --name <skill> tui
+skillctl --target <runtime> tui
+skillctl --json --name <skill> tui
+```
+
+What to check:
+
+- if a skill card is missing, remove an overly narrow `--name`, `--scope`, or `--target` filter
+- if the dashboard shows stale visibility or drift, follow the mapped CLI actions: `skillctl update [skill]`, `skillctl explain <skill>`, `skillctl path <skill>`, `skillctl history [skill]`, `skillctl pin <skill> <ref>`, or `skillctl rollback <skill> <version-or-commit>`
+- if you need machine-readable dashboard state, use `--json`; it returns the normal response envelope with aggregated skill cards and history data
+
+## MCP Client Cannot Use `mcp serve`
+
+`skillctl mcp serve` is implemented. It starts a stdio MCP bridge that exposes the v1 lifecycle tools and returns the same JSON response envelope the CLI emits with `--json`.
+
+What to check:
+
+- send `initialize` before `tools/list` or `tools/call`, then send `notifications/initialized`
+- use newline-delimited JSON-RPC over stdin/stdout
+- use a supported protocol version: `2025-03-26`, `2025-06-18`, or `2025-11-25`
+- call one of the shipped v1 tools: `skills_list`, `skills_install`, `skills_remove`, `skills_sync`, `skills_update`, `skills_rollback`, `skills_history`, `skills_explain`, `skills_override_create`, `skills_validate`, `skills_doctor`, or `skills_telemetry_status`
+- pass tool arguments as a JSON object; required fields are enforced, so `skills_remove` needs `{"skill":"<name>"}` and `skills_rollback` needs both `skill` and `version_or_commit`
+
+Minimal handshake:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"example-client","version":"1.0.0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+```
+
+If you do not need MCP specifically, the simplest automation path is still the plain CLI with `--json`.

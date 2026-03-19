@@ -809,6 +809,23 @@
         "to-do.json"
       ],
       "updated_at": "2026-03-19T16:07:51Z"
+    },
+    {
+      "id": "T030",
+      "title": "Update troubleshooting docs to reflect the implemented TUI and MCP server",
+      "priority": 3,
+      "status": "done",
+      "details": "Replaced the stale troubleshooting placeholder text for `skillctl tui` and `skillctl mcp serve` with the implemented behavior, CLI mappings, MCP handshake guidance, supported protocol versions, and `--json` automation guidance.",
+      "tags": [
+        "review-followup",
+        "docs"
+      ],
+      "files": [
+        "docs/troubleshooting.md",
+        "to-do.json"
+      ],
+      "updated_at": "2026-03-19T16:12:44Z",
+      "blockers": []
     }
   ]
 }
