@@ -233,5 +233,6 @@ RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
 
 More detail:
 
+- user guide: [docs/user-guide.md](./docs/user-guide.md)
 - product direction: [spec.md](./spec.md)
 - troubleshooting: [docs/troubleshooting.md](./docs/troubleshooting.md)
