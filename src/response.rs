@@ -21,6 +21,9 @@ pub struct AppResponse {
     /// Optional human-readable summary for non-JSON output.
     #[serde(skip)]
     pub summary: Option<String>,
+    /// Optional explicit process status override for diagnostics-heavy commands.
+    #[serde(skip)]
+    pub status_override: Option<ExitStatus>,
 }
 
 impl AppResponse {
@@ -33,6 +36,7 @@ impl AppResponse {
             errors: Vec::new(),
             data: Value::Object(Map::new()),
             summary: None,
+            status_override: None,
         }
     }
 
@@ -45,6 +49,7 @@ impl AppResponse {
             errors: vec![error.into()],
             data: Value::Object(Map::new()),
             summary: None,
+            status_override: None,
         }
     }
 
@@ -60,6 +65,12 @@ impl AppResponse {
         self
     }
 
+    /// Override the process exit status while preserving the response payload.
+    pub fn with_exit_status(mut self, status: ExitStatus) -> Self {
+        self.status_override = Some(status);
+        self
+    }
+
     /// Attach a warning and preserve success semantics.
     pub fn with_warning(mut self, warning: impl Into<String>) -> Self {
         self.warnings.push(warning.into());
@@ -68,6 +79,9 @@ impl AppResponse {
 
     /// Compute the exit status implied by the response content.
     pub const fn exit_status(&self) -> ExitStatus {
+        if let Some(status) = self.status_override {
+            return status;
+        }
         if self.ok {
             if self.warnings.is_empty() {
                 ExitStatus::Success

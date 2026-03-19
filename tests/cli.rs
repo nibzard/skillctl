@@ -356,6 +356,98 @@ fn install_updates_manifest_lockfile_store_state_and_projection_records() {
 }
 
 #[test]
+fn validate_reports_invalid_local_skills() {
+    let workspace = TestWorkspace::new();
+    workspace.write_file(
+        ".agents/skills/broken/SKILL.md",
+        concat!("---\n", "name: broken\n", "---\n", "\n", "# broken\n"),
+    );
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .args(["--json", "validate"])
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(predicate::str::is_empty());
+
+    let output = assert.get_output();
+    let body: Value = serde_json::from_slice(&output.stdout).expect("stdout is valid json");
+
+    assert_eq!(body["command"], "validate");
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["data"]["summary"]["error_count"], 1);
+    assert_eq!(body["data"]["issues"][0]["code"], "invalid-skill");
+    assert_eq!(body["data"]["issues"][0]["severity"], "error");
+    assert!(
+        body["data"]["issues"][0]["path"]
+            .as_str()
+            .expect("path exists")
+            .contains(".agents/skills/broken/SKILL.md"),
+    );
+}
+
+#[test]
+fn validate_reports_invalid_overlay_shadow_mappings() {
+    let workspace = TestWorkspace::new();
+    workspace.write_skill_source("shared-skills", "release-notes");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["override", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    workspace.write_file(".agents/overlays/release-notes/extra.md", "# unmanaged\n");
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--json", "validate"])
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(predicate::str::is_empty());
+
+    let output = assert.get_output();
+    let body: Value = serde_json::from_slice(&output.stdout).expect("stdout is valid json");
+
+    assert_eq!(body["command"], "validate");
+    assert_eq!(body["ok"], false);
+    assert!(
+        body["data"]["issues"]
+            .as_array()
+            .expect("issues array exists")
+            .iter()
+            .any(|issue| {
+                issue["code"] == "invalid-overlay-mapping"
+                    && issue["path"] == ".agents/overlays/release-notes/extra.md"
+            }),
+        "unexpected issues: {body:#?}",
+    );
+}
+
+#[test]
 fn init_bootstraps_the_default_workspace_layout() {
     let workspace = TestWorkspace::new();
 
@@ -584,6 +676,187 @@ fn sync_materializes_generated_copies_without_touching_canonical_skills() {
         ".agents/skills/release-notes"
     );
     assert!(metadata["generated_at"].is_string());
+}
+
+#[test]
+fn doctor_reports_shadowing_and_projection_drift() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_skill_source("shared-skills", "release-notes");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    workspace.write_workspace_skill(
+        "release-notes",
+        "Canonical release notes helper.",
+        &[("notes.md", "# Canonical\n")],
+    );
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--json", "doctor"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::is_empty());
+
+    let output = assert.get_output();
+    let body: Value = serde_json::from_slice(&output.stdout).expect("stdout is valid json");
+    let issues = body["data"]["issues"]
+        .as_array()
+        .expect("issues array exists");
+
+    assert_eq!(body["command"], "doctor");
+    assert_eq!(body["ok"], true);
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue["code"] == "shadowed-skill" && issue["skill"] == "release-notes"),
+        "unexpected issues: {body:#?}",
+    );
+    assert!(
+        issues.iter().any(|issue| {
+            issue["code"] == "projection-drift" && issue["skill"] == "release-notes"
+        }),
+        "unexpected issues: {body:#?}",
+    );
+}
+
+#[test]
+fn doctor_reports_stale_lockfile_entries() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!("version: 1\n", "\n", "targets:\n", "  - codex\n",));
+    workspace.write_lockfile(concat!(
+        "version: 1\n",
+        "\n",
+        "state:\n",
+        "  manifest_version: 1\n",
+        "  local_state_version: 1\n",
+        "\n",
+        "imports:\n",
+        "  stale-skill:\n",
+        "    source:\n",
+        "      type: local-path\n",
+        "      url: file:///tmp/stale-skill\n",
+        "      subpath: .agents/skills/stale-skill\n",
+        "    revision:\n",
+        "      resolved: deadbeef\n",
+        "    timestamps:\n",
+        "      fetched_at: 2026-01-01T00:00:00Z\n",
+        "      first_installed_at: 2026-01-01T00:00:00Z\n",
+        "      last_updated_at: 2026-01-01T00:00:00Z\n",
+        "    hashes:\n",
+        "      content: sha256:content\n",
+        "      overlay: sha256:none\n",
+        "      effective_version: sha256:effective\n",
+    ));
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--json", "doctor"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::is_empty());
+
+    let output = assert.get_output();
+    let body: Value = serde_json::from_slice(&output.stdout).expect("stdout is valid json");
+
+    assert!(
+        body["data"]["issues"]
+            .as_array()
+            .expect("issues array exists")
+            .iter()
+            .any(|issue| issue["code"] == "stale-lockfile-entry" && issue["skill"] == "stale-skill"),
+        "unexpected issues: {body:#?}",
+    );
+}
+
+#[test]
+fn explain_reports_winner_shadowed_candidates_visibility_and_drift() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_skill_source("shared-skills", "release-notes");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    workspace.write_workspace_skill(
+        "release-notes",
+        "Canonical release notes helper.",
+        &[("notes.md", "# Canonical\n")],
+    );
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--json", "explain", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let output = assert.get_output();
+    let body: Value = serde_json::from_slice(&output.stdout).expect("stdout is valid json");
+
+    assert_eq!(body["command"], "explain");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["data"]["skill"], "release-notes");
+    assert_eq!(body["data"]["status"], "selected");
+    assert_eq!(body["data"]["winner"]["source_class"], "canonical-local");
+    assert_eq!(
+        body["data"]["winner"]["root"],
+        ".agents/skills/release-notes"
+    );
+    assert_eq!(body["data"]["shadowed"][0]["source_class"], "imported");
+    assert_eq!(body["data"]["targets"][0]["target"], "claude-code");
+    assert_eq!(body["data"]["targets"][0]["root"], ".claude/skills");
+    assert_eq!(body["data"]["targets"][0]["visible"], true);
+    assert_eq!(
+        body["data"]["drift"]["active_projection_matches_winner"],
+        false
+    );
+    assert_eq!(
+        body["data"]["drift"]["active_differs_from_pinned_source"],
+        true
+    );
 }
 
 #[test]

@@ -13,6 +13,7 @@ use crate::{
     adapter::{AdapterRegistry, TargetScope},
     app::AppContext,
     cli::Scope,
+    doctor,
     error::AppError,
     history::{self, HistoryLedger},
     lockfile::WorkspaceLockfile,
@@ -456,10 +457,10 @@ pub fn handle_remove(
 
 /// Handle `skillctl explain`.
 pub fn handle_explain(
-    _context: &AppContext,
-    _request: ExplainRequest,
+    context: &AppContext,
+    request: ExplainRequest,
 ) -> Result<AppResponse, AppError> {
-    Err(AppError::NotYetImplemented { command: "explain" })
+    doctor::build_explain_response(context, request.skill.as_str())
 }
 
 /// Handle `skillctl enable`.

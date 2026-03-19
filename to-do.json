@@ -418,7 +418,7 @@
       "id": "T016",
       "title": "Implement `validate`, `doctor`, and `explain` diagnostics",
       "priority": 2,
-      "status": "todo",
+      "status": "done",
       "details": "Build diagnostics that explain why a skill is valid, missing, shadowed, stale, detached, or not loading for a target.",
       "steps": [
         "Implement core validation for malformed skills, duplicate identities, invalid overlays, and target compatibility issues.",
@@ -432,6 +432,13 @@
         "T009",
         "T010",
         "T013"
+      ],
+      "updated_at": "2026-03-19T13:06:34Z",
+      "files": [
+        "src/doctor.rs",
+        "src/response.rs",
+        "src/skill.rs",
+        "tests/cli.rs"
       ]
     },
     {
