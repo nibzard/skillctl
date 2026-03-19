@@ -90,6 +90,12 @@ pub enum AppError {
         /// Stable command identifier.
         command: &'static str,
     },
+    /// Projection-root planning failed validation.
+    #[error("invalid projection plan: {message}")]
+    PlannerValidation {
+        /// Validation message.
+        message: String,
+    },
     /// JSON output rendering failed.
     #[error("failed to render JSON output: {source}")]
     JsonRender {
@@ -180,7 +186,8 @@ impl AppError {
             | Self::InvalidGitDirFile { .. }
             | Self::NotYetImplemented { .. }
             | Self::JsonRender { .. } => ExitStatus::OperationalError,
-            Self::ManifestParse { .. }
+            Self::PlannerValidation { .. }
+            | Self::ManifestParse { .. }
             | Self::ManifestValidation { .. }
             | Self::ManifestSerialize { .. }
             | Self::LockfileParse { .. }

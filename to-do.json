@@ -151,7 +151,7 @@
       "id": "T006",
       "title": "Implement the adapter registry and target root planner for all supported runtimes",
       "priority": 1,
-      "status": "todo",
+      "status": "done",
       "details": "Encode runtime discovery roots, precedence rules, scope support, neutral-root compatibility, and symlink risk for `codex`, `claude-code`, `github-copilot`, `gemini-cli`, `amp`, and `opencode`.",
       "steps": [
         "Define typed adapter metadata for workspace and user scopes, discovery roots, precedence behavior, and compatibility notes.",
@@ -161,7 +161,15 @@
       "depends_on": [
         "T001",
         "T003"
-      ]
+      ],
+      "updated_at": "2026-03-19T10:04:33Z",
+      "files": [
+        "src/adapter.rs",
+        "src/error.rs",
+        "src/planner.rs",
+        "to-do.json"
+      ],
+      "blockers": []
     },
     {
       "id": "T007",
