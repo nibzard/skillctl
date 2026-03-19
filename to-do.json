@@ -1,0 +1,506 @@
+{
+  "schema_version": 1,
+  "project": {
+    "name": "skillctl",
+    "root": "."
+  },
+  "source_files": [
+    "README.md",
+    "spec.md"
+  ],
+  "tasks": [
+    {
+      "id": "T001",
+      "title": "Establish the executable Rust foundation and command dispatch architecture",
+      "priority": 1,
+      "status": "done",
+      "details": "Replace the help-only bootstrap with a test-first command runtime, domain-oriented module layout, typed errors, and shared execution plumbing that can support the CLI, MCP server, and TUI.",
+      "steps": [
+        "Create the core modules called for by the spec: manifest, lockfile, source, skill, overlay, adapter, planner, materialize, history, telemetry, doctor, mcp, and tui.",
+        "Add a dispatcher that maps parsed clap commands to typed handlers instead of stopping at help output.",
+        "Define shared error, response, and application-context types so later commands can reuse one execution model."
+      ],
+      "updated_at": "2026-03-19T09:01:13Z",
+      "files": [
+        "Cargo.toml",
+        "Cargo.lock",
+        "src/main.rs",
+        "src/lib.rs",
+        "src/cli.rs",
+        "src/app.rs",
+        "src/error.rs",
+        "src/response.rs",
+        "src/runtime.rs",
+        "src/manifest.rs",
+        "src/lockfile.rs",
+        "src/source.rs",
+        "src/skill.rs",
+        "src/overlay.rs",
+        "src/adapter.rs",
+        "src/planner.rs",
+        "src/materialize.rs",
+        "src/history.rs",
+        "src/telemetry.rs",
+        "src/doctor.rs",
+        "src/mcp.rs",
+        "src/tui.rs",
+        "tests/cli.rs"
+      ],
+      "blockers": []
+    },
+    {
+      "id": "T002",
+      "title": "Implement `skillctl init` workspace bootstrap and repo integration",
+      "priority": 1,
+      "status": "todo",
+      "details": "Create the manifest-free default workspace layout under `.agents/`, including optional local Git exclusions, without mutating unrelated repository files.",
+      "steps": [
+        "Create `.agents/skills/`, `.agents/overlays/`, and a minimal `.agents/skillctl.yaml` with sensible defaults.",
+        "Add optional `.git/info/exclude` handling for generated runtime roots as described by the spec.",
+        "Return human-readable and JSON summaries describing what was created or skipped."
+      ],
+      "depends_on": [
+        "T001"
+      ]
+    },
+    {
+      "id": "T003",
+      "title": "Implement manifest loading, validation, and serialization for `.agents/skillctl.yaml`",
+      "priority": 1,
+      "status": "todo",
+      "details": "Model the workspace manifest with strong Rust types, explicit defaults, and validation for targets, projection policy, layout, imports, overrides, adapters, and telemetry settings.",
+      "steps": [
+        "Parse the minimal and full manifest shapes described in the spec.",
+        "Validate projection policy, projection mode, layout paths, target names, and import definitions.",
+        "Support deterministic serialization so manifest output is stable in tests and Git diffs."
+      ],
+      "depends_on": [
+        "T001"
+      ]
+    },
+    {
+      "id": "T004",
+      "title": "Implement lockfile modeling, deterministic IO, and state versioning",
+      "priority": 1,
+      "status": "todo",
+      "details": "Add `.agents/skillctl.lock` support that records exact source identity, revision, hashes, timestamps, and effective-version data with deliberate schema evolution.",
+      "steps": [
+        "Model lock entries for source type, normalized source URL, selected subpath, commit or digest, content hash, overlay hash, and effective version hash.",
+        "Read and write the lockfile deterministically so the same inputs produce the same file output.",
+        "Define versioning and migration hooks for future manifest, lockfile, and local-state changes."
+      ],
+      "depends_on": [
+        "T001",
+        "T003"
+      ]
+    },
+    {
+      "id": "T005",
+      "title": "Implement skill parsing and validation for `SKILL.md` plus vendor-specific metadata passthrough",
+      "priority": 1,
+      "status": "todo",
+      "details": "Parse skills as directories containing `SKILL.md`, validate the open Agent Skills contract, and preserve vendor-specific extensions without mutating them.",
+      "steps": [
+        "Validate that `SKILL.md` exists and that required fields such as name and description are present.",
+        "Check name and directory consistency, frontmatter parsing, and invalid path traversal in overlays.",
+        "Preserve supported extra metadata such as `agents/openai.yaml` and Claude-specific frontmatter fields."
+      ],
+      "depends_on": [
+        "T001"
+      ]
+    },
+    {
+      "id": "T006",
+      "title": "Implement the adapter registry and target root planner for all supported runtimes",
+      "priority": 1,
+      "status": "todo",
+      "details": "Encode runtime discovery roots, precedence rules, scope support, neutral-root compatibility, and symlink risk for `codex`, `claude-code`, `github-copilot`, `gemini-cli`, `amp`, and `opencode`.",
+      "steps": [
+        "Define typed adapter metadata for workspace and user scopes, discovery roots, precedence behavior, and compatibility notes.",
+        "Implement the documented shared-root planning rules for neutral and native projection policies.",
+        "Expose planner results in a form that can be reused by sync, doctor, explain, and JSON output."
+      ],
+      "depends_on": [
+        "T001",
+        "T003"
+      ]
+    },
+    {
+      "id": "T007",
+      "title": "Implement source detection, normalization, and fetch support for Git, local paths, and archives",
+      "priority": 1,
+      "status": "todo",
+      "details": "Support the install pipeline’s input sources, detect skills in the required directory layouts, and normalize candidates into a stable internal representation.",
+      "steps": [
+        "Detect candidate skills in `.agents/skills/`, `.claude/skills/`, `.opencode/skills/`, and repo-root `skills/`.",
+        "Fetch or stage sources from Git URLs, local directories, and local archives while capturing immutable revision information.",
+        "Normalize detected candidates with source path, displayed name, compatibility hints, and selected subpath."
+      ],
+      "depends_on": [
+        "T001",
+        "T005"
+      ]
+    },
+    {
+      "id": "T008",
+      "title": "Implement effective-skill resolution, overlay application, and conflict handling",
+      "priority": 1,
+      "status": "todo",
+      "details": "Resolve canonical local skills, imported skills, and overrides into one effective view per projected name while enforcing the precedence and tie rules in the spec.",
+      "steps": [
+        "Build a resolver that combines manifest inputs, discovered local skills, imports from the lockfile, and overlays.",
+        "Apply explicit manifest priority first, then source-class precedence, and treat unresolved ties as errors.",
+        "Produce an explainable effective-skill graph that downstream commands can inspect."
+      ],
+      "depends_on": [
+        "T003",
+        "T004",
+        "T005",
+        "T006",
+        "T007"
+      ]
+    },
+    {
+      "id": "T009",
+      "title": "Implement copy-first projection materialization and the `sync` command",
+      "priority": 1,
+      "status": "todo",
+      "details": "Materialize effective skills into runtime-visible roots using deterministic copy mode by default, emit provenance metadata, and prune only prior `skillctl` outputs.",
+      "steps": [
+        "Compute physical roots from the planner and materialize generated copies without touching canonical authoring directories.",
+        "Write `.skillctl-projection.json` metadata for each generated projection.",
+        "Implement stale-projection pruning that only removes directories previously generated by `skillctl`."
+      ],
+      "depends_on": [
+        "T008"
+      ]
+    },
+    {
+      "id": "T010",
+      "title": "Implement the SQLite local state store and history ledger",
+      "priority": 1,
+      "status": "todo",
+      "details": "Create `~/.skillctl/state.db` as the local system of record for installs, projections, modification detection, telemetry consent, pins, rollbacks, and history events.",
+      "steps": [
+        "Design a versioned SQLite schema for install records, projection records, update checks, local modifications, pins, rollbacks, and telemetry settings.",
+        "Add a history-writing layer that records installs, updates, projections, detachments, and cleanup operations deterministically.",
+        "Expose query APIs that higher-level commands can use for history, explain, update planning, and TUI views."
+      ],
+      "depends_on": [
+        "T001",
+        "T004"
+      ]
+    },
+    {
+      "id": "T011",
+      "title": "Implement `skillctl install` end to end for interactive and non-interactive workflows",
+      "priority": 1,
+      "status": "todo",
+      "details": "Support the main install journey from source inspection through selection, lockfile updates, projection, and history recording.",
+      "steps": [
+        "Implement interactive selection that lists detected skills, locations, pinned revisions, and scope choices.",
+        "Implement exact-name non-interactive selection using `--name` or an equivalent selector that never guesses.",
+        "Pin the installed revision, update the lockfile and state store, run projection, and record the install event."
+      ],
+      "depends_on": [
+        "T004",
+        "T005",
+        "T006",
+        "T007",
+        "T008",
+        "T009",
+        "T010"
+      ]
+    },
+    {
+      "id": "T012",
+      "title": "Implement the overlay model and `skillctl override` workflow",
+      "priority": 2,
+      "status": "todo",
+      "details": "Add shadow-file overlays in `.agents/overlays/<skill-id>/` so imported skills can be customized without breaking upgradeability.",
+      "steps": [
+        "Resolve overlay files by relative path and make them override upstream content in the effective-skill view.",
+        "Implement `skillctl override <skill>` to create the minimal editable overlay layout.",
+        "Track overlay hashes in the lockfile and state store so update and rollback logic can reason about drift."
+      ],
+      "depends_on": [
+        "T005",
+        "T008",
+        "T009",
+        "T010"
+      ]
+    },
+    {
+      "id": "T013",
+      "title": "Implement `skillctl update` planning, upstream checks, and local modification handling",
+      "priority": 2,
+      "status": "todo",
+      "details": "Compare pinned installs with upstream revisions, detect overlays and unmanaged edits, and propose safe actions rather than overwriting state blindly.",
+      "steps": [
+        "Check upstream sources and compare the installed pinned commit with the latest available revision.",
+        "Differentiate managed overlays, unmanaged edits to projected copies, and detached local forks.",
+        "Produce an update plan that can apply, defer, skip, or redirect the user into overlay or fork workflows while recording history."
+      ],
+      "depends_on": [
+        "T010",
+        "T011",
+        "T012"
+      ]
+    },
+    {
+      "id": "T014",
+      "title": "Implement pinning, rollback, and fork or detach workflows",
+      "priority": 2,
+      "status": "todo",
+      "details": "Let users pin revisions, inspect prior effective versions, roll back safely, and detach imported skills into canonical local ownership when needed.",
+      "steps": [
+        "Implement `pin` and `rollback` against exact recorded versions in the lockfile and state database.",
+        "Implement `fork` to copy an effective skill into `.agents/skills/` and detach it from upstream updates.",
+        "Record every pin, rollback, and detach transition in local history and projection metadata."
+      ],
+      "depends_on": [
+        "T010",
+        "T011",
+        "T012",
+        "T013"
+      ]
+    },
+    {
+      "id": "T015",
+      "title": "Implement the remaining lifecycle and inventory commands",
+      "priority": 2,
+      "status": "todo",
+      "details": "Fill out the day-to-day command surface for managed-skill visibility and maintenance.",
+      "steps": [
+        "Implement `list`, `history`, and `path` using the manifest, lockfile, projections, and local state store.",
+        "Implement `enable`, `disable`, and `remove` so effective-skill selection and projections stay consistent.",
+        "Implement `clean` to remove only generated state and projections while never deleting canonical skills or overlays implicitly."
+      ],
+      "depends_on": [
+        "T009",
+        "T010",
+        "T011"
+      ]
+    },
+    {
+      "id": "T016",
+      "title": "Implement `validate`, `doctor`, and `explain` diagnostics",
+      "priority": 2,
+      "status": "todo",
+      "details": "Build diagnostics that explain why a skill is valid, missing, shadowed, stale, detached, or not loading for a target.",
+      "steps": [
+        "Implement core validation for malformed skills, duplicate identities, invalid overlays, and target compatibility issues.",
+        "Implement `doctor` checks for shadowing, stale lockfile entries, unmanaged edits, wrong precedence roots, and adapter-specific loading problems.",
+        "Implement `explain` to show the active winner, shadowed candidates, physical roots, target visibility, and drift from pinned sources."
+      ],
+      "depends_on": [
+        "T005",
+        "T006",
+        "T008",
+        "T009",
+        "T010",
+        "T013"
+      ]
+    },
+    {
+      "id": "T017",
+      "title": "Implement opt-in symlink mode with adapter-specific warnings and safeguards",
+      "priority": 4,
+      "status": "todo",
+      "details": "Keep copy mode as the default while supporting explicit symlink projection where the user opts in and the adapter deems it safe enough.",
+      "steps": [
+        "Add projection-mode handling for `copy` and `symlink` in the planner and materializer.",
+        "Warn when selected targets are marked `symlink-unstable` and require explicit override behavior.",
+        "Report symlink risks consistently in human output, JSON output, and diagnostics."
+      ],
+      "depends_on": [
+        "T006",
+        "T009",
+        "T016"
+      ]
+    },
+    {
+      "id": "T018",
+      "title": "Implement telemetry consent, settings commands, and public-only event emission",
+      "priority": 3,
+      "status": "todo",
+      "details": "Add the first-run notice, opt-out controls, consent persistence, and event filtering so telemetry is useful without leaking private-source information.",
+      "steps": [
+        "Implement `telemetry status`, `telemetry enable`, and `telemetry disable` backed by the local state store.",
+        "Show a clear first-run notice and persist user consent separately from local history so history still works when telemetry is off.",
+        "Emit only public-source install and update events and suppress remote telemetry for private or local-only sources."
+      ],
+      "depends_on": [
+        "T010",
+        "T011",
+        "T013"
+      ]
+    },
+    {
+      "id": "T019",
+      "title": "Implement the bundled `skillctl` management skill at user scope",
+      "priority": 3,
+      "status": "todo",
+      "details": "Ship and manage a built-in `skillctl` skill that helps agents use the CLI and debug missing or stale skills.",
+      "steps": [
+        "Package the bundled skill as a managed built-in asset with explicit versioning.",
+        "Install and keep it updated in user scope without conflicting with user-managed skills.",
+        "Require explicit user action for removal and surface its state in history and diagnostics."
+      ],
+      "depends_on": [
+        "T006",
+        "T011",
+        "T018"
+      ]
+    },
+    {
+      "id": "T020",
+      "title": "Normalize global flags, JSON output, exit codes, and non-interactive behavior across the CLI",
+      "priority": 2,
+      "status": "todo",
+      "details": "Make the command surface stable for humans and agents by standardizing `--json`, `--quiet`, `--verbose`, `--no-input`, `--interactive`, `--name`, `--scope`, `--target`, and `--cwd` semantics everywhere.",
+      "steps": [
+        "Define one response envelope that every command and subcommand uses for success, warnings, errors, and data.",
+        "Implement the documented exit-code contract, including warning and validation-specific exits and interactive-input-required failures.",
+        "Audit every command so interactive features have deterministic non-interactive behavior and machine-readable output."
+      ],
+      "depends_on": [
+        "T001",
+        "T011",
+        "T013",
+        "T015",
+        "T016",
+        "T018"
+      ]
+    },
+    {
+      "id": "T021",
+      "title": "Implement trust states and security warnings for untrusted or risky skills",
+      "priority": 3,
+      "status": "todo",
+      "details": "Add the trust model needed to identify risky installs, script-bearing skills from untrusted sources, and operations that should be blocked or downgraded.",
+      "steps": [
+        "Model trust state for sources and effective skills so install, update, and doctor can reason about risk.",
+        "Warn or block operations involving risky content according to the spec’s trust-gate and exit-code expectations.",
+        "Surface trust decisions in diagnostics, JSON responses, and local history."
+      ],
+      "depends_on": [
+        "T005",
+        "T013",
+        "T016",
+        "T018"
+      ]
+    },
+    {
+      "id": "T022",
+      "title": "Implement the MCP server and v1 tool parity",
+      "priority": 4,
+      "status": "todo",
+      "details": "Expose the lifecycle manager to agents through MCP with the same behavior and structured output as the CLI.",
+      "steps": [
+        "Implement `mcp serve` and the v1 tools: `skills_list`, `skills_install`, `skills_remove`, `skills_sync`, `skills_update`, `skills_rollback`, `skills_history`, `skills_explain`, `skills_override_create`, `skills_validate`, `skills_doctor`, and `skills_telemetry_status`.",
+        "Reuse the same typed command layer as the CLI so behavior and JSON output stay in lockstep.",
+        "Require explicit parameters for destructive actions and avoid hidden mutations outside managed roots."
+      ],
+      "depends_on": [
+        "T011",
+        "T013",
+        "T014",
+        "T015",
+        "T016",
+        "T018",
+        "T020"
+      ]
+    },
+    {
+      "id": "T023",
+      "title": "Implement the terminal UI for inspection, updates, and history",
+      "priority": 4,
+      "status": "todo",
+      "details": "Build the optional TUI around the same state and command model used by the CLI so it adds visibility without adding a second behavior surface.",
+      "steps": [
+        "Show installed versions, update availability, overlays, local modifications, target visibility, and rollback or pin details.",
+        "Map every TUI action to an existing CLI command instead of inventing TUI-only behavior.",
+        "Keep TUI reads and writes deterministic and safe for concurrent CLI usage."
+      ],
+      "depends_on": [
+        "T010",
+        "T013",
+        "T014",
+        "T015",
+        "T016",
+        "T020"
+      ]
+    },
+    {
+      "id": "T024",
+      "title": "Build the full test suite, fixture repos, and cross-platform integration matrix",
+      "priority": 2,
+      "status": "todo",
+      "details": "Expand the current help-only tests into the unit and integration coverage required by the spec’s TDD mandate and acceptance criteria.",
+      "steps": [
+        "Add unit tests for manifest parsing, lockfile roundtrips, overlay resolution, conflict resolution, root planning, install candidate detection, history writes, telemetry suppression, and JSON output contracts.",
+        "Create fixture repos for canonical local skills, imported skills with overlays, same-name conflicts, monorepos, broken symlink cases, alternate source layouts, update blockers, and private-source installs.",
+        "Run integration coverage across OS, mode, scope, and target combinations called out in the spec."
+      ],
+      "depends_on": [
+        "T001"
+      ]
+    },
+    {
+      "id": "T025",
+      "title": "Add CI quality gates and documentation verification",
+      "priority": 2,
+      "status": "todo",
+      "details": "Enforce the engineering discipline in the spec so warnings, formatting drift, missing docs, and broken tests are treated as defects.",
+      "steps": [
+        "Add CI jobs for `cargo fmt --check`, strict `clippy`, `cargo test`, and documentation verification.",
+        "Fail CI on warnings and ensure public modules, types, and important functions are covered by Rust docs.",
+        "Make the automated checks align with the growing unit and integration test suite."
+      ],
+      "depends_on": [
+        "T001",
+        "T024"
+      ]
+    },
+    {
+      "id": "T026",
+      "title": "Package the binary and release a curl-installable distribution path",
+      "priority": 3,
+      "status": "todo",
+      "details": "Turn the Rust binary into a shippable product with versioned releases and an installation flow that matches the product shape in the spec.",
+      "steps": [
+        "Define release artifacts for supported platforms and ensure the binary bundles required built-in assets.",
+        "Add a repeatable release workflow that publishes tagged binaries and supports curl-based installation.",
+        "Verify release builds preserve deterministic behavior and sane first-run setup."
+      ],
+      "depends_on": [
+        "T011",
+        "T015",
+        "T019",
+        "T025"
+      ]
+    },
+    {
+      "id": "T027",
+      "title": "Write end-user documentation, command help, and troubleshooting guides",
+      "priority": 3,
+      "status": "todo",
+      "details": "Document the model, command surface, and debugging flows so a new user can understand the system quickly and recover from common failures with one command.",
+      "steps": [
+        "Expand the README and command help to explain canonical roots, imports, overlays, projections, history, telemetry, and trust states.",
+        "Add examples for install, update, rollback, doctor, explain, MCP usage, and TUI equivalents.",
+        "Document how to diagnose missing, stale, shadowed, detached, or conflicting skills across supported runtimes."
+      ],
+      "depends_on": [
+        "T011",
+        "T013",
+        "T016",
+        "T018",
+        "T020",
+        "T022",
+        "T023"
+      ]
+    }
+  ]
+}
