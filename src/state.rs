@@ -13,6 +13,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::{
     adapter::TargetRuntime, error::AppError, history::HistoryEventKind, source::SourceKind,
@@ -23,7 +24,7 @@ pub const CURRENT_MANIFEST_VERSION: u32 = 1;
 /// Current schema version for `.agents/skillctl.lock`.
 pub const CURRENT_LOCKFILE_VERSION: u32 = 1;
 /// Current schema version for `~/.skillctl/state.db`.
-pub const CURRENT_LOCAL_STATE_VERSION: u32 = 1;
+pub const CURRENT_LOCAL_STATE_VERSION: u32 = 2;
 
 /// Default directory created under the home directory for local state.
 pub const DEFAULT_LOCAL_STATE_DIR: &str = ".skillctl";
@@ -38,7 +39,9 @@ pub const LOCKFILE_SCHEMA_POLICY: SchemaVersionPolicy =
     SchemaVersionPolicy::new(CURRENT_LOCKFILE_VERSION, CURRENT_LOCKFILE_VERSION);
 /// Version policy for the local state store.
 pub const LOCAL_STATE_SCHEMA_POLICY: SchemaVersionPolicy =
-    SchemaVersionPolicy::new(CURRENT_LOCAL_STATE_VERSION, CURRENT_LOCAL_STATE_VERSION);
+    SchemaVersionPolicy::new(CURRENT_LOCAL_STATE_VERSION, 1);
+
+const GLOBAL_WORKSPACE_KEY: &str = "__global__";
 
 const REQUIRED_TABLES: &[&str] = &[
     "history_events",
@@ -470,6 +473,7 @@ pub struct SkillStateSnapshot {
 /// SQLite-backed local system of record for skill lifecycle state.
 pub struct LocalStateStore {
     path: PathBuf,
+    workspace_key: String,
     connection: Connection,
 }
 
@@ -478,6 +482,7 @@ impl std::fmt::Debug for LocalStateStore {
         formatter
             .debug_struct("LocalStateStore")
             .field("path", &self.path)
+            .field("workspace_key", &self.workspace_key)
             .finish_non_exhaustive()
     }
 }
@@ -485,12 +490,30 @@ impl std::fmt::Debug for LocalStateStore {
 impl LocalStateStore {
     /// Open or create the default `~/.skillctl/state.db` database.
     pub fn open_default() -> Result<Self, AppError> {
-        Self::open_at(default_state_database_path()?)
+        let working_directory =
+            env::current_dir().map_err(|source| AppError::CurrentWorkingDirectory { source })?;
+        Self::open_default_for(&working_directory)
+    }
+
+    /// Open or create the default `~/.skillctl/state.db` database for one workspace.
+    pub fn open_default_for(working_directory: &Path) -> Result<Self, AppError> {
+        Self::open_at_for(default_state_database_path()?, working_directory)
     }
 
     /// Open or create a store at an explicit database path.
     pub fn open_at(path: impl Into<PathBuf>) -> Result<Self, AppError> {
+        let working_directory =
+            env::current_dir().map_err(|source| AppError::CurrentWorkingDirectory { source })?;
+        Self::open_at_for(path, &working_directory)
+    }
+
+    /// Open or create a store at an explicit database path for one workspace.
+    pub fn open_at_for(
+        path: impl Into<PathBuf>,
+        working_directory: &Path,
+    ) -> Result<Self, AppError> {
         let path = path.into();
+        let workspace_key = workspace_key_for_path(working_directory)?;
 
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|source| AppError::FilesystemOperation {
@@ -504,22 +527,38 @@ impl LocalStateStore {
             path: path.clone(),
             source,
         })?;
-        bootstrap_connection(&connection, &path)?;
+        bootstrap_connection(&connection, &path, &workspace_key)?;
 
-        Ok(Self { path, connection })
+        Ok(Self {
+            path,
+            workspace_key,
+            connection,
+        })
     }
 
     /// Open an in-memory store. Intended for tests and pure logic callers.
     pub fn open_in_memory() -> Result<Self, AppError> {
+        let working_directory =
+            env::current_dir().map_err(|source| AppError::CurrentWorkingDirectory { source })?;
+        Self::open_in_memory_for(&working_directory)
+    }
+
+    /// Open an in-memory store for one workspace. Intended for tests.
+    pub fn open_in_memory_for(working_directory: &Path) -> Result<Self, AppError> {
         let path = PathBuf::from(":memory:");
+        let workspace_key = workspace_key_for_path(working_directory)?;
         let connection =
             Connection::open_in_memory().map_err(|source| AppError::LocalStateOpen {
                 path: path.clone(),
                 source,
             })?;
-        bootstrap_connection(&connection, &path)?;
+        bootstrap_connection(&connection, &path, &workspace_key)?;
 
-        Ok(Self { path, connection })
+        Ok(Self {
+            path,
+            workspace_key,
+            connection,
+        })
     }
 
     /// Return the path to the backing SQLite database.
@@ -532,15 +571,31 @@ impl LocalStateStore {
         schema_version(&self.connection, &self.path)
     }
 
+    pub(crate) fn workspace_key_for_scope(&self, scope: ManagedScope) -> &str {
+        match scope {
+            ManagedScope::Workspace => self.workspace_key.as_str(),
+            ManagedScope::User => GLOBAL_WORKSPACE_KEY,
+        }
+    }
+
+    pub(crate) fn workspace_key_for_history_scope(&self, scope: Option<ManagedScope>) -> &str {
+        match scope {
+            Some(ManagedScope::Workspace) => self.workspace_key.as_str(),
+            Some(ManagedScope::User) | None => GLOBAL_WORKSPACE_KEY,
+        }
+    }
+
     /// List every current install record in stable scope and skill order.
     pub fn list_install_records(&self) -> Result<Vec<InstallRecord>, AppError> {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT scope, skill_id, source_kind, source_url, source_subpath, \
+                "SELECT workspace_key, scope, skill_id, source_kind, source_url, source_subpath, \
                  resolved_revision, upstream_revision, content_hash, overlay_hash, \
                  effective_version_hash, installed_at, updated_at, detached, forked \
                  FROM install_records \
+                 WHERE (scope = 'workspace' AND workspace_key = ?1) \
+                    OR (scope = 'user' AND workspace_key = ?2) \
                  ORDER BY CASE scope WHEN 'workspace' THEN 0 ELSE 1 END, skill_id",
             )
             .map_err(|source| {
@@ -548,24 +603,28 @@ impl LocalStateStore {
             })?;
 
         let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, String>(8)?,
-                    row.get::<_, String>(9)?,
-                    row.get::<_, String>(10)?,
-                    row.get::<_, String>(11)?,
-                    row.get::<_, i64>(12)?,
-                    row.get::<_, i64>(13)?,
-                ))
-            })
+            .query_map(
+                params![self.workspace_key.as_str(), GLOBAL_WORKSPACE_KEY],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, String>(11)?,
+                        row.get::<_, String>(12)?,
+                        row.get::<_, i64>(13)?,
+                        row.get::<_, i64>(14)?,
+                    ))
+                },
+            )
             .map_err(|source| local_state_query(&self.path, "query install records", source))?;
 
         let mut records = Vec::new();
@@ -588,34 +647,42 @@ impl LocalStateStore {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT scope, skill_id, source_kind, source_url, source_subpath, \
+                "SELECT workspace_key, scope, skill_id, source_kind, source_url, source_subpath, \
                  resolved_revision, upstream_revision, content_hash, overlay_hash, \
                  effective_version_hash, installed_at, updated_at, detached, forked \
-                 FROM install_records WHERE scope = ?1 AND skill_id = ?2",
+                 FROM install_records WHERE scope = ?1 AND workspace_key = ?2 AND skill_id = ?3",
             )
             .map_err(|source| {
                 local_state_query(&self.path, "prepare install record query", source)
             })?;
 
         let row = statement
-            .query_row(params![skill.scope.as_str(), skill.skill_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, String>(8)?,
-                    row.get::<_, String>(9)?,
-                    row.get::<_, String>(10)?,
-                    row.get::<_, String>(11)?,
-                    row.get::<_, i64>(12)?,
-                    row.get::<_, i64>(13)?,
-                ))
-            })
+            .query_row(
+                params![
+                    skill.scope.as_str(),
+                    self.workspace_key_for_scope(skill.scope),
+                    skill.skill_id
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, String>(11)?,
+                        row.get::<_, String>(12)?,
+                        row.get::<_, i64>(13)?,
+                        row.get::<_, i64>(14)?,
+                    ))
+                },
+            )
             .optional()
             .map_err(|source| local_state_query(&self.path, "load install record", source))?;
 
@@ -625,7 +692,12 @@ impl LocalStateStore {
 
     /// Insert or update the current install record for a managed skill.
     pub fn upsert_install_record(&mut self, record: &InstallRecord) -> Result<(), AppError> {
-        upsert_install_record_in(&self.connection, &self.path, record)
+        upsert_install_record_in(
+            &self.connection,
+            &self.path,
+            self.workspace_key_for_scope(record.skill.scope),
+            record,
+        )
     }
 
     /// List projection records, optionally filtered to one managed skill.
@@ -634,14 +706,16 @@ impl LocalStateStore {
         skill: Option<&ManagedSkillRef>,
     ) -> Result<Vec<ProjectionRecord>, AppError> {
         let sql_all = concat!(
-            "SELECT scope, skill_id, target, generation_mode, physical_root, projected_path, ",
-            "effective_version_hash, generated_at FROM projection_records ",
+            "SELECT workspace_key, scope, skill_id, target, generation_mode, physical_root, ",
+            "projected_path, effective_version_hash, generated_at FROM projection_records ",
+            "WHERE (scope = 'workspace' AND workspace_key = ?1) ",
+            "   OR (scope = 'user' AND workspace_key = ?2) ",
             "ORDER BY scope, skill_id, target, physical_root"
         );
         let sql_filtered = concat!(
-            "SELECT scope, skill_id, target, generation_mode, physical_root, projected_path, ",
-            "effective_version_hash, generated_at FROM projection_records ",
-            "WHERE scope = ?1 AND skill_id = ?2 ORDER BY target, physical_root"
+            "SELECT workspace_key, scope, skill_id, target, generation_mode, physical_root, ",
+            "projected_path, effective_version_hash, generated_at FROM projection_records ",
+            "WHERE scope = ?1 AND workspace_key = ?2 AND skill_id = ?3 ORDER BY target, physical_root"
         );
 
         let mut statement = self
@@ -659,18 +733,26 @@ impl LocalStateStore {
         if let Some(skill) = skill {
             validate_skill_ref(&self.path, skill)?;
             let rows = statement
-                .query_map(params![skill.scope.as_str(), skill.skill_id], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, String>(7)?,
-                    ))
-                })
+                .query_map(
+                    params![
+                        skill.scope.as_str(),
+                        self.workspace_key_for_scope(skill.scope),
+                        skill.skill_id
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, String>(7)?,
+                            row.get::<_, String>(8)?,
+                        ))
+                    },
+                )
                 .map_err(|source| {
                     local_state_query(&self.path, "query projection records", source)
                 })?;
@@ -683,18 +765,22 @@ impl LocalStateStore {
             }
         } else {
             let rows = statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, String>(7)?,
-                    ))
-                })
+                .query_map(
+                    params![self.workspace_key.as_str(), GLOBAL_WORKSPACE_KEY],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, String>(7)?,
+                            row.get::<_, String>(8)?,
+                        ))
+                    },
+                )
                 .map_err(|source| {
                     local_state_query(&self.path, "query projection records", source)
                 })?;
@@ -712,7 +798,12 @@ impl LocalStateStore {
 
     /// Insert or update the current projection record for a managed skill.
     pub fn upsert_projection_record(&mut self, record: &ProjectionRecord) -> Result<(), AppError> {
-        upsert_projection_record_in(&self.connection, &self.path, record)
+        upsert_projection_record_in(
+            &self.connection,
+            &self.path,
+            self.workspace_key_for_scope(record.skill.scope),
+            record,
+        )
     }
 
     /// Replace the current projection records for one scope atomically.
@@ -721,11 +812,12 @@ impl LocalStateStore {
         scope: ManagedScope,
         records: &[ProjectionRecord],
     ) -> Result<(), AppError> {
+        let workspace_key = self.workspace_key_for_scope(scope).to_string();
         self.with_transaction("replace projection records", |connection, path| {
             connection
                 .execute(
-                    "DELETE FROM projection_records WHERE scope = ?1",
-                    params![scope.as_str()],
+                    "DELETE FROM projection_records WHERE scope = ?1 AND workspace_key = ?2",
+                    params![scope.as_str(), workspace_key.as_str()],
                 )
                 .map_err(|source| {
                     local_state_query(path, "delete projection records for scope", source)
@@ -743,7 +835,7 @@ impl LocalStateStore {
                         ),
                     });
                 }
-                upsert_projection_record_in(connection, path, record)?;
+                upsert_projection_record_in(connection, path, workspace_key.as_str(), record)?;
             }
 
             Ok(())
@@ -756,14 +848,16 @@ impl LocalStateStore {
         skill: Option<&ManagedSkillRef>,
     ) -> Result<Vec<UpdateCheckRecord>, AppError> {
         let sql_all = concat!(
-            "SELECT id, scope, skill_id, checked_at, pinned_revision, latest_revision, outcome, ",
-            "overlay_detected, local_modification_detected, notes FROM update_checks ",
+            "SELECT id, workspace_key, scope, skill_id, checked_at, pinned_revision, latest_revision, ",
+            "outcome, overlay_detected, local_modification_detected, notes FROM update_checks ",
+            "WHERE (scope = 'workspace' AND workspace_key = ?1) ",
+            "   OR (scope = 'user' AND workspace_key = ?2) ",
             "ORDER BY checked_at DESC, id DESC"
         );
         let sql_filtered = concat!(
-            "SELECT id, scope, skill_id, checked_at, pinned_revision, latest_revision, outcome, ",
-            "overlay_detected, local_modification_detected, notes FROM update_checks ",
-            "WHERE scope = ?1 AND skill_id = ?2 ORDER BY checked_at DESC, id DESC"
+            "SELECT id, workspace_key, scope, skill_id, checked_at, pinned_revision, latest_revision, ",
+            "outcome, overlay_detected, local_modification_detected, notes FROM update_checks ",
+            "WHERE scope = ?1 AND workspace_key = ?2 AND skill_id = ?3 ORDER BY checked_at DESC, id DESC"
         );
 
         let mut statement = self
@@ -781,20 +875,28 @@ impl LocalStateStore {
         if let Some(skill) = skill {
             validate_skill_ref(&self.path, skill)?;
             let rows = statement
-                .query_map(params![skill.scope.as_str(), skill.skill_id], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, i64>(7)?,
-                        row.get::<_, i64>(8)?,
-                        row.get::<_, Option<String>>(9)?,
-                    ))
-                })
+                .query_map(
+                    params![
+                        skill.scope.as_str(),
+                        self.workspace_key_for_scope(skill.scope),
+                        skill.skill_id
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                            row.get::<_, String>(7)?,
+                            row.get::<_, i64>(8)?,
+                            row.get::<_, i64>(9)?,
+                            row.get::<_, Option<String>>(10)?,
+                        ))
+                    },
+                )
                 .map_err(|source| local_state_query(&self.path, "query update checks", source))?;
 
             for row in rows {
@@ -804,20 +906,24 @@ impl LocalStateStore {
             }
         } else {
             let rows = statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, i64>(7)?,
-                        row.get::<_, i64>(8)?,
-                        row.get::<_, Option<String>>(9)?,
-                    ))
-                })
+                .query_map(
+                    params![self.workspace_key.as_str(), GLOBAL_WORKSPACE_KEY],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                            row.get::<_, String>(7)?,
+                            row.get::<_, i64>(8)?,
+                            row.get::<_, i64>(9)?,
+                            row.get::<_, Option<String>>(10)?,
+                        ))
+                    },
+                )
                 .map_err(|source| local_state_query(&self.path, "query update checks", source))?;
 
             for row in rows {
@@ -840,9 +946,9 @@ impl LocalStateStore {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT id, scope, skill_id, checked_at, pinned_revision, latest_revision, \
+                "SELECT id, workspace_key, scope, skill_id, checked_at, pinned_revision, latest_revision, \
                  outcome, overlay_detected, local_modification_detected, notes \
-                 FROM update_checks WHERE scope = ?1 AND skill_id = ?2 \
+                 FROM update_checks WHERE scope = ?1 AND workspace_key = ?2 AND skill_id = ?3 \
                  ORDER BY checked_at DESC, id DESC LIMIT 1",
             )
             .map_err(|source| {
@@ -850,20 +956,28 @@ impl LocalStateStore {
             })?;
 
         let row = statement
-            .query_row(params![skill.scope.as_str(), skill.skill_id], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, i64>(7)?,
-                    row.get::<_, i64>(8)?,
-                    row.get::<_, Option<String>>(9)?,
-                ))
-            })
+            .query_row(
+                params![
+                    skill.scope.as_str(),
+                    self.workspace_key_for_scope(skill.scope),
+                    skill.skill_id
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                    ))
+                },
+            )
             .optional()
             .map_err(|source| local_state_query(&self.path, "load latest update check", source))?;
 
@@ -873,7 +987,12 @@ impl LocalStateStore {
 
     /// Insert one immutable update check row.
     pub fn record_update_check(&mut self, record: &UpdateCheckRecord) -> Result<i64, AppError> {
-        insert_update_check_record_in(&self.connection, &self.path, record)
+        insert_update_check_record_in(
+            &self.connection,
+            &self.path,
+            self.workspace_key_for_scope(record.skill.scope),
+            record,
+        )
     }
 
     /// List local modification records ordered newest first.
@@ -882,12 +1001,13 @@ impl LocalStateStore {
         skill: Option<&ManagedSkillRef>,
     ) -> Result<Vec<LocalModificationRecord>, AppError> {
         let sql_all = concat!(
-            "SELECT id, scope, skill_id, detected_at, kind, path, details ",
-            "FROM local_modifications ORDER BY detected_at DESC, id DESC"
+            "SELECT id, workspace_key, scope, skill_id, detected_at, kind, path, details ",
+            "FROM local_modifications WHERE (scope = 'workspace' AND workspace_key = ?1) ",
+            "   OR (scope = 'user' AND workspace_key = ?2) ORDER BY detected_at DESC, id DESC"
         );
         let sql_filtered = concat!(
-            "SELECT id, scope, skill_id, detected_at, kind, path, details ",
-            "FROM local_modifications WHERE scope = ?1 AND skill_id = ?2 ",
+            "SELECT id, workspace_key, scope, skill_id, detected_at, kind, path, details ",
+            "FROM local_modifications WHERE scope = ?1 AND workspace_key = ?2 AND skill_id = ?3 ",
             "ORDER BY detected_at DESC, id DESC"
         );
 
@@ -906,17 +1026,25 @@ impl LocalStateStore {
         if let Some(skill) = skill {
             validate_skill_ref(&self.path, skill)?;
             let rows = statement
-                .query_map(params![skill.scope.as_str(), skill.skill_id], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                    ))
-                })
+                .query_map(
+                    params![
+                        skill.scope.as_str(),
+                        self.workspace_key_for_scope(skill.scope),
+                        skill.skill_id
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                            row.get::<_, Option<String>>(7)?,
+                        ))
+                    },
+                )
                 .map_err(|source| {
                     local_state_query(&self.path, "query local modifications", source)
                 })?;
@@ -929,17 +1057,21 @@ impl LocalStateStore {
             }
         } else {
             let rows = statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                    ))
-                })
+                .query_map(
+                    params![self.workspace_key.as_str(), GLOBAL_WORKSPACE_KEY],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                            row.get::<_, Option<String>>(7)?,
+                        ))
+                    },
+                )
                 .map_err(|source| {
                     local_state_query(&self.path, "query local modifications", source)
                 })?;
@@ -960,7 +1092,12 @@ impl LocalStateStore {
         &mut self,
         record: &LocalModificationRecord,
     ) -> Result<i64, AppError> {
-        insert_local_modification_record_in(&self.connection, &self.path, record)
+        insert_local_modification_record_in(
+            &self.connection,
+            &self.path,
+            self.workspace_key_for_scope(record.skill.scope),
+            record,
+        )
     }
 
     /// Load the current pin record for one managed skill.
@@ -970,22 +1107,30 @@ impl LocalStateStore {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT scope, skill_id, requested_reference, resolved_revision, \
-                 effective_version_hash, pinned_at FROM pins WHERE scope = ?1 AND skill_id = ?2",
+                "SELECT workspace_key, scope, skill_id, requested_reference, resolved_revision, \
+                 effective_version_hash, pinned_at FROM pins WHERE scope = ?1 AND workspace_key = ?2 AND skill_id = ?3",
             )
             .map_err(|source| local_state_query(&self.path, "prepare pin query", source))?;
 
         let row = statement
-            .query_row(params![skill.scope.as_str(), skill.skill_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            })
+            .query_row(
+                params![
+                    skill.scope.as_str(),
+                    self.workspace_key_for_scope(skill.scope),
+                    skill.skill_id
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
             .optional()
             .map_err(|source| local_state_query(&self.path, "load pin record", source))?;
 
@@ -995,32 +1140,38 @@ impl LocalStateStore {
 
     /// Insert or update the current pin for a managed skill.
     pub fn upsert_pin_record(&mut self, record: &PinRecord) -> Result<(), AppError> {
-        upsert_pin_record_in(&self.connection, &self.path, record)
+        upsert_pin_record_in(
+            &self.connection,
+            &self.path,
+            self.workspace_key_for_scope(record.skill.scope),
+            record,
+        )
     }
 
     /// Delete the mutable install, pin, and projection rows for one managed skill.
     pub fn delete_current_skill_state(&mut self, skill: &ManagedSkillRef) -> Result<(), AppError> {
         validate_skill_ref(&self.path, skill)?;
+        let workspace_key = self.workspace_key_for_scope(skill.scope).to_string();
 
         self.with_transaction("delete current skill state", |connection, path| {
             connection
                 .execute(
-                    "DELETE FROM projection_records WHERE scope = ?1 AND skill_id = ?2",
-                    params![skill.scope.as_str(), skill.skill_id],
+                    "DELETE FROM projection_records WHERE scope = ?1 AND workspace_key = ?2 AND skill_id = ?3",
+                    params![skill.scope.as_str(), workspace_key.as_str(), skill.skill_id],
                 )
                 .map_err(|source| {
                     local_state_query(path, "delete projection records for skill", source)
                 })?;
             connection
                 .execute(
-                    "DELETE FROM pins WHERE scope = ?1 AND skill_id = ?2",
-                    params![skill.scope.as_str(), skill.skill_id],
+                    "DELETE FROM pins WHERE scope = ?1 AND workspace_key = ?2 AND skill_id = ?3",
+                    params![skill.scope.as_str(), workspace_key.as_str(), skill.skill_id],
                 )
                 .map_err(|source| local_state_query(path, "delete pin record", source))?;
             connection
                 .execute(
-                    "DELETE FROM install_records WHERE scope = ?1 AND skill_id = ?2",
-                    params![skill.scope.as_str(), skill.skill_id],
+                    "DELETE FROM install_records WHERE scope = ?1 AND workspace_key = ?2 AND skill_id = ?3",
+                    params![skill.scope.as_str(), workspace_key.as_str(), skill.skill_id],
                 )
                 .map_err(|source| local_state_query(path, "delete install record", source))?;
 
@@ -1034,12 +1185,13 @@ impl LocalStateStore {
         skill: Option<&ManagedSkillRef>,
     ) -> Result<Vec<RollbackRecord>, AppError> {
         let sql_all = concat!(
-            "SELECT id, scope, skill_id, rolled_back_at, from_reference, to_reference ",
-            "FROM rollback_records ORDER BY rolled_back_at DESC, id DESC"
+            "SELECT id, workspace_key, scope, skill_id, rolled_back_at, from_reference, to_reference ",
+            "FROM rollback_records WHERE (scope = 'workspace' AND workspace_key = ?1) ",
+            "   OR (scope = 'user' AND workspace_key = ?2) ORDER BY rolled_back_at DESC, id DESC"
         );
         let sql_filtered = concat!(
-            "SELECT id, scope, skill_id, rolled_back_at, from_reference, to_reference ",
-            "FROM rollback_records WHERE scope = ?1 AND skill_id = ?2 ",
+            "SELECT id, workspace_key, scope, skill_id, rolled_back_at, from_reference, to_reference ",
+            "FROM rollback_records WHERE scope = ?1 AND workspace_key = ?2 AND skill_id = ?3 ",
             "ORDER BY rolled_back_at DESC, id DESC"
         );
 
@@ -1058,16 +1210,24 @@ impl LocalStateStore {
         if let Some(skill) = skill {
             validate_skill_ref(&self.path, skill)?;
             let rows = statement
-                .query_map(params![skill.scope.as_str(), skill.skill_id], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                })
+                .query_map(
+                    params![
+                        skill.scope.as_str(),
+                        self.workspace_key_for_scope(skill.scope),
+                        skill.skill_id
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                        ))
+                    },
+                )
                 .map_err(|source| {
                     local_state_query(&self.path, "query rollback records", source)
                 })?;
@@ -1080,16 +1240,20 @@ impl LocalStateStore {
             }
         } else {
             let rows = statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                })
+                .query_map(
+                    params![self.workspace_key.as_str(), GLOBAL_WORKSPACE_KEY],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                        ))
+                    },
+                )
                 .map_err(|source| {
                     local_state_query(&self.path, "query rollback records", source)
                 })?;
@@ -1107,7 +1271,12 @@ impl LocalStateStore {
 
     /// Insert one immutable rollback record.
     pub fn record_rollback(&mut self, record: &RollbackRecord) -> Result<i64, AppError> {
-        insert_rollback_record_in(&self.connection, &self.path, record)
+        insert_rollback_record_in(
+            &self.connection,
+            &self.path,
+            self.workspace_key_for_scope(record.skill.scope),
+            record,
+        )
     }
 
     /// Load the current telemetry settings row, if one has been persisted.
@@ -1147,13 +1316,17 @@ impl LocalStateStore {
 
     /// Append one immutable history entry to the local ledger.
     pub fn append_history_entry(&mut self, entry: &HistoryEntry) -> Result<i64, AppError> {
-        insert_history_entry_in(&self.connection, &self.path, entry)
+        insert_history_entry_in(&self.connection, &self.path, &self.workspace_key, entry)
     }
 
     /// Remove every current projection record across all scopes.
     pub fn clear_projection_records(&mut self) -> Result<(), AppError> {
         self.connection
-            .execute("DELETE FROM projection_records", [])
+            .execute(
+                "DELETE FROM projection_records WHERE (scope = 'workspace' AND workspace_key = ?1) \
+                 OR (scope = 'user' AND workspace_key = ?2)",
+                params![self.workspace_key.as_str(), GLOBAL_WORKSPACE_KEY],
+            )
             .map_err(|source| {
                 local_state_query(&self.path, "delete all projection records", source)
             })?;
@@ -1163,12 +1336,14 @@ impl LocalStateStore {
     /// Query history entries in deterministic newest-first order.
     pub fn history_entries(&self, query: &HistoryQuery) -> Result<Vec<HistoryEntry>, AppError> {
         let sql_all = concat!(
-            "SELECT id, kind, scope, skill_id, target, occurred_at, summary, details_json ",
-            "FROM history_events ORDER BY occurred_at DESC, id DESC"
+            "SELECT id, workspace_key, kind, scope, skill_id, target, occurred_at, summary, details_json ",
+            "FROM history_events WHERE (scope = 'workspace' AND workspace_key = ?1) ",
+            "   OR ((scope = 'user' OR scope IS NULL) AND workspace_key = ?2) ",
+            "ORDER BY occurred_at DESC, id DESC"
         );
         let sql_filtered = concat!(
-            "SELECT id, kind, scope, skill_id, target, occurred_at, summary, details_json ",
-            "FROM history_events WHERE scope = ?1 AND skill_id = ?2 ",
+            "SELECT id, workspace_key, kind, scope, skill_id, target, occurred_at, summary, details_json ",
+            "FROM history_events WHERE scope = ?1 AND workspace_key = ?2 AND skill_id = ?3 ",
             "ORDER BY occurred_at DESC, id DESC"
         );
 
@@ -1185,18 +1360,26 @@ impl LocalStateStore {
         if let Some(skill) = &query.skill {
             validate_skill_ref(&self.path, skill)?;
             let rows = statement
-                .query_map(params![skill.scope.as_str(), skill.skill_id], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, Option<String>>(7)?,
-                    ))
-                })
+                .query_map(
+                    params![
+                        skill.scope.as_str(),
+                        self.workspace_key_for_scope(skill.scope),
+                        skill.skill_id
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, String>(7)?,
+                            row.get::<_, Option<String>>(8)?,
+                        ))
+                    },
+                )
                 .map_err(|source| local_state_query(&self.path, "query history entries", source))?;
 
             for row in rows {
@@ -1207,18 +1390,22 @@ impl LocalStateStore {
             }
         } else {
             let rows = statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, Option<String>>(7)?,
-                    ))
-                })
+                .query_map(
+                    params![self.workspace_key.as_str(), GLOBAL_WORKSPACE_KEY],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, String>(7)?,
+                            row.get::<_, Option<String>>(8)?,
+                        ))
+                    },
+                )
                 .map_err(|source| local_state_query(&self.path, "query history entries", source))?;
 
             for row in rows {
@@ -1269,6 +1456,18 @@ impl LocalStateStore {
     }
 }
 
+/// Derive the stable workspace namespace key used for workspace-scoped state.
+pub fn workspace_key_for_path(path: &Path) -> Result<String, AppError> {
+    let canonical = fs::canonicalize(path).map_err(|source| AppError::FilesystemOperation {
+        action: "canonicalize workspace path for state namespace",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 /// Resolve the default local state root under the current home directory.
 pub fn default_state_root() -> Result<PathBuf, AppError> {
     resolve_home_directory()
@@ -1284,16 +1483,17 @@ pub fn default_state_database_path() -> Result<PathBuf, AppError> {
 pub(crate) fn upsert_install_record_in(
     connection: &Connection,
     path: &Path,
+    workspace_key: &str,
     record: &InstallRecord,
 ) -> Result<(), AppError> {
     validate_install_record(path, record)?;
     connection
         .execute(
-            "INSERT INTO install_records (scope, skill_id, source_kind, source_url, \
+            "INSERT INTO install_records (scope, workspace_key, skill_id, source_kind, source_url, \
              source_subpath, resolved_revision, upstream_revision, content_hash, overlay_hash, \
              effective_version_hash, installed_at, updated_at, detached, forked) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
-             ON CONFLICT(scope, skill_id) DO UPDATE SET \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
+             ON CONFLICT(scope, workspace_key, skill_id) DO UPDATE SET \
              source_kind = excluded.source_kind, \
              source_url = excluded.source_url, \
              source_subpath = excluded.source_subpath, \
@@ -1308,6 +1508,7 @@ pub(crate) fn upsert_install_record_in(
              forked = excluded.forked",
             params![
                 record.skill.scope.as_str(),
+                workspace_key,
                 record.skill.skill_id,
                 source_kind_as_str(record.source_kind),
                 record.source_url,
@@ -1331,21 +1532,23 @@ pub(crate) fn upsert_install_record_in(
 pub(crate) fn upsert_projection_record_in(
     connection: &Connection,
     path: &Path,
+    workspace_key: &str,
     record: &ProjectionRecord,
 ) -> Result<(), AppError> {
     validate_projection_record(path, record)?;
     connection
         .execute(
-            "INSERT INTO projection_records (scope, skill_id, target, generation_mode, \
+            "INSERT INTO projection_records (scope, workspace_key, skill_id, target, generation_mode, \
              physical_root, projected_path, effective_version_hash, generated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
-             ON CONFLICT(scope, skill_id, target, physical_root) DO UPDATE SET \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+             ON CONFLICT(scope, workspace_key, skill_id, target, physical_root) DO UPDATE SET \
              generation_mode = excluded.generation_mode, \
              projected_path = excluded.projected_path, \
              effective_version_hash = excluded.effective_version_hash, \
              generated_at = excluded.generated_at",
             params![
                 record.skill.scope.as_str(),
+                workspace_key,
                 record.skill.skill_id,
                 record.target.as_str(),
                 record.generation_mode.as_str(),
@@ -1363,16 +1566,18 @@ pub(crate) fn upsert_projection_record_in(
 pub(crate) fn insert_update_check_record_in(
     connection: &Connection,
     path: &Path,
+    workspace_key: &str,
     record: &UpdateCheckRecord,
 ) -> Result<i64, AppError> {
     validate_update_check_record(path, record)?;
     connection
         .execute(
-            "INSERT INTO update_checks (scope, skill_id, checked_at, pinned_revision, \
+            "INSERT INTO update_checks (scope, workspace_key, skill_id, checked_at, pinned_revision, \
              latest_revision, outcome, overlay_detected, local_modification_detected, notes) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 record.skill.scope.as_str(),
+                workspace_key,
                 record.skill.skill_id,
                 record.checked_at,
                 record.pinned_revision,
@@ -1391,15 +1596,17 @@ pub(crate) fn insert_update_check_record_in(
 pub(crate) fn insert_local_modification_record_in(
     connection: &Connection,
     path: &Path,
+    workspace_key: &str,
     record: &LocalModificationRecord,
 ) -> Result<i64, AppError> {
     validate_local_modification_record(path, record)?;
     connection
         .execute(
-            "INSERT INTO local_modifications (scope, skill_id, detected_at, kind, path, details) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO local_modifications (scope, workspace_key, skill_id, detected_at, kind, path, details) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 record.skill.scope.as_str(),
+                workspace_key,
                 record.skill.skill_id,
                 record.detected_at,
                 record.kind.as_str(),
@@ -1415,20 +1622,22 @@ pub(crate) fn insert_local_modification_record_in(
 pub(crate) fn upsert_pin_record_in(
     connection: &Connection,
     path: &Path,
+    workspace_key: &str,
     record: &PinRecord,
 ) -> Result<(), AppError> {
     validate_pin_record(path, record)?;
     connection
         .execute(
-            "INSERT INTO pins (scope, skill_id, requested_reference, resolved_revision, \
-             effective_version_hash, pinned_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-             ON CONFLICT(scope, skill_id) DO UPDATE SET \
+            "INSERT INTO pins (scope, workspace_key, skill_id, requested_reference, resolved_revision, \
+             effective_version_hash, pinned_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT(scope, workspace_key, skill_id) DO UPDATE SET \
              requested_reference = excluded.requested_reference, \
              resolved_revision = excluded.resolved_revision, \
              effective_version_hash = excluded.effective_version_hash, \
              pinned_at = excluded.pinned_at",
             params![
                 record.skill.scope.as_str(),
+                workspace_key,
                 record.skill.skill_id,
                 record.requested_reference,
                 record.resolved_revision,
@@ -1444,15 +1653,17 @@ pub(crate) fn upsert_pin_record_in(
 pub(crate) fn insert_rollback_record_in(
     connection: &Connection,
     path: &Path,
+    workspace_key: &str,
     record: &RollbackRecord,
 ) -> Result<i64, AppError> {
     validate_rollback_record(path, record)?;
     connection
         .execute(
-            "INSERT INTO rollback_records (scope, skill_id, rolled_back_at, from_reference, \
-             to_reference) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO rollback_records (scope, workspace_key, skill_id, rolled_back_at, from_reference, \
+             to_reference) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 record.skill.scope.as_str(),
+                workspace_key,
                 record.skill.skill_id,
                 record.rolled_back_at,
                 record.from_reference,
@@ -1491,16 +1702,22 @@ pub(crate) fn upsert_telemetry_settings_in(
 pub(crate) fn insert_history_entry_in(
     connection: &Connection,
     path: &Path,
+    workspace_key: &str,
     entry: &HistoryEntry,
 ) -> Result<i64, AppError> {
     validate_history_entry(path, entry)?;
     let details_json = encode_history_details(path, &entry.details)?;
+    let scoped_workspace_key = match entry.scope {
+        Some(ManagedScope::Workspace) => workspace_key,
+        Some(ManagedScope::User) | None => GLOBAL_WORKSPACE_KEY,
+    };
 
     connection
         .execute(
-            "INSERT INTO history_events (kind, scope, skill_id, target, occurred_at, summary, \
-             details_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO history_events (workspace_key, kind, scope, skill_id, target, occurred_at, summary, \
+             details_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
+                scoped_workspace_key,
                 entry.kind.as_str(),
                 entry.scope.map(ManagedScope::as_str),
                 entry.skill_id,
@@ -1515,14 +1732,22 @@ pub(crate) fn insert_history_entry_in(
     Ok(connection.last_insert_rowid())
 }
 
-fn bootstrap_connection(connection: &Connection, path: &Path) -> Result<(), AppError> {
+fn bootstrap_connection(
+    connection: &Connection,
+    path: &Path,
+    workspace_key: &str,
+) -> Result<(), AppError> {
     connection
         .execute_batch("PRAGMA foreign_keys = ON;")
         .map_err(|source| local_state_query(path, "enable foreign keys", source))?;
-    initialize_or_validate_schema(connection, path)
+    initialize_or_validate_schema(connection, path, workspace_key)
 }
 
-fn initialize_or_validate_schema(connection: &Connection, path: &Path) -> Result<(), AppError> {
+fn initialize_or_validate_schema(
+    connection: &Connection,
+    path: &Path,
+    workspace_key: &str,
+) -> Result<(), AppError> {
     let found = schema_version(connection, path)?;
     if found == 0 {
         if database_has_user_tables(connection, path)? {
@@ -1540,10 +1765,10 @@ fn initialize_or_validate_schema(connection: &Connection, path: &Path) -> Result
 
     match LOCAL_STATE_SCHEMA_POLICY.classify(found) {
         VersionDisposition::Current => validate_required_tables(connection, path),
-        VersionDisposition::NeedsMigration { from, to } => Err(local_state_validation(
-            path,
-            format!("schema version {from} requires migration to {to}"),
-        )),
+        VersionDisposition::NeedsMigration { from, to } => {
+            migrate_schema(connection, path, workspace_key, from, to)?;
+            validate_required_tables(connection, path)
+        }
         VersionDisposition::Unsupported {
             found,
             minimum_supported,
@@ -1559,6 +1784,120 @@ fn initialize_or_validate_schema(connection: &Connection, path: &Path) -> Result
             Err(local_state_validation(path, message))
         }
     }
+}
+
+fn migrate_schema(
+    connection: &Connection,
+    path: &Path,
+    workspace_key: &str,
+    from: u32,
+    to: u32,
+) -> Result<(), AppError> {
+    if from != 1 || to != CURRENT_LOCAL_STATE_VERSION {
+        return Err(local_state_validation(
+            path,
+            format!("schema version {from} requires migration to {to}"),
+        ));
+    }
+
+    connection
+        .execute_batch(
+            "
+ALTER TABLE install_records RENAME TO install_records_v1;
+ALTER TABLE projection_records RENAME TO projection_records_v1;
+ALTER TABLE update_checks RENAME TO update_checks_v1;
+ALTER TABLE local_modifications RENAME TO local_modifications_v1;
+ALTER TABLE pins RENAME TO pins_v1;
+ALTER TABLE rollback_records RENAME TO rollback_records_v1;
+ALTER TABLE history_events RENAME TO history_events_v1;
+",
+        )
+        .map_err(|source| local_state_query(path, "rename legacy schema tables", source))?;
+
+    connection
+        .execute_batch(&local_state_schema_sql())
+        .map_err(|source| {
+            local_state_query(path, "initialize migrated local state schema", source)
+        })?;
+
+    connection
+        .execute(
+            "INSERT INTO install_records (scope, workspace_key, skill_id, source_kind, source_url, \
+             source_subpath, resolved_revision, upstream_revision, content_hash, overlay_hash, \
+             effective_version_hash, installed_at, updated_at, detached, forked) \
+             SELECT scope, CASE WHEN scope = 'workspace' THEN ?1 ELSE ?2 END, skill_id, source_kind, \
+             source_url, source_subpath, resolved_revision, upstream_revision, content_hash, overlay_hash, \
+             effective_version_hash, installed_at, updated_at, detached, forked FROM install_records_v1",
+            params![workspace_key, GLOBAL_WORKSPACE_KEY],
+        )
+        .map_err(|source| local_state_query(path, "migrate install records", source))?;
+    connection
+        .execute(
+            "INSERT INTO projection_records (scope, workspace_key, skill_id, target, generation_mode, \
+             physical_root, projected_path, effective_version_hash, generated_at) \
+             SELECT scope, CASE WHEN scope = 'workspace' THEN ?1 ELSE ?2 END, skill_id, target, generation_mode, \
+             physical_root, projected_path, effective_version_hash, generated_at FROM projection_records_v1",
+            params![workspace_key, GLOBAL_WORKSPACE_KEY],
+        )
+        .map_err(|source| local_state_query(path, "migrate projection records", source))?;
+    connection
+        .execute(
+            "INSERT INTO update_checks (scope, workspace_key, skill_id, checked_at, pinned_revision, \
+             latest_revision, outcome, overlay_detected, local_modification_detected, notes) \
+             SELECT scope, CASE WHEN scope = 'workspace' THEN ?1 ELSE ?2 END, skill_id, checked_at, pinned_revision, \
+             latest_revision, outcome, overlay_detected, local_modification_detected, notes FROM update_checks_v1",
+            params![workspace_key, GLOBAL_WORKSPACE_KEY],
+        )
+        .map_err(|source| local_state_query(path, "migrate update checks", source))?;
+    connection
+        .execute(
+            "INSERT INTO local_modifications (scope, workspace_key, skill_id, detected_at, kind, path, details) \
+             SELECT scope, CASE WHEN scope = 'workspace' THEN ?1 ELSE ?2 END, skill_id, detected_at, kind, path, details \
+             FROM local_modifications_v1",
+            params![workspace_key, GLOBAL_WORKSPACE_KEY],
+        )
+        .map_err(|source| local_state_query(path, "migrate local modifications", source))?;
+    connection
+        .execute(
+            "INSERT INTO pins (scope, workspace_key, skill_id, requested_reference, resolved_revision, \
+             effective_version_hash, pinned_at) \
+             SELECT scope, CASE WHEN scope = 'workspace' THEN ?1 ELSE ?2 END, skill_id, requested_reference, \
+             resolved_revision, effective_version_hash, pinned_at FROM pins_v1",
+            params![workspace_key, GLOBAL_WORKSPACE_KEY],
+        )
+        .map_err(|source| local_state_query(path, "migrate pin records", source))?;
+    connection
+        .execute(
+            "INSERT INTO rollback_records (scope, workspace_key, skill_id, rolled_back_at, from_reference, to_reference) \
+             SELECT scope, CASE WHEN scope = 'workspace' THEN ?1 ELSE ?2 END, skill_id, rolled_back_at, from_reference, \
+             to_reference FROM rollback_records_v1",
+            params![workspace_key, GLOBAL_WORKSPACE_KEY],
+        )
+        .map_err(|source| local_state_query(path, "migrate rollback records", source))?;
+    connection
+        .execute(
+            "INSERT INTO history_events (workspace_key, kind, scope, skill_id, target, occurred_at, summary, details_json) \
+             SELECT CASE WHEN scope = 'workspace' THEN ?1 ELSE ?2 END, kind, scope, skill_id, target, occurred_at, summary, details_json \
+             FROM history_events_v1",
+            params![workspace_key, GLOBAL_WORKSPACE_KEY],
+        )
+        .map_err(|source| local_state_query(path, "migrate history entries", source))?;
+
+    connection
+        .execute_batch(
+            "
+DROP TABLE install_records_v1;
+DROP TABLE projection_records_v1;
+DROP TABLE update_checks_v1;
+DROP TABLE local_modifications_v1;
+DROP TABLE pins_v1;
+DROP TABLE rollback_records_v1;
+DROP TABLE history_events_v1;
+",
+        )
+        .map_err(|source| local_state_query(path, "drop migrated legacy tables", source))?;
+
+    Ok(())
 }
 
 fn schema_version(connection: &Connection, path: &Path) -> Result<u32, AppError> {
@@ -1619,6 +1958,7 @@ fn local_state_schema_sql() -> String {
         r"
 CREATE TABLE install_records (
     scope TEXT NOT NULL CHECK (scope IN ('workspace', 'user')),
+    workspace_key TEXT NOT NULL,
     skill_id TEXT NOT NULL,
     source_kind TEXT NOT NULL CHECK (source_kind IN ('git', 'local-path', 'archive')),
     source_url TEXT NOT NULL,
@@ -1632,11 +1972,12 @@ CREATE TABLE install_records (
     updated_at TEXT NOT NULL,
     detached INTEGER NOT NULL CHECK (detached IN (0, 1)),
     forked INTEGER NOT NULL CHECK (forked IN (0, 1)),
-    PRIMARY KEY (scope, skill_id)
+    PRIMARY KEY (scope, workspace_key, skill_id)
 );
 
 CREATE TABLE projection_records (
     scope TEXT NOT NULL CHECK (scope IN ('workspace', 'user')),
+    workspace_key TEXT NOT NULL,
     skill_id TEXT NOT NULL,
     target TEXT NOT NULL CHECK (
         target IN ('codex', 'claude-code', 'github-copilot', 'gemini-cli', 'amp', 'opencode')
@@ -1646,12 +1987,13 @@ CREATE TABLE projection_records (
     projected_path TEXT NOT NULL,
     effective_version_hash TEXT NOT NULL,
     generated_at TEXT NOT NULL,
-    PRIMARY KEY (scope, skill_id, target, physical_root)
+    PRIMARY KEY (scope, workspace_key, skill_id, target, physical_root)
 );
 
 CREATE TABLE update_checks (
     id INTEGER PRIMARY KEY,
     scope TEXT NOT NULL CHECK (scope IN ('workspace', 'user')),
+    workspace_key TEXT NOT NULL,
     skill_id TEXT NOT NULL,
     checked_at TEXT NOT NULL,
     pinned_revision TEXT NOT NULL,
@@ -1665,11 +2007,12 @@ CREATE TABLE update_checks (
 );
 
 CREATE INDEX idx_update_checks_skill_time
-    ON update_checks (scope, skill_id, checked_at DESC, id DESC);
+    ON update_checks (scope, workspace_key, skill_id, checked_at DESC, id DESC);
 
 CREATE TABLE local_modifications (
     id INTEGER PRIMARY KEY,
     scope TEXT NOT NULL CHECK (scope IN ('workspace', 'user')),
+    workspace_key TEXT NOT NULL,
     skill_id TEXT NOT NULL,
     detected_at TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('overlay', 'projected-copy', 'detached-fork')),
@@ -1678,21 +2021,23 @@ CREATE TABLE local_modifications (
 );
 
 CREATE INDEX idx_local_modifications_skill_time
-    ON local_modifications (scope, skill_id, detected_at DESC, id DESC);
+    ON local_modifications (scope, workspace_key, skill_id, detected_at DESC, id DESC);
 
 CREATE TABLE pins (
     scope TEXT NOT NULL CHECK (scope IN ('workspace', 'user')),
+    workspace_key TEXT NOT NULL,
     skill_id TEXT NOT NULL,
     requested_reference TEXT NOT NULL,
     resolved_revision TEXT NOT NULL,
     effective_version_hash TEXT,
     pinned_at TEXT NOT NULL,
-    PRIMARY KEY (scope, skill_id)
+    PRIMARY KEY (scope, workspace_key, skill_id)
 );
 
 CREATE TABLE rollback_records (
     id INTEGER PRIMARY KEY,
     scope TEXT NOT NULL CHECK (scope IN ('workspace', 'user')),
+    workspace_key TEXT NOT NULL,
     skill_id TEXT NOT NULL,
     rolled_back_at TEXT NOT NULL,
     from_reference TEXT NOT NULL,
@@ -1700,7 +2045,7 @@ CREATE TABLE rollback_records (
 );
 
 CREATE INDEX idx_rollback_records_skill_time
-    ON rollback_records (scope, skill_id, rolled_back_at DESC, id DESC);
+    ON rollback_records (scope, workspace_key, skill_id, rolled_back_at DESC, id DESC);
 
 CREATE TABLE telemetry_settings (
     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
@@ -1711,6 +2056,7 @@ CREATE TABLE telemetry_settings (
 
 CREATE TABLE history_events (
     id INTEGER PRIMARY KEY,
+    workspace_key TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (
         kind IN (
             'install',
@@ -1740,7 +2086,7 @@ CREATE TABLE history_events (
 );
 
 CREATE INDEX idx_history_events_skill_time
-    ON history_events (scope, skill_id, occurred_at DESC, id DESC);
+    ON history_events (scope, workspace_key, skill_id, occurred_at DESC, id DESC);
 
 PRAGMA user_version = {version};
 ",
@@ -1784,6 +2130,7 @@ type InstallRow = (
     String,
     String,
     String,
+    String,
     Option<String>,
     String,
     String,
@@ -1803,10 +2150,12 @@ type ProjectionRow = (
     String,
     String,
     String,
+    String,
 );
 
 type UpdateCheckRow = (
     i64,
+    String,
     String,
     String,
     String,
@@ -1824,18 +2173,28 @@ type LocalModificationRow = (
     String,
     String,
     String,
+    String,
     Option<String>,
     Option<String>,
 );
 
-type PinRow = (String, String, String, String, Option<String>, String);
+type PinRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+);
 
-type RollbackRow = (i64, String, String, String, String, String);
+type RollbackRow = (i64, String, String, String, String, String, String);
 
 type TelemetrySettingsRow = (String, Option<String>, String);
 
 type HistoryEntryRow = (
     i64,
+    String,
     String,
     Option<String>,
     Option<String>,
@@ -1846,35 +2205,36 @@ type HistoryEntryRow = (
 );
 
 fn decode_install_record(path: &Path, row: InstallRow) -> Result<InstallRecord, AppError> {
+    let scope = parse_scope(path, "install_records.scope", &row.1)?;
+    validate_workspace_key(path, "install_records.workspace_key", scope, &row.0)?;
     Ok(InstallRecord {
-        skill: ManagedSkillRef::new(parse_scope(path, "install_records.scope", &row.0)?, row.1),
-        source_kind: parse_source_kind(path, "install_records.source_kind", &row.2)?,
-        source_url: row.3,
-        source_subpath: row.4,
-        resolved_revision: row.5,
-        upstream_revision: row.6,
-        content_hash: row.7,
-        overlay_hash: row.8,
-        effective_version_hash: row.9,
-        installed_at: row.10,
-        updated_at: row.11,
-        detached: int_to_bool(path, "install_records.detached", row.12)?,
-        forked: int_to_bool(path, "install_records.forked", row.13)?,
+        skill: ManagedSkillRef::new(scope, row.2),
+        source_kind: parse_source_kind(path, "install_records.source_kind", &row.3)?,
+        source_url: row.4,
+        source_subpath: row.5,
+        resolved_revision: row.6,
+        upstream_revision: row.7,
+        content_hash: row.8,
+        overlay_hash: row.9,
+        effective_version_hash: row.10,
+        installed_at: row.11,
+        updated_at: row.12,
+        detached: int_to_bool(path, "install_records.detached", row.13)?,
+        forked: int_to_bool(path, "install_records.forked", row.14)?,
     })
 }
 
 fn decode_projection_record(path: &Path, row: ProjectionRow) -> Result<ProjectionRecord, AppError> {
+    let scope = parse_scope(path, "projection_records.scope", &row.1)?;
+    validate_workspace_key(path, "projection_records.workspace_key", scope, &row.0)?;
     Ok(ProjectionRecord {
-        skill: ManagedSkillRef::new(
-            parse_scope(path, "projection_records.scope", &row.0)?,
-            row.1,
-        ),
-        target: parse_target_runtime(path, "projection_records.target", &row.2)?,
-        generation_mode: parse_projection_mode(path, "projection_records.generation_mode", &row.3)?,
-        physical_root: row.4,
-        projected_path: row.5,
-        effective_version_hash: row.6,
-        generated_at: row.7,
+        skill: ManagedSkillRef::new(scope, row.2),
+        target: parse_target_runtime(path, "projection_records.target", &row.3)?,
+        generation_mode: parse_projection_mode(path, "projection_records.generation_mode", &row.4)?,
+        physical_root: row.5,
+        projected_path: row.6,
+        effective_version_hash: row.7,
+        generated_at: row.8,
     })
 }
 
@@ -1882,20 +2242,22 @@ fn decode_update_check_record(
     path: &Path,
     row: UpdateCheckRow,
 ) -> Result<UpdateCheckRecord, AppError> {
+    let scope = parse_scope(path, "update_checks.scope", &row.2)?;
+    validate_workspace_key(path, "update_checks.workspace_key", scope, &row.1)?;
     Ok(UpdateCheckRecord {
         id: Some(row.0),
-        skill: ManagedSkillRef::new(parse_scope(path, "update_checks.scope", &row.1)?, row.2),
-        checked_at: row.3,
-        pinned_revision: row.4,
-        latest_revision: row.5,
-        outcome: parse_update_check_outcome(path, "update_checks.outcome", &row.6)?,
-        overlay_detected: int_to_bool(path, "update_checks.overlay_detected", row.7)?,
+        skill: ManagedSkillRef::new(scope, row.3),
+        checked_at: row.4,
+        pinned_revision: row.5,
+        latest_revision: row.6,
+        outcome: parse_update_check_outcome(path, "update_checks.outcome", &row.7)?,
+        overlay_detected: int_to_bool(path, "update_checks.overlay_detected", row.8)?,
         local_modification_detected: int_to_bool(
             path,
             "update_checks.local_modification_detected",
-            row.8,
+            row.9,
         )?,
-        notes: row.9,
+        notes: row.10,
     })
 }
 
@@ -1903,36 +2265,39 @@ fn decode_local_modification_record(
     path: &Path,
     row: LocalModificationRow,
 ) -> Result<LocalModificationRecord, AppError> {
+    let scope = parse_scope(path, "local_modifications.scope", &row.2)?;
+    validate_workspace_key(path, "local_modifications.workspace_key", scope, &row.1)?;
     Ok(LocalModificationRecord {
         id: Some(row.0),
-        skill: ManagedSkillRef::new(
-            parse_scope(path, "local_modifications.scope", &row.1)?,
-            row.2,
-        ),
-        detected_at: row.3,
-        kind: parse_local_modification_kind(path, "local_modifications.kind", &row.4)?,
-        path: row.5,
-        details: row.6,
+        skill: ManagedSkillRef::new(scope, row.3),
+        detected_at: row.4,
+        kind: parse_local_modification_kind(path, "local_modifications.kind", &row.5)?,
+        path: row.6,
+        details: row.7,
     })
 }
 
 fn decode_pin_record(path: &Path, row: PinRow) -> Result<PinRecord, AppError> {
+    let scope = parse_scope(path, "pins.scope", &row.1)?;
+    validate_workspace_key(path, "pins.workspace_key", scope, &row.0)?;
     Ok(PinRecord {
-        skill: ManagedSkillRef::new(parse_scope(path, "pins.scope", &row.0)?, row.1),
-        requested_reference: row.2,
-        resolved_revision: row.3,
-        effective_version_hash: row.4,
-        pinned_at: row.5,
+        skill: ManagedSkillRef::new(scope, row.2),
+        requested_reference: row.3,
+        resolved_revision: row.4,
+        effective_version_hash: row.5,
+        pinned_at: row.6,
     })
 }
 
 fn decode_rollback_record(path: &Path, row: RollbackRow) -> Result<RollbackRecord, AppError> {
+    let scope = parse_scope(path, "rollback_records.scope", &row.2)?;
+    validate_workspace_key(path, "rollback_records.workspace_key", scope, &row.1)?;
     Ok(RollbackRecord {
         id: Some(row.0),
-        skill: ManagedSkillRef::new(parse_scope(path, "rollback_records.scope", &row.1)?, row.2),
-        rolled_back_at: row.3,
-        from_reference: row.4,
-        to_reference: row.5,
+        skill: ManagedSkillRef::new(scope, row.3),
+        rolled_back_at: row.4,
+        from_reference: row.5,
+        to_reference: row.6,
     })
 }
 
@@ -1948,11 +2313,22 @@ fn decode_telemetry_settings(
 }
 
 fn decode_history_entry(path: &Path, row: HistoryEntryRow) -> Result<HistoryEntry, AppError> {
-    let scope = match row.2 {
+    let scope = match row.3 {
         Some(scope) => Some(parse_scope(path, "history_events.scope", &scope)?),
         None => None,
     };
-    let target = match row.4 {
+    if let Some(scope) = scope {
+        validate_workspace_key(path, "history_events.workspace_key", scope, &row.1)?;
+    } else if row.1 != GLOBAL_WORKSPACE_KEY {
+        return Err(local_state_validation(
+            path,
+            format!(
+                "history_events.workspace_key must be '{}' for global events, found '{}'",
+                GLOBAL_WORKSPACE_KEY, row.1
+            ),
+        ));
+    }
+    let target = match row.5 {
         Some(target) => Some(parse_target_runtime(
             path,
             "history_events.target",
@@ -1963,19 +2339,45 @@ fn decode_history_entry(path: &Path, row: HistoryEntryRow) -> Result<HistoryEntr
 
     Ok(HistoryEntry {
         id: Some(row.0),
-        kind: HistoryEventKind::parse(&row.1).ok_or_else(|| {
+        kind: HistoryEventKind::parse(&row.2).ok_or_else(|| {
             local_state_validation(
                 path,
-                format!("history_events.kind has unsupported value '{}'", row.1),
+                format!("history_events.kind has unsupported value '{}'", row.2),
             )
         })?,
         scope,
-        skill_id: row.3,
+        skill_id: row.4,
         target,
-        occurred_at: row.5,
-        summary: row.6,
-        details: decode_history_details(path, row.7)?,
+        occurred_at: row.6,
+        summary: row.7,
+        details: decode_history_details(path, row.8)?,
     })
+}
+
+fn validate_workspace_key(
+    path: &Path,
+    field: &str,
+    scope: ManagedScope,
+    value: &str,
+) -> Result<(), AppError> {
+    if value.trim().is_empty() {
+        return Err(local_state_validation(
+            path,
+            format!("{field} must not be empty"),
+        ));
+    }
+
+    if scope == ManagedScope::User && value != GLOBAL_WORKSPACE_KEY {
+        return Err(local_state_validation(
+            path,
+            format!(
+                "{field} must be '{}' for user scope rows, found '{}'",
+                GLOBAL_WORKSPACE_KEY, value
+            ),
+        ));
+    }
+
+    Ok(())
 }
 
 fn parse_scope(path: &Path, field: &str, value: &str) -> Result<ManagedScope, AppError> {
@@ -2603,6 +3005,132 @@ mod tests {
         assert_eq!(snapshot.projections, vec![projection]);
         assert_eq!(snapshot.local_modifications.len(), 1);
         assert_eq!(snapshot.rollbacks.len(), 1);
+    }
+
+    #[test]
+    fn workspace_scoped_records_are_isolated_by_workspace_key() {
+        let temp = tempdir().expect("tempdir exists");
+        let path = temp.path().join("state.db");
+        let workspace_a = temp.path().join("workspace-a");
+        let workspace_b = temp.path().join("workspace-b");
+        fs::create_dir_all(&workspace_a).expect("workspace a exists");
+        fs::create_dir_all(&workspace_b).expect("workspace b exists");
+
+        let mut store_a =
+            LocalStateStore::open_at_for(&path, &workspace_a).expect("workspace a opens");
+        let mut store_b =
+            LocalStateStore::open_at_for(&path, &workspace_b).expect("workspace b opens");
+
+        let workspace_skill = ManagedSkillRef::new(ManagedScope::Workspace, "release-notes");
+        let user_skill = ManagedSkillRef::new(ManagedScope::User, "release-notes");
+
+        let install_record =
+            |skill: ManagedSkillRef, revision: &str, installed_at: &str| InstallRecord {
+                skill,
+                source_kind: SourceKind::Git,
+                source_url: "https://example.com/release-notes.git".to_string(),
+                source_subpath: ".agents/skills/release-notes".to_string(),
+                resolved_revision: revision.to_string(),
+                upstream_revision: Some(revision.to_string()),
+                content_hash: format!("sha256:{revision}:content"),
+                overlay_hash: "sha256:none".to_string(),
+                effective_version_hash: format!("sha256:{revision}:effective"),
+                installed_at: installed_at.to_string(),
+                updated_at: installed_at.to_string(),
+                detached: false,
+                forked: false,
+            };
+
+        let workspace_a_install = install_record(
+            workspace_skill.clone(),
+            "aaaaaaaaaaaaaaaa",
+            "2026-03-19T12:00:00Z",
+        );
+        let workspace_b_install = install_record(
+            workspace_skill.clone(),
+            "bbbbbbbbbbbbbbbb",
+            "2026-03-19T12:05:00Z",
+        );
+        let user_install = install_record(
+            user_skill.clone(),
+            "cccccccccccccccc",
+            "2026-03-19T12:10:00Z",
+        );
+
+        store_a
+            .upsert_install_record(&workspace_a_install)
+            .expect("workspace a install writes");
+        store_b
+            .upsert_install_record(&workspace_b_install)
+            .expect("workspace b install writes");
+        store_a
+            .upsert_install_record(&user_install)
+            .expect("user install writes");
+
+        assert_eq!(
+            store_a
+                .install_record(&workspace_skill)
+                .expect("workspace a install loads")
+                .expect("workspace a install exists"),
+            workspace_a_install
+        );
+        assert_eq!(
+            store_b
+                .install_record(&workspace_skill)
+                .expect("workspace b install loads")
+                .expect("workspace b install exists"),
+            workspace_b_install
+        );
+        assert_eq!(
+            store_a
+                .install_record(&user_skill)
+                .expect("user install loads in workspace a")
+                .expect("user install exists in workspace a"),
+            user_install
+        );
+        assert_eq!(
+            store_b
+                .install_record(&user_skill)
+                .expect("user install loads in workspace b")
+                .expect("user install exists in workspace b"),
+            user_install
+        );
+        assert_eq!(
+            store_a
+                .list_install_records()
+                .expect("workspace a records load")
+                .into_iter()
+                .filter(|record| record.skill.scope == ManagedScope::Workspace)
+                .collect::<Vec<_>>(),
+            vec![workspace_a_install]
+        );
+        assert_eq!(
+            store_b
+                .list_install_records()
+                .expect("workspace b records load")
+                .into_iter()
+                .filter(|record| record.skill.scope == ManagedScope::Workspace)
+                .collect::<Vec<_>>(),
+            vec![workspace_b_install]
+        );
+        assert_eq!(
+            store_a
+                .list_install_records()
+                .expect("user records load in workspace a")
+                .into_iter()
+                .filter(|record| record.skill.scope == ManagedScope::User)
+                .collect::<Vec<_>>(),
+            vec![user_install.clone()]
+        );
+        assert_eq!(
+            store_b
+                .list_install_records()
+                .expect("user records load in workspace b")
+                .into_iter()
+                .filter(|record| record.skill.scope == ManagedScope::User)
+                .collect::<Vec<_>>(),
+            vec![user_install]
+        );
     }
 
     #[test]

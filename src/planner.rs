@@ -108,7 +108,7 @@ pub fn handle_update(
 ) -> Result<AppResponse, AppError> {
     let manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
     let lockfile = WorkspaceLockfile::load_from_workspace(&context.working_directory)?;
-    let mut store = LocalStateStore::open_default()?;
+    let mut store = LocalStateStore::open_default_for(&context.working_directory)?;
     let selected_skills = select_managed_skills(&store, context, &request)?;
     if selected_skills.is_empty() {
         return Ok(AppResponse::success("update")

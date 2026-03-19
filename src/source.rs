@@ -37,7 +37,8 @@ use crate::{
     response::AppResponse,
     skill::{DEFAULT_SKILLS_DIR, SkillDefinition},
     state::{
-        InstallRecord, LocalStateStore, ManagedScope, ManagedSkillRef, PinRecord, ProjectionRecord,
+        InstallRecord, LocalStateStore, ManagedScope, ManagedSkillRef, PinRecord,
+        workspace_key_for_path,
     },
     telemetry,
     trust::SkillTrust,
@@ -74,6 +75,8 @@ const DETECTION_ROOTS: &[DetectionRoot] = &[
 const SUPPORTED_ARCHIVE_EXTENSIONS: &[&str] = &[
     ".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz",
 ];
+const USER_IMPORTS_NAMESPACE: &str = "user";
+const WORKSPACE_IMPORTS_NAMESPACE: &str = "workspace";
 
 /// Supported install source categories.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -258,7 +261,6 @@ struct InstallBuildContext<'a> {
     working_directory: &'a Path,
     manifest: &'a WorkspaceManifest,
     lockfile: &'a WorkspaceLockfile,
-    imports_root: &'a Path,
     install_timestamp: &'a str,
 }
 
@@ -306,7 +308,6 @@ pub fn handle_install(
         )?;
 
         let install_timestamp = current_timestamp();
-        let imports_root = imports_store_root()?;
         let mut operations = Vec::with_capacity(selected.len());
 
         for candidate in &selected {
@@ -314,7 +315,6 @@ pub fn handle_install(
                 working_directory: &context.working_directory,
                 manifest: &manifest,
                 lockfile: &lockfile,
-                imports_root: &imports_root,
                 install_timestamp: &install_timestamp,
             };
             let operation = build_install_operation(
@@ -345,7 +345,13 @@ pub fn handle_install(
         }
 
         let sync_report = materialize::sync_workspace(&scoped_context)?;
-        record_install_state(scope, &operations, &sync_report, &install_timestamp)?;
+        record_install_state(
+            context,
+            scope,
+            &operations,
+            &sync_report,
+            &install_timestamp,
+        )?;
         transaction.checkpoint("after-state")?;
 
         let installed: Vec<_> = operations
@@ -794,7 +800,8 @@ fn build_install_operation(
         .unwrap_or_else(|| overlay::NO_OVERLAY_HASH.to_string());
     let effective_version_hash =
         compute_effective_version_hash(&revision.resolved, &content_hash, &overlay_hash);
-    let stored_source_root = context.imports_root.join(&import_id);
+    let stored_source_root =
+        stored_import_root(managed_scope(scope), context.working_directory, &import_id)?;
     let first_installed_at = context.lockfile.imports.get(&import_id).map_or_else(
         || LockfileTimestamp::new(context.install_timestamp.to_string()),
         |entry| entry.timestamps.first_installed_at.clone(),
@@ -973,12 +980,13 @@ fn install_context_for_scope(context: &AppContext, scope: TargetScope) -> AppCon
 }
 
 fn record_install_state(
+    context: &AppContext,
     scope: TargetScope,
     operations: &[InstallOperation],
     sync_report: &MaterializationReport,
     install_timestamp: &str,
 ) -> Result<(), AppError> {
-    let mut store = LocalStateStore::open_default()?;
+    let mut store = LocalStateStore::open_default_for(&context.working_directory)?;
     let managed_scope = managed_scope(scope);
     let mut installed_at_by_skill = BTreeMap::new();
 
@@ -999,32 +1007,46 @@ fn record_install_state(
         })?;
     }
 
-    let projection_records =
-        projection_records_for_install(managed_scope, operations, sync_report, install_timestamp);
-    let mut ledger = HistoryLedger::new(&mut store);
+    {
+        let mut ledger = HistoryLedger::new(&mut store);
 
-    for operation in operations {
-        let install_record = InstallRecord {
-            skill: ManagedSkillRef::new(managed_scope, operation.installed.name.clone()),
-            source_kind: operation.locked_import.source.kind,
-            source_url: operation.locked_import.source.url.clone(),
-            source_subpath: operation.locked_import.source.subpath.as_str().to_string(),
-            resolved_revision: operation.locked_import.revision.resolved.clone(),
-            upstream_revision: operation.locked_import.revision.upstream.clone(),
-            content_hash: operation.locked_import.hashes.content.clone(),
-            overlay_hash: operation.locked_import.hashes.overlay.clone(),
-            effective_version_hash: operation.locked_import.hashes.effective_version.clone(),
-            installed_at: installed_at_by_skill
-                .get(&operation.installed.name)
-                .cloned()
-                .unwrap_or_else(|| install_timestamp.to_string()),
-            updated_at: install_timestamp.to_string(),
-            detached: false,
-            forked: false,
-        };
-        ledger.record_install_with_trust(&install_record, &operation.installed.trust)?;
+        for operation in operations {
+            let install_record = InstallRecord {
+                skill: ManagedSkillRef::new(managed_scope, operation.installed.name.clone()),
+                source_kind: operation.locked_import.source.kind,
+                source_url: operation.locked_import.source.url.clone(),
+                source_subpath: operation.locked_import.source.subpath.as_str().to_string(),
+                resolved_revision: operation.locked_import.revision.resolved.clone(),
+                upstream_revision: operation.locked_import.revision.upstream.clone(),
+                content_hash: operation.locked_import.hashes.content.clone(),
+                overlay_hash: operation.locked_import.hashes.overlay.clone(),
+                effective_version_hash: operation.locked_import.hashes.effective_version.clone(),
+                installed_at: installed_at_by_skill
+                    .get(&operation.installed.name)
+                    .cloned()
+                    .unwrap_or_else(|| install_timestamp.to_string()),
+                updated_at: install_timestamp.to_string(),
+                detached: false,
+                forked: false,
+            };
+            ledger.record_install_with_trust(&install_record, &operation.installed.trust)?;
+        }
     }
 
+    let projection_records = materialize::rebuild_projection_records_for_scope(
+        &mut store,
+        managed_scope,
+        sync_report,
+        install_timestamp,
+    )?;
+    let mut ledger = HistoryLedger::new(&mut store);
+    materialize::record_pruned_projection_history(
+        &mut ledger,
+        context,
+        managed_scope,
+        sync_report,
+        install_timestamp,
+    )?;
     for record in projection_records {
         ledger.record_projection(&record)?;
     }
@@ -1037,52 +1059,6 @@ fn install_requested_reference(kind: SourceKind, revision: &SourceRevision) -> S
         SourceKind::Git => "HEAD".to_string(),
         SourceKind::LocalPath | SourceKind::Archive => revision.resolved.clone(),
     }
-}
-
-fn projection_records_for_install(
-    scope: ManagedScope,
-    operations: &[InstallOperation],
-    sync_report: &MaterializationReport,
-    install_timestamp: &str,
-) -> Vec<ProjectionRecord> {
-    let targets_by_root: BTreeMap<_, _> = sync_report
-        .plan
-        .physical_roots
-        .iter()
-        .map(|root| (root.path.clone(), root.targets.clone()))
-        .collect();
-    let operations_by_name: BTreeMap<_, _> = operations
-        .iter()
-        .map(|operation| (operation.installed.name.clone(), operation))
-        .collect();
-    let mut records = Vec::new();
-    let generation_mode = sync_report.recorded_generation_mode();
-
-    for generated_root in &sync_report.generated_roots {
-        let Some(targets) = targets_by_root.get(&generated_root.path) else {
-            continue;
-        };
-
-        for skill_name in &generated_root.materialized {
-            let Some(operation) = operations_by_name.get(skill_name) else {
-                continue;
-            };
-
-            for target in targets {
-                records.push(ProjectionRecord {
-                    skill: ManagedSkillRef::new(scope, skill_name.clone()),
-                    target: *target,
-                    generation_mode,
-                    physical_root: generated_root.path.clone(),
-                    projected_path: skill_name.clone(),
-                    effective_version_hash: operation.installed.effective_version_hash.clone(),
-                    generated_at: install_timestamp.to_string(),
-                });
-            }
-        }
-    }
-
-    records
 }
 
 fn install_summary(installed: &[InstalledSkill], sync_report: &MaterializationReport) -> String {
@@ -1126,6 +1102,27 @@ pub(crate) fn imports_store_root() -> Result<PathBuf, AppError> {
         .map(PathBuf::from)
         .map(|path| path.join(".skillctl/store/imports"))
         .ok_or(AppError::HomeDirectoryUnavailable)
+}
+
+pub(crate) fn imports_scope_root(
+    scope: ManagedScope,
+    working_directory: &Path,
+) -> Result<PathBuf, AppError> {
+    let root = imports_store_root()?;
+    match scope {
+        ManagedScope::User => Ok(root.join(USER_IMPORTS_NAMESPACE)),
+        ManagedScope::Workspace => Ok(root
+            .join(WORKSPACE_IMPORTS_NAMESPACE)
+            .join(workspace_key_for_path(working_directory)?)),
+    }
+}
+
+pub(crate) fn stored_import_root(
+    scope: ManagedScope,
+    working_directory: &Path,
+    import_id: &str,
+) -> Result<PathBuf, AppError> {
+    Ok(imports_scope_root(scope, working_directory)?.join(import_id))
 }
 
 pub(crate) fn current_timestamp() -> String {
@@ -2084,6 +2081,43 @@ mod tests {
                 "source must be a Git URL, existing local directory, or existing local archive"
             ),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn stored_import_roots_are_namespaced_by_scope_and_workspace() {
+        let fixture = TestSourceFixture::new();
+        let workspace_a = fixture.path().join("workspace-a");
+        let workspace_b = fixture.path().join("workspace-b");
+        fs::create_dir_all(&workspace_a).expect("workspace a exists");
+        fs::create_dir_all(&workspace_b).expect("workspace b exists");
+
+        let workspace_a_root =
+            stored_import_root(ManagedScope::Workspace, &workspace_a, "release-notes")
+                .expect("workspace a root builds");
+        let workspace_b_root =
+            stored_import_root(ManagedScope::Workspace, &workspace_b, "release-notes")
+                .expect("workspace b root builds");
+        let user_a_root = stored_import_root(ManagedScope::User, &workspace_a, "release-notes")
+            .expect("user root builds for workspace a");
+        let user_b_root = stored_import_root(ManagedScope::User, &workspace_b, "release-notes")
+            .expect("user root builds for workspace b");
+
+        assert_ne!(workspace_a_root, workspace_b_root);
+        assert_eq!(user_a_root, user_b_root);
+        assert!(
+            workspace_a_root
+                .to_string_lossy()
+                .contains(WORKSPACE_IMPORTS_NAMESPACE),
+            "workspace root should stay in the workspace namespace: {}",
+            workspace_a_root.display()
+        );
+        assert!(
+            user_a_root
+                .to_string_lossy()
+                .contains(USER_IMPORTS_NAMESPACE),
+            "user root should stay in the user namespace: {}",
+            user_a_root.display()
         );
     }
 

@@ -12,6 +12,7 @@ use crate::{
     manifest::{ImportDefinition, ManifestPath, ManifestScope, WorkspaceManifest},
     materialize::PROJECTION_METADATA_FILE,
     skill::{OPENAI_METADATA_FILE, SKILL_MANIFEST_FILE, SkillDefinition, SkillVendorMetadata},
+    source::stored_import_root,
 };
 
 /// Typed scope for canonical and imported skills during effective resolution.
@@ -470,7 +471,14 @@ fn load_import_candidate(
         });
     };
 
-    let stored_source_root = request.imports_directory.join(&import.id);
+    let stored_source_root = stored_import_root(
+        match import.scope {
+            ManifestScope::Workspace => crate::state::ManagedScope::Workspace,
+            ManifestScope::User => crate::state::ManagedScope::User,
+        },
+        &request.working_directory,
+        &import.id,
+    )?;
     ensure_directory(
         &stored_source_root,
         "inspect stored import root",
@@ -681,13 +689,22 @@ fn collect_directory_files(
 
     for entry in entries {
         let path = entry.path();
-        let metadata = entry
-            .metadata()
-            .map_err(|source| AppError::FilesystemOperation {
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|source| AppError::FilesystemOperation {
                 action: "inspect skill path",
                 path: path.clone(),
                 source,
             })?;
+
+        if metadata.file_type().is_symlink() {
+            return Err(AppError::ResolutionValidation {
+                message: format!(
+                    "{kind} directory '{}' contains unsupported symlink '{}'",
+                    root.display(),
+                    path.display()
+                ),
+            });
+        }
 
         if metadata.is_dir() {
             collect_directory_files(root, &path, kind, files)?;
@@ -802,13 +819,21 @@ fn read_child_directories(root: &Path, kind: &'static str) -> Result<Vec<PathBuf
             source,
         })?;
         let path = entry.path();
-        let metadata = entry
-            .metadata()
-            .map_err(|source| AppError::FilesystemOperation {
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|source| AppError::FilesystemOperation {
                 action: "inspect skill path",
                 path: path.clone(),
                 source,
             })?;
+        if metadata.file_type().is_symlink() {
+            return Err(AppError::ResolutionValidation {
+                message: format!(
+                    "{kind} '{}' contains unsupported symlink '{}'",
+                    root.display(),
+                    path.display()
+                ),
+            });
+        }
         if metadata.is_dir() {
             directories.push(path);
         } else {
@@ -830,11 +855,16 @@ fn ensure_directory(
     action: &'static str,
     expected: &'static str,
 ) -> Result<(), AppError> {
-    let metadata = fs::metadata(path).map_err(|source| AppError::FilesystemOperation {
+    let metadata = fs::symlink_metadata(path).map_err(|source| AppError::FilesystemOperation {
         action,
         path: path.to_path_buf(),
         source,
     })?;
+    if metadata.file_type().is_symlink() {
+        return Err(AppError::ResolutionValidation {
+            message: format!("path '{}' must not be a symlink", path.display()),
+        });
+    }
     if !metadata.is_dir() {
         return Err(AppError::PathConflict {
             path: path.to_path_buf(),
@@ -905,6 +935,8 @@ fn portable_relative_path(path: &Path) -> Result<String, AppError> {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
 
     use crate::{
         lockfile::{
@@ -912,7 +944,8 @@ mod tests {
             LockfileTimestamp,
         },
         manifest::ImportSourceType,
-        source::SourceKind,
+        source::{SourceKind, stored_import_root},
+        state::ManagedScope,
     };
 
     #[test]
@@ -1234,6 +1267,90 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_canonical_local_skill_roots() {
+        let fixture = ResolverFixture::new();
+        fixture.write_skill(
+            "external/release-notes",
+            "release-notes",
+            "Symlink targets must not be treated as canonical local skills.",
+        );
+
+        let local_root = fixture.path(".agents/skills");
+        fs::create_dir_all(&local_root).expect("local skills root exists");
+        symlink(
+            fixture.path("external/release-notes"),
+            local_root.join("release-notes"),
+        )
+        .expect("skill symlink created");
+
+        let error = build_effective_skill_graph(&fixture.request(Vec::new(), Vec::new()))
+            .expect_err("symlinked local skill should fail validation");
+
+        assert!(
+            error.to_string().contains("unsupported symlink"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_overlay_entries() {
+        let fixture = ResolverFixture::new();
+        fixture.write_skill(
+            "imports/overridden-import/skills/release-notes",
+            "release-notes",
+            "Base imported skill.",
+        );
+        fixture.write_text(
+            "external/SKILL.md",
+            concat!(
+                "---\n",
+                "name: release-notes\n",
+                "description: External overlay manifest.\n",
+                "---\n",
+                "\n",
+                "# Release Notes\n"
+            ),
+        );
+
+        let overlay_root = fixture.path(".agents/overlays/overridden-import");
+        fs::create_dir_all(&overlay_root).expect("overlay root exists");
+        symlink(
+            fixture.path("external/SKILL.md"),
+            overlay_root.join("SKILL.md"),
+        )
+        .expect("overlay symlink created");
+
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "overridden-import".to_string(),
+            ManifestPath::new(".agents/overlays/overridden-import"),
+        );
+
+        let request = fixture.request_with_overrides(
+            vec![import_definition(
+                "overridden-import",
+                "skills/release-notes",
+            )],
+            vec![locked_import(
+                "overridden-import",
+                "https://example.com/overridden.git",
+                "skills/release-notes",
+            )],
+            overrides,
+        );
+
+        let error = build_effective_skill_graph(&request)
+            .expect_err("symlinked overlay entries should fail validation");
+
+        assert!(
+            error.to_string().contains("unsupported symlink"),
+            "unexpected error: {error}"
+        );
+    }
+
     fn import_definition(id: &str, path: &str) -> ImportDefinition {
         ImportDefinition {
             id: id.to_string(),
@@ -1326,7 +1443,43 @@ mod tests {
             let mut lockfile = WorkspaceLockfile::default_at(self.path(".agents/skillctl.lock"));
             lockfile.imports = locked_imports.into_iter().collect();
 
+            for import in &manifest.imports {
+                let fixture_root = self.path(format!("imports/{}", import.id));
+                if !fixture_root.exists() {
+                    continue;
+                }
+
+                let scope = match import.scope {
+                    ManifestScope::Workspace => ManagedScope::Workspace,
+                    ManifestScope::User => ManagedScope::User,
+                };
+                let stored_root = stored_import_root(scope, self.root.path(), &import.id)
+                    .expect("stored import root builds");
+                if let Some(parent) = stored_root.parent() {
+                    fs::create_dir_all(parent).expect("stored import parent exists");
+                }
+                if stored_root.exists() {
+                    fs::remove_dir_all(&stored_root).expect("stale stored import root removed");
+                }
+                copy_directory_tree(&fixture_root, &stored_root);
+            }
+
             ResolveWorkspaceRequest::new(self.root.path(), self.path("imports"), manifest, lockfile)
+        }
+    }
+
+    fn copy_directory_tree(source: &Path, destination: &Path) {
+        fs::create_dir_all(destination).expect("destination exists");
+        for entry in fs::read_dir(source).expect("directory entries read") {
+            let entry = entry.expect("directory entry exists");
+            let path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            let metadata = fs::symlink_metadata(&path).expect("entry metadata exists");
+            if metadata.is_dir() {
+                copy_directory_tree(&path, &destination_path);
+            } else {
+                fs::copy(&path, &destination_path).expect("file copied");
+            }
         }
     }
 }

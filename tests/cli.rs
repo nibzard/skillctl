@@ -3,6 +3,7 @@ use predicates::prelude::*;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use serde_yaml::Value as YamlValue;
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
@@ -16,7 +17,7 @@ const MINIMAL_LOCKFILE: &str = concat!(
     "\n",
     "state:\n",
     "  manifest_version: 1\n",
-    "  local_state_version: 1\n",
+    "  local_state_version: 2\n",
 );
 
 #[test]
@@ -424,6 +425,7 @@ fn init_dispatches_to_runtime_and_bootstraps_the_workspace() {
     let mut cmd = Command::cargo_bin("skillctl").expect("binary exists");
 
     cmd.current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
         .arg("init")
         .assert()
         .success()
@@ -433,9 +435,11 @@ fn init_dispatches_to_runtime_and_bootstraps_the_workspace() {
 
 #[test]
 fn json_output_uses_stable_response_contract_for_command_errors() {
+    let home = tempfile::tempdir().expect("tempdir exists");
     let mut cmd = Command::cargo_bin("skillctl").expect("binary exists");
 
     let assert = cmd
+        .env("HOME", home.path())
         .args(["--json", "install", "./missing-source"])
         .assert()
         .failure()
@@ -566,6 +570,7 @@ fn quiet_mode_suppresses_success_summaries() {
     Command::cargo_bin("skillctl")
         .expect("binary exists")
         .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
         .args(["--quiet", "init"])
         .assert()
         .success()
@@ -584,6 +589,7 @@ fn verbose_mode_renders_structured_data_in_human_output() {
     let assert = Command::cargo_bin("skillctl")
         .expect("binary exists")
         .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
         .args(["--verbose", "init"])
         .assert()
         .success()
@@ -753,8 +759,8 @@ fn install_updates_manifest_lockfile_store_state_and_projection_records() {
 
     assert!(
         workspace
-            .home_path()
-            .join(".skillctl/store/imports/release-notes/.agents/skills/release-notes/SKILL.md")
+            .workspace_import_root("release-notes")
+            .join(".agents/skills/release-notes/SKILL.md")
             .is_file(),
         "stored import checkout should exist",
     );
@@ -825,8 +831,7 @@ fn install_rolls_back_when_the_transaction_fails_after_state_write() {
     let snapshot = workspace.snapshot_paths(&[
         ".agents/skillctl.yaml",
         ".agents/skillctl.lock",
-        "home/.skillctl/state.db",
-        "home/.skillctl/store/imports/release-notes",
+        "home/.skillctl/store/imports",
         ".claude/skills",
     ]);
 
@@ -843,6 +848,33 @@ fn install_rolls_back_when_the_transaction_fails_after_state_write() {
         ],
         &snapshot,
     );
+
+    let connection = Connection::open(workspace.home_path().join(".skillctl/state.db"))
+        .expect("state database opens");
+    let install_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM install_records WHERE scope = ?1 AND skill_id = ?2",
+            params!["workspace", "release-notes"],
+            |row| row.get(0),
+        )
+        .expect("install count query succeeds");
+    let projection_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM projection_records WHERE scope = ?1 AND skill_id = ?2",
+            params!["workspace", "release-notes"],
+            |row| row.get(0),
+        )
+        .expect("projection count query succeeds");
+    let history_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM history_events WHERE scope = ?1 AND skill_id = ?2",
+            params!["workspace", "release-notes"],
+            |row| row.get(0),
+        )
+        .expect("history count query succeeds");
+    assert_eq!(install_count, 0);
+    assert_eq!(projection_count, 0);
+    assert_eq!(history_count, 0);
 }
 
 #[test]
@@ -1166,6 +1198,7 @@ fn validate_reports_invalid_local_skills() {
     let assert = Command::cargo_bin("skillctl")
         .expect("binary exists")
         .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
         .args(["--json", "validate"])
         .assert()
         .failure()
@@ -1254,6 +1287,7 @@ fn init_bootstraps_the_default_workspace_layout() {
     let assert = Command::cargo_bin("skillctl")
         .expect("binary exists")
         .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
         .arg("init")
         .assert()
         .success()
@@ -1306,6 +1340,7 @@ fn init_updates_git_info_exclude_without_touching_gitignore_and_is_idempotent() 
     Command::cargo_bin("skillctl")
         .expect("binary exists")
         .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
         .arg("init")
         .assert()
         .success()
@@ -1342,6 +1377,7 @@ fn init_updates_git_info_exclude_without_touching_gitignore_and_is_idempotent() 
     Command::cargo_bin("skillctl")
         .expect("binary exists")
         .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
         .arg("init")
         .assert()
         .success()
@@ -1361,6 +1397,7 @@ fn init_json_output_describes_created_and_skipped_items() {
     let assert = Command::cargo_bin("skillctl")
         .expect("binary exists")
         .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
         .args(["--json", "init"])
         .assert()
         .success()
@@ -1419,6 +1456,7 @@ fn sync_materializes_generated_copies_without_touching_canonical_skills() {
     Command::cargo_bin("skillctl")
         .expect("binary exists")
         .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
         .arg("sync")
         .assert()
         .success()
@@ -1496,6 +1534,7 @@ fn sync_symlink_mode_requires_explicit_override_for_unstable_targets() {
     Command::cargo_bin("skillctl")
         .expect("binary exists")
         .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
         .arg("sync")
         .assert()
         .failure()
@@ -1678,6 +1717,7 @@ fn sync_symlink_mode_materializes_symlinked_files_and_emits_warnings() {
     let assert = Command::cargo_bin("skillctl")
         .expect("binary exists")
         .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
         .args(["--json", "sync"])
         .assert()
         .code(2)
@@ -1752,6 +1792,7 @@ fn sync_symlink_mode_human_output_includes_warning_lines() {
     Command::cargo_bin("skillctl")
         .expect("binary exists")
         .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
         .arg("sync")
         .assert()
         .code(2)
@@ -1847,6 +1888,7 @@ fn doctor_reports_symlink_risk_with_override_guidance() {
     let assert = Command::cargo_bin("skillctl")
         .expect("binary exists")
         .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
         .args(["--json", "doctor"])
         .assert()
         .code(2)
@@ -1947,7 +1989,7 @@ fn doctor_reports_stale_lockfile_entries() {
         "\n",
         "state:\n",
         "  manifest_version: 1\n",
-        "  local_state_version: 1\n",
+        "  local_state_version: 2\n",
         "\n",
         "imports:\n",
         "  stale-skill:\n",
@@ -2151,6 +2193,7 @@ fn sync_prunes_only_prior_skillctl_generated_projections() {
     Command::cargo_bin("skillctl")
         .expect("binary exists")
         .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
         .arg("sync")
         .assert()
         .success()
@@ -2203,6 +2246,7 @@ fn sync_refuses_to_overwrite_hand_authored_runtime_skill_directories() {
     Command::cargo_bin("skillctl")
         .expect("binary exists")
         .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
         .arg("sync")
         .assert()
         .failure()
@@ -2269,9 +2313,9 @@ fn override_creates_a_minimal_overlay_and_updates_manifest_lockfile_and_state() 
     assert_eq!(
         fs::read_to_string(&overlay_manifest_path).expect("overlay manifest exists"),
         fs::read_to_string(
-            workspace.home_path().join(
-                ".skillctl/store/imports/release-notes/.agents/skills/release-notes/SKILL.md"
-            )
+            workspace
+                .workspace_import_root("release-notes")
+                .join(".agents/skills/release-notes/SKILL.md")
         )
         .expect("stored import manifest exists")
     );
@@ -3236,6 +3280,124 @@ fn pin_updates_manifest_lockfile_state_and_projection_metadata() {
 }
 
 #[test]
+fn pin_refreshes_projection_state_for_untouched_skills_when_targets_move() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_skill_source("git-release", "release-notes");
+    workspace.write_skill_source("git-bugs", "bug-triage");
+    workspace.init_git_repo("git-release");
+    workspace.init_git_repo("git-bugs");
+    let release_repo_url = workspace.git_repo_url("git-release");
+    let bug_repo_url = workspace.git_repo_url("git-bugs");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770000000")
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            release_repo_url.as_str(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770000001")
+        .args([
+            "--no-input",
+            "--name",
+            "bug-triage",
+            "install",
+            bug_repo_url.as_str(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let manifest_path = workspace.path().join(".agents/skillctl.yaml");
+    let manifest = fs::read_to_string(&manifest_path).expect("manifest exists");
+    fs::write(
+        &manifest_path,
+        manifest.replace("  - claude-code\n", "  - codex\n"),
+    )
+    .expect("manifest target updates");
+
+    workspace.write_skill_source_at(
+        "git-release",
+        ".agents/skills/release-notes",
+        "release-notes",
+        "Pinned release notes helper.",
+    );
+    workspace.commit_all("git-release", "pin release notes");
+    let pinned_commit = workspace.git_head("git-release");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770001234")
+        .args(["pin", "release-notes", pinned_commit.as_str()])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    assert!(
+        workspace
+            .path()
+            .join(".agents/skills/bug-triage/SKILL.md")
+            .is_file(),
+        "pin should re-project untouched skills into the new target root",
+    );
+
+    let path_assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--json", "path", "bug-triage"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+    let path_body: Value =
+        serde_json::from_slice(&path_assert.get_output().stdout).expect("stdout is valid json");
+    assert_eq!(path_body["data"]["projections"][0]["target"], "codex");
+    assert_eq!(
+        path_body["data"]["projections"][0]["root"],
+        ".agents/skills"
+    );
+
+    let connection = Connection::open(workspace.home_path().join(".skillctl/state.db"))
+        .expect("state database opens");
+    let projection_row: (String, String, String) = connection
+        .query_row(
+            "SELECT target, physical_root, projected_path \
+             FROM projection_records WHERE skill_id = ?1",
+            params!["bug-triage"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("projection record exists");
+    assert_eq!(
+        projection_row,
+        (
+            "codex".to_string(),
+            ".agents/skills".to_string(),
+            "bug-triage".to_string(),
+        )
+    );
+}
+
+#[test]
 fn pin_rolls_back_when_the_transaction_fails_after_state_write() {
     let workspace = TestWorkspace::new();
     workspace.write_manifest(concat!(
@@ -3277,7 +3439,7 @@ fn pin_rolls_back_when_the_transaction_fails_after_state_write() {
         ".agents/skillctl.yaml",
         ".agents/skillctl.lock",
         "home/.skillctl/state.db",
-        "home/.skillctl/store/imports/release-notes",
+        "home/.skillctl/store/imports",
         ".claude/skills",
     ]);
 
@@ -3538,7 +3700,7 @@ fn rollback_rolls_back_when_the_transaction_fails_after_state_write() {
         ".agents/skillctl.yaml",
         ".agents/skillctl.lock",
         "home/.skillctl/state.db",
-        "home/.skillctl/store/imports/release-notes",
+        "home/.skillctl/store/imports",
         ".claude/skills",
     ]);
 
@@ -3873,13 +4035,20 @@ fn list_and_path_report_managed_skill_inventory_and_filesystem_locations() {
         path_body["data"]["stored_source_root"]
             .as_str()
             .expect("stored source root exists")
-            .ends_with(".skillctl/store/imports/release-notes"),
+            == workspace
+                .workspace_import_root("release-notes")
+                .display()
+                .to_string(),
     );
     assert!(
         path_body["data"]["active_source_root"]
             .as_str()
             .expect("active source root exists")
-            .ends_with(".skillctl/store/imports/release-notes/.agents/skills/release-notes"),
+            == workspace
+                .workspace_import_root("release-notes")
+                .join(".agents/skills/release-notes")
+                .display()
+                .to_string(),
     );
     assert_eq!(
         path_body["data"]["planned_roots"][0]["path"],
@@ -4739,10 +4908,7 @@ fn remove_drops_current_install_state_but_history_remains_queryable() {
     let lockfile = workspace.read_lockfile_yaml();
     assert!(lockfile["imports"]["release-notes"].is_null());
     assert!(
-        !workspace
-            .home_path()
-            .join(".skillctl/store/imports/release-notes")
-            .exists(),
+        !workspace.workspace_import_root("release-notes").exists(),
         "stored immutable source should be removed",
     );
     assert!(
@@ -4859,7 +5025,7 @@ fn remove_rolls_back_when_the_transaction_fails_after_state_write() {
         ".agents/skillctl.lock",
         ".agents/overlays/release-notes",
         "home/.skillctl/state.db",
-        "home/.skillctl/store/imports/release-notes",
+        "home/.skillctl/store/imports",
         ".claude/skills",
     ]);
 
@@ -4900,8 +5066,11 @@ fn clean_removes_generated_projections_and_unused_import_state_without_touching_
         .stderr(predicate::str::is_empty());
 
     workspace.write_workspace_skill("local-only", "Local canonical helper.", &[]);
+    let stale_skill_manifest = workspace
+        .workspace_import_root_relative("stale-skill")
+        .join("SKILL.md");
     workspace.write_file(
-        "home/.skillctl/store/imports/stale-skill/SKILL.md",
+        stale_skill_manifest.to_string_lossy().as_ref(),
         concat!(
             "---\n",
             "name: stale-skill\n",
@@ -4938,12 +5107,11 @@ fn clean_removes_generated_projections_and_unused_import_state_without_touching_
             .as_array()
             .expect("cleaned state exists")
             .iter()
-            .any(|entry| {
-                entry["path"]
-                    .as_str()
-                    .expect("path exists")
-                    .ends_with(".skillctl/store/imports/stale-skill")
-            }),
+            .any(|entry| entry["path"]
+                == workspace
+                    .workspace_import_root("stale-skill")
+                    .display()
+                    .to_string()),
     );
 
     assert!(
@@ -4958,17 +5126,11 @@ fn clean_removes_generated_projections_and_unused_import_state_without_touching_
         "canonical local skills must remain untouched",
     );
     assert!(
-        workspace
-            .home_path()
-            .join(".skillctl/store/imports/release-notes")
-            .is_dir(),
+        workspace.workspace_import_root("release-notes").is_dir(),
         "active immutable imports should not be deleted by clean",
     );
     assert!(
-        !workspace
-            .home_path()
-            .join(".skillctl/store/imports/stale-skill")
-            .exists(),
+        !workspace.workspace_import_root("stale-skill").exists(),
         "unused import state should be removed",
     );
 
@@ -5017,8 +5179,11 @@ fn clean_rolls_back_when_the_transaction_fails_after_state_write() {
         .success()
         .stderr(predicate::str::is_empty());
 
+    let stale_skill_manifest = workspace
+        .workspace_import_root_relative("stale-skill")
+        .join("SKILL.md");
     workspace.write_file(
-        "home/.skillctl/store/imports/stale-skill/SKILL.md",
+        stale_skill_manifest.to_string_lossy().as_ref(),
         concat!(
             "---\n",
             "name: stale-skill\n",
@@ -5156,6 +5321,20 @@ impl TestWorkspace {
         let path = self.path.join("home");
         fs::create_dir_all(&path).expect("home directory exists");
         path
+    }
+
+    fn workspace_import_root_relative(&self, import_id: &str) -> PathBuf {
+        let canonical = fs::canonicalize(&self.path).expect("workspace path canonicalizes");
+        let mut hasher = Sha256::new();
+        hasher.update(canonical.to_string_lossy().as_bytes());
+        PathBuf::from("home/.skillctl/store/imports/workspace")
+            .join(format!("{:x}", hasher.finalize()))
+            .join(import_id)
+    }
+
+    fn workspace_import_root(&self, import_id: &str) -> PathBuf {
+        self.path
+            .join(self.workspace_import_root_relative(import_id))
     }
 
     fn write_manifest(&self, contents: &str) {

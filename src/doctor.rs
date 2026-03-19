@@ -25,7 +25,7 @@ use crate::{
         self, CLAUDE_FRONTMATTER_FIELDS, OPENAI_METADATA_FILE, SKILL_MANIFEST_FILE,
         SkillDefinition, SkillVendorMetadata,
     },
-    source::imports_store_root,
+    source::{imports_store_root, stored_import_root},
     state::{LocalStateStore, ManagedScope, ManagedSkillRef},
     trust::SkillTrust,
 };
@@ -300,7 +300,7 @@ fn bundled_doctor_artifacts(context: &AppContext) -> Result<BundledDoctorArtifac
         });
     }
 
-    let store = LocalStateStore::open_default()?;
+    let store = LocalStateStore::open_default_for(&context.working_directory)?;
     let managed_skill = ManagedSkillRef::new(ManagedScope::User, "skillctl");
     let snapshot = store.skill_snapshot(&managed_skill)?;
 
@@ -376,7 +376,7 @@ fn bundled_doctor_artifacts(context: &AppContext) -> Result<BundledDoctorArtifac
 }
 
 fn build_bundled_explain_report(context: &AppContext) -> Result<ExplainReport, AppError> {
-    let store = LocalStateStore::open_default()?;
+    let store = LocalStateStore::open_default_for(&context.working_directory)?;
     let managed_skill = ManagedSkillRef::new(ManagedScope::User, "skillctl");
     let snapshot = store.skill_snapshot(&managed_skill)?;
     let plan = bundled_target_plan(context)?;
@@ -738,7 +738,11 @@ fn validate_import(
         return Ok(issues);
     };
 
-    let stored_root = imports_store_root()?.join(&import.id);
+    let stored_root = stored_import_root(
+        managed_scope_from_manifest(import.scope),
+        &context.working_directory,
+        &import.id,
+    )?;
     if let Some(issue) = ensure_directory_issue(
         context,
         "missing-import-store",
@@ -1042,7 +1046,7 @@ fn projection_record_issues(
     plan: &ProjectionPlan,
 ) -> Result<Vec<DiagnosticIssue>, AppError> {
     let mut issues = Vec::new();
-    let store = LocalStateStore::open_default()?;
+    let store = LocalStateStore::open_default_for(&context.working_directory)?;
     let projection_records = store.projection_records(None)?;
     let plan_roots: BTreeMap<_, _> = plan
         .assignments
@@ -1182,7 +1186,7 @@ fn build_explain_report(
         )?)
     };
 
-    let store = LocalStateStore::open_default()?;
+    let store = LocalStateStore::open_default_for(&context.working_directory)?;
     let managed_skill = ManagedSkillRef::new(scope, skill_name);
     let snapshot = store.skill_snapshot(&managed_skill)?;
     let managed_effective_version = snapshot
@@ -1944,13 +1948,22 @@ fn collect_directory_files(
 
     for entry in entries {
         let path = entry.path();
-        let metadata = entry
-            .metadata()
-            .map_err(|source| AppError::FilesystemOperation {
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|source| AppError::FilesystemOperation {
                 action: "inspect skill path",
                 path: path.clone(),
                 source,
             })?;
+
+        if metadata.file_type().is_symlink() {
+            return Err(AppError::ResolutionValidation {
+                message: format!(
+                    "{kind} '{}' contains unsupported symlink '{}'",
+                    root.display(),
+                    path.display()
+                ),
+            });
+        }
 
         if metadata.is_dir() {
             collect_directory_files(root, &path, kind, files)?;
@@ -1981,11 +1994,16 @@ fn collect_directory_files(
 }
 
 fn ensure_directory(path: &Path, label: &'static str) -> Result<(), AppError> {
-    let metadata = fs::metadata(path).map_err(|source| AppError::FilesystemOperation {
+    let metadata = fs::symlink_metadata(path).map_err(|source| AppError::FilesystemOperation {
         action: "inspect skill directory",
         path: path.to_path_buf(),
         source,
     })?;
+    if metadata.file_type().is_symlink() {
+        return Err(AppError::ResolutionValidation {
+            message: format!("{label} '{}' must not be a symlink", path.display()),
+        });
+    }
     if !metadata.is_dir() {
         return Err(AppError::ResolutionValidation {
             message: format!("{label} '{}' must be a directory", path.display()),

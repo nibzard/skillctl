@@ -610,7 +610,7 @@ mod tests {
         "\n",
         "state:\n",
         "  manifest_version: 1\n",
-        "  local_state_version: 1\n",
+        "  local_state_version: 2\n",
     );
 
     const FULL_LOCKFILE: &str = concat!(
@@ -618,7 +618,7 @@ mod tests {
         "\n",
         "state:\n",
         "  manifest_version: 1\n",
-        "  local_state_version: 1\n",
+        "  local_state_version: 2\n",
         "\n",
         "imports:\n",
         "  ai-sdk:\n",
@@ -671,7 +671,7 @@ mod tests {
             "\n",
             "state:\n",
             "  manifest_version: 1\n",
-            "  local_state_version: 1\n",
+            "  local_state_version: 2\n",
             "\n",
             "imports:\n",
             "  ai-sdk:\n",

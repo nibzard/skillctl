@@ -148,7 +148,7 @@ pub fn handle_open(
 
 fn build_app(context: &AppContext) -> Result<TuiApp, AppError> {
     let manifest = load_manifest_or_default(&context.working_directory)?;
-    let store = LocalStateStore::open_default()?;
+    let store = LocalStateStore::open_default_for(&context.working_directory)?;
     let selected_skill = context.selector.skill_name.clone();
     let managed_skills = selected_managed_skills(context, &store)?;
     let mut skills = Vec::with_capacity(managed_skills.len());

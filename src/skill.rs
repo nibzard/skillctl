@@ -22,7 +22,7 @@ use crate::{
     manifest::{ImportDefinition, ManifestScope, WorkspaceManifest},
     materialize, planner,
     response::AppResponse,
-    source::{current_timestamp, imports_store_root},
+    source::{current_timestamp, stored_import_root},
     state::{LocalStateStore, ManagedScope, ManagedSkillRef, ProjectionRecord},
 };
 
@@ -283,7 +283,7 @@ impl PathRequest {
 
 /// Handle `skillctl list`.
 pub fn handle_list(context: &AppContext, _request: ListRequest) -> Result<AppResponse, AppError> {
-    let store = LocalStateStore::open_default()?;
+    let store = LocalStateStore::open_default_for(&context.working_directory)?;
     let installs = store.list_install_records()?;
     if installs.is_empty() {
         return Ok(AppResponse::success("list")
@@ -319,11 +319,11 @@ pub fn handle_list(context: &AppContext, _request: ListRequest) -> Result<AppRes
                 .and_then(|import| manifest.overrides.get(&import.id))
                 .map(|path| path.as_str().to_string()),
             "stored_source_root": lockfile_entry
-                .map(|_| imports_store_root())
+                .map(|_| stored_import_root(install.skill.scope, &context.working_directory, &install.skill.skill_id))
                 .transpose()?
-                .map(|root| root.join(&install.skill.skill_id).display().to_string()),
+                .map(|root| root.display().to_string()),
             "active_source_root": lockfile_entry
-                .map(|entry| imports_store_root().map(|root| root.join(&install.skill.skill_id).join(entry.source.subpath.as_str())))
+                .map(|entry| stored_import_root(install.skill.scope, &context.working_directory, &install.skill.skill_id).map(|root| root.join(entry.source.subpath.as_str())))
                 .transpose()?
                 .map(|path| path.display().to_string()),
             "pinned_reference": snapshot.pin.as_ref().map(|pin| pin.requested_reference.clone()),
@@ -356,7 +356,7 @@ pub fn handle_remove(
     request: RemoveRequest,
 ) -> Result<AppResponse, AppError> {
     lifecycle::run_transaction("remove", |transaction| {
-        let mut store = LocalStateStore::open_default()?;
+        let mut store = LocalStateStore::open_default_for(&context.working_directory)?;
         transaction.track_state_database()?;
         let managed_skill =
             match resolve_installed_skill(&store, request.skill.as_str(), context.selector.scope) {
@@ -430,7 +430,11 @@ pub fn handle_remove(
             }
         }
 
-        let stored_source_root = imports_store_root()?.join(request.skill.as_str());
+        let stored_source_root = stored_import_root(
+            managed_skill.scope,
+            &context.working_directory,
+            request.skill.as_str(),
+        )?;
         transaction.track_path(&stored_source_root)?;
         if remove_directory_if_exists(&stored_source_root, "remove stored import root")? {
             removed_paths.push(stored_source_root.display().to_string());
@@ -500,7 +504,7 @@ pub fn handle_enable(
     request: EnableRequest,
 ) -> Result<AppResponse, AppError> {
     if builtin::is_bundled_request(request.skill.as_str(), context.selector.scope) {
-        let store = LocalStateStore::open_default()?;
+        let store = LocalStateStore::open_default_for(&context.working_directory)?;
         match resolve_installed_skill(&store, request.skill.as_str(), context.selector.scope) {
             Ok(managed_skill) => {
                 let install_record = store.install_record(&managed_skill)?.ok_or_else(|| {
@@ -533,7 +537,7 @@ pub fn handle_disable(
 pub fn handle_path(context: &AppContext, request: PathRequest) -> Result<AppResponse, AppError> {
     let manifest = load_manifest_or_default(&context.working_directory)?;
     let lockfile = load_lockfile_or_default(&context.working_directory)?;
-    let store = LocalStateStore::open_default()?;
+    let store = LocalStateStore::open_default_for(&context.working_directory)?;
     let managed_skill =
         resolve_installed_skill(&store, request.skill.as_str(), context.selector.scope)?;
     let install_record =
@@ -568,11 +572,11 @@ pub fn handle_path(context: &AppContext, request: PathRequest) -> Result<AppResp
             "managed_import": managed_import.is_some(),
             "managed_import_enabled": managed_import.map(|import| import.enabled),
             "stored_source_root": lockfile_entry
-                .map(|_| imports_store_root())
+                .map(|_| stored_import_root(managed_skill.scope, &context.working_directory, request.skill.as_str()))
                 .transpose()?
-                .map(|root| root.join(request.skill.as_str()).display().to_string()),
+                .map(|root| root.display().to_string()),
             "active_source_root": lockfile_entry
-                .map(|entry| imports_store_root().map(|root| root.join(request.skill.as_str()).join(entry.source.subpath.as_str())))
+                .map(|entry| stored_import_root(managed_skill.scope, &context.working_directory, request.skill.as_str()).map(|root| root.join(entry.source.subpath.as_str())))
                 .transpose()?
                 .map(|path| path.display().to_string()),
             "overlay_root": managed_import
@@ -732,7 +736,7 @@ fn toggle_managed_import(
 ) -> Result<AppResponse, AppError> {
     lifecycle::run_transaction(command, |transaction| {
         let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
-        let mut store = LocalStateStore::open_default()?;
+        let mut store = LocalStateStore::open_default_for(&context.working_directory)?;
         transaction.track_path(&manifest.path)?;
         transaction.track_state_database()?;
         let managed_skill = resolve_installed_skill(&store, skill, context.selector.scope)?;

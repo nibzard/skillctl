@@ -84,6 +84,7 @@ fn workspace_copy_mode_matrix_matches_spec_target_combinations() {
         let assert = Command::cargo_bin("skillctl")
             .expect("binary exists")
             .current_dir(workspace.path())
+            .env("HOME", workspace.home_path())
             .args(["--json", "sync"])
             .assert()
             .success()

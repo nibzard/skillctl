@@ -10,7 +10,7 @@ pub const MINIMAL_LOCKFILE: &str = concat!(
     "\n",
     "state:\n",
     "  manifest_version: 1\n",
-    "  local_state_version: 1\n",
+    "  local_state_version: 2\n",
 );
 
 pub struct TestWorkspace {

@@ -19,13 +19,13 @@ use crate::{
     lifecycle,
     lockfile::{LockfileTimestamp, WorkspaceLockfile},
     manifest::{ManifestScope, WorkspaceManifest},
-    materialize::{self, MaterializationReport},
+    materialize,
     overlay::{NO_OVERLAY_HASH, hash_overlay_root},
     response::AppResponse,
     skill,
     source::{
         SourceKind, compute_effective_version_hash, copy_source_tree, current_timestamp,
-        hash_directory_contents, imports_store_root,
+        hash_directory_contents, stored_import_root,
     },
     state::{
         HistoryDetails, HistoryEntry, HistoryQuery, InstallRecord, LocalModificationRecord,
@@ -154,11 +154,15 @@ impl<'store> HistoryLedger<'store> {
             ),
             details: install_details(record, trust),
         };
+        let workspace_key = self
+            .store
+            .workspace_key_for_scope(record.skill.scope)
+            .to_string();
 
         self.store
             .with_transaction("record install", |connection, path| {
-                upsert_install_record_in(connection, path, record)?;
-                insert_history_entry_in(connection, path, &entry)
+                upsert_install_record_in(connection, path, &workspace_key, record)?;
+                insert_history_entry_in(connection, path, &workspace_key, &entry)
             })
     }
 
@@ -183,11 +187,15 @@ impl<'store> HistoryLedger<'store> {
             summary: format!("Checked {} for updates", record.skill.skill_id),
             details: update_check_details(record, trust),
         };
+        let workspace_key = self
+            .store
+            .workspace_key_for_scope(record.skill.scope)
+            .to_string();
 
         self.store
             .with_transaction("record update check", |connection, path| {
-                insert_update_check_record_in(connection, path, record)?;
-                insert_history_entry_in(connection, path, &entry)
+                insert_update_check_record_in(connection, path, &workspace_key, record)?;
+                insert_history_entry_in(connection, path, &workspace_key, &entry)
             })
     }
 
@@ -213,11 +221,15 @@ impl<'store> HistoryLedger<'store> {
             ),
             details,
         };
+        let workspace_key = self
+            .store
+            .workspace_key_for_scope(record.skill.scope)
+            .to_string();
 
         self.store
             .with_transaction("record applied update", |connection, path| {
-                upsert_install_record_in(connection, path, record)?;
-                insert_history_entry_in(connection, path, &entry)
+                upsert_install_record_in(connection, path, &workspace_key, record)?;
+                insert_history_entry_in(connection, path, &workspace_key, &entry)
             })
     }
 
@@ -237,11 +249,15 @@ impl<'store> HistoryLedger<'store> {
             ),
             details: projection_details(record),
         };
+        let workspace_key = self
+            .store
+            .workspace_key_for_scope(record.skill.scope)
+            .to_string();
 
         self.store
             .with_transaction("record projection", |connection, path| {
-                upsert_projection_record_in(connection, path, record)?;
-                insert_history_entry_in(connection, path, &entry)
+                upsert_projection_record_in(connection, path, &workspace_key, record)?;
+                insert_history_entry_in(connection, path, &workspace_key, &entry)
             })
     }
 
@@ -260,11 +276,15 @@ impl<'store> HistoryLedger<'store> {
             summary: format!("Detected local modification for {}", record.skill.skill_id),
             details: local_modification_details(record),
         };
+        let workspace_key = self
+            .store
+            .workspace_key_for_scope(record.skill.scope)
+            .to_string();
 
         self.store
             .with_transaction("record local modification", |connection, path| {
-                insert_local_modification_record_in(connection, path, record)?;
-                insert_history_entry_in(connection, path, &entry)
+                insert_local_modification_record_in(connection, path, &workspace_key, record)?;
+                insert_history_entry_in(connection, path, &workspace_key, &entry)
             })
     }
 
@@ -283,11 +303,15 @@ impl<'store> HistoryLedger<'store> {
             ),
             details: pin_details(record),
         };
+        let workspace_key = self
+            .store
+            .workspace_key_for_scope(record.skill.scope)
+            .to_string();
 
         self.store
             .with_transaction("record pin", |connection, path| {
-                upsert_pin_record_in(connection, path, record)?;
-                insert_history_entry_in(connection, path, &entry)
+                upsert_pin_record_in(connection, path, &workspace_key, record)?;
+                insert_history_entry_in(connection, path, &workspace_key, &entry)
             })
     }
 
@@ -303,11 +327,15 @@ impl<'store> HistoryLedger<'store> {
             summary: format!("Rolled back {}", record.skill.skill_id),
             details: rollback_details(record),
         };
+        let workspace_key = self
+            .store
+            .workspace_key_for_scope(record.skill.scope)
+            .to_string();
 
         self.store
             .with_transaction("record rollback", |connection, path| {
-                insert_rollback_record_in(connection, path, record)?;
-                insert_history_entry_in(connection, path, &entry)
+                insert_rollback_record_in(connection, path, &workspace_key, record)?;
+                insert_history_entry_in(connection, path, &workspace_key, &entry)
             })
     }
 
@@ -359,11 +387,15 @@ impl<'store> HistoryLedger<'store> {
             summary: format!("Detached {} into {}", record.skill.skill_id, local_root),
             details,
         };
+        let workspace_key = self
+            .store
+            .workspace_key_for_scope(record.skill.scope)
+            .to_string();
 
         self.store
             .with_transaction("record detach", |connection, path| {
-                upsert_install_record_in(connection, path, record)?;
-                insert_history_entry_in(connection, path, &entry)
+                upsert_install_record_in(connection, path, &workspace_key, record)?;
+                insert_history_entry_in(connection, path, &workspace_key, &entry)
             })
     }
 
@@ -393,11 +425,15 @@ impl<'store> HistoryLedger<'store> {
             summary: format!("Forked {} into {}", record.skill.skill_id, local_root),
             details,
         };
+        let workspace_key = self
+            .store
+            .workspace_key_for_scope(record.skill.scope)
+            .to_string();
 
         self.store
             .with_transaction("record fork", |connection, path| {
-                upsert_install_record_in(connection, path, record)?;
-                insert_history_entry_in(connection, path, &entry)
+                upsert_install_record_in(connection, path, &workspace_key, record)?;
+                insert_history_entry_in(connection, path, &workspace_key, &entry)
             })
     }
 
@@ -460,11 +496,15 @@ impl<'store> HistoryLedger<'store> {
             summary: format!("Telemetry consent changed to {}", settings.consent.as_str()),
             details,
         };
+        let workspace_key = self
+            .store
+            .workspace_key_for_history_scope(entry.scope)
+            .to_string();
 
         self.store
             .with_transaction("record telemetry change", |connection, path| {
                 upsert_telemetry_settings_in(connection, path, settings)?;
-                insert_history_entry_in(connection, path, &entry)
+                insert_history_entry_in(connection, path, &workspace_key, &entry)
             })
     }
 
@@ -528,7 +568,7 @@ pub fn handle_pin(context: &AppContext, request: PinRequest) -> Result<AppRespon
     lifecycle::run_transaction("pin", |transaction| {
         let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
         let mut lockfile = WorkspaceLockfile::load_from_workspace(&context.working_directory)?;
-        let mut store = LocalStateStore::open_default()?;
+        let mut store = LocalStateStore::open_default_for(&context.working_directory)?;
         transaction.track_path(&manifest.path)?;
         transaction.track_path(&lockfile.path)?;
         transaction.track_state_database()?;
@@ -557,7 +597,11 @@ pub fn handle_pin(context: &AppContext, request: PinRequest) -> Result<AppRespon
         let import_index =
             managed_import_index(&manifest, &managed_skill.skill_id, managed_skill.scope)?;
         let import_id = manifest.imports[import_index].id.clone();
-        transaction.track_path(imports_store_root()?.join(&import_id))?;
+        transaction.track_path(stored_import_root(
+            managed_skill.scope,
+            &context.working_directory,
+            &import_id,
+        )?)?;
         let lockfile_entry =
             lockfile
                 .imports
@@ -595,7 +639,10 @@ pub fn handle_pin(context: &AppContext, request: PinRequest) -> Result<AppRespon
         manifest.write_to_path()?;
         lockfile.write_to_path()?;
 
-        copy_source_tree(&checked_out.root, &imports_store_root()?.join(&import_id))?;
+        copy_source_tree(
+            &checked_out.root,
+            &stored_import_root(managed_skill.scope, &context.working_directory, &import_id)?,
+        )?;
 
         let sync_report = materialize::sync_workspace(&scoped_context)?;
 
@@ -619,13 +666,20 @@ pub fn handle_pin(context: &AppContext, request: PinRequest) -> Result<AppRespon
         };
 
         store.upsert_install_record(&updated_install)?;
-        let projection_records = projection_records_for_skill(
+        let projection_records = materialize::rebuild_projection_records_for_scope(
+            &mut store,
+            managed_skill.scope,
             &sync_report,
-            &managed_skill,
-            &effective_version_hash,
             &timestamp,
-        );
+        )?;
         let mut ledger = HistoryLedger::new(&mut store);
+        materialize::record_pruned_projection_history(
+            &mut ledger,
+            context,
+            managed_skill.scope,
+            &sync_report,
+            &timestamp,
+        )?;
         ledger.record_pin(&pin_record)?;
         for record in projection_records {
             ledger.record_projection(&record)?;
@@ -661,7 +715,7 @@ pub fn handle_rollback(
     lifecycle::run_transaction("rollback", |transaction| {
         let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
         let mut lockfile = WorkspaceLockfile::load_from_workspace(&context.working_directory)?;
-        let mut store = LocalStateStore::open_default()?;
+        let mut store = LocalStateStore::open_default_for(&context.working_directory)?;
         transaction.track_path(&manifest.path)?;
         transaction.track_path(&lockfile.path)?;
         transaction.track_state_database()?;
@@ -690,7 +744,11 @@ pub fn handle_rollback(
         let import_index =
             managed_import_index(&manifest, &managed_skill.skill_id, managed_skill.scope)?;
         let import_id = manifest.imports[import_index].id.clone();
-        transaction.track_path(imports_store_root()?.join(&import_id))?;
+        transaction.track_path(stored_import_root(
+            managed_skill.scope,
+            &context.working_directory,
+            &import_id,
+        )?)?;
         let lockfile_entry =
             lockfile
                 .imports
@@ -740,7 +798,10 @@ pub fn handle_rollback(
         manifest.write_to_path()?;
         lockfile.write_to_path()?;
 
-        copy_source_tree(&checked_out.root, &imports_store_root()?.join(&import_id))?;
+        copy_source_tree(
+            &checked_out.root,
+            &stored_import_root(managed_skill.scope, &context.working_directory, &import_id)?,
+        )?;
 
         let sync_report = materialize::sync_workspace(&scoped_context)?;
 
@@ -772,13 +833,20 @@ pub fn handle_rollback(
 
         store.upsert_install_record(&updated_install)?;
         store.upsert_pin_record(&pin_record)?;
-        let projection_records = projection_records_for_skill(
+        let projection_records = materialize::rebuild_projection_records_for_scope(
+            &mut store,
+            managed_skill.scope,
             &sync_report,
-            &managed_skill,
-            &effective_version_hash,
             &timestamp,
-        );
+        )?;
         let mut ledger = HistoryLedger::new(&mut store);
+        materialize::record_pruned_projection_history(
+            &mut ledger,
+            context,
+            managed_skill.scope,
+            &sync_report,
+            &timestamp,
+        )?;
         ledger.record_rollback(&rollback_record)?;
         for record in projection_records {
             ledger.record_projection(&record)?;
@@ -824,7 +892,7 @@ pub fn handle_history(
         (None, Some(global)) => Some(global.clone()),
         (None, None) => None,
     };
-    let store = LocalStateStore::open_default()?;
+    let store = LocalStateStore::open_default_for(&context.working_directory)?;
 
     let (query, filter) = match requested_skill {
         Some(skill_name) => {
@@ -937,50 +1005,6 @@ pub(crate) fn context_for_scope(context: &AppContext, scope: ManagedScope) -> Ap
         ManagedScope::User => Scope::User,
     });
     scoped
-}
-
-pub(crate) fn projection_records_for_skill(
-    sync_report: &MaterializationReport,
-    skill: &ManagedSkillRef,
-    effective_version_hash: &str,
-    generated_at: &str,
-) -> Vec<ProjectionRecord> {
-    let targets_by_root: BTreeMap<_, _> = sync_report
-        .plan
-        .physical_roots
-        .iter()
-        .map(|root| (root.path.clone(), root.targets.clone()))
-        .collect();
-    let mut records = Vec::new();
-    let generation_mode = sync_report.recorded_generation_mode();
-
-    for generated_root in &sync_report.generated_roots {
-        if !generated_root
-            .materialized
-            .iter()
-            .any(|name| name == &skill.skill_id)
-        {
-            continue;
-        }
-
-        let Some(targets) = targets_by_root.get(&generated_root.path) else {
-            continue;
-        };
-
-        for target in targets {
-            records.push(ProjectionRecord {
-                skill: skill.clone(),
-                target: *target,
-                generation_mode,
-                physical_root: generated_root.path.clone(),
-                projected_path: skill.skill_id.clone(),
-                effective_version_hash: effective_version_hash.to_string(),
-                generated_at: generated_at.to_string(),
-            });
-        }
-    }
-
-    records
 }
 
 #[derive(Debug)]

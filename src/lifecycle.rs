@@ -92,7 +92,7 @@ enum SnapshotState {
     Missing,
     File(PathBuf),
     Directory(PathBuf),
-    Symlink(PathBuf),
+    Symlink { target: PathBuf, is_dir: bool },
 }
 
 fn snapshot_path(path: &Path, backup_root: &Path, index: usize) -> Result<SnapshotState, AppError> {
@@ -112,13 +112,15 @@ fn snapshot_path(path: &Path, backup_root: &Path, index: usize) -> Result<Snapsh
     };
 
     if metadata.file_type().is_symlink() {
-        return fs::read_link(path)
-            .map(SnapshotState::Symlink)
-            .map_err(|source| AppError::FilesystemOperation {
-                action: "read lifecycle symlink",
-                path: path.to_path_buf(),
-                source,
-            });
+        let target = fs::read_link(path).map_err(|source| AppError::FilesystemOperation {
+            action: "read lifecycle symlink",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let is_dir = fs::metadata(path)
+            .map(|metadata| metadata.is_dir())
+            .unwrap_or(false);
+        return Ok(SnapshotState::Symlink { target, is_dir });
     }
 
     if metadata.is_dir() {
@@ -145,7 +147,7 @@ fn restore_path(path: &Path, snapshot: &SnapshotState) -> Result<(), AppError> {
     remove_existing_path(path)?;
 
     match snapshot {
-        SnapshotState::Missing => Ok(()),
+        SnapshotState::Missing => prune_empty_parents(path),
         SnapshotState::File(backup_path) => {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(|source| AppError::FilesystemOperation {
@@ -164,7 +166,7 @@ fn restore_path(path: &Path, snapshot: &SnapshotState) -> Result<(), AppError> {
         SnapshotState::Directory(backup_path) => {
             copy_tree(backup_path, path, "restore lifecycle directory")
         }
-        SnapshotState::Symlink(target) => {
+        SnapshotState::Symlink { target, is_dir } => {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(|source| AppError::FilesystemOperation {
                     action: "create lifecycle symlink parent",
@@ -172,9 +174,30 @@ fn restore_path(path: &Path, snapshot: &SnapshotState) -> Result<(), AppError> {
                     source,
                 })?;
             }
-            create_symlink(target, path)
+            create_symlink(target, path, *is_dir)
         }
     }
+}
+
+fn prune_empty_parents(path: &Path) -> Result<(), AppError> {
+    let mut current = path.parent();
+    while let Some(parent) = current {
+        match fs::remove_dir(parent) {
+            Ok(()) => current = parent.parent(),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => break,
+            Err(source) if source.kind() == io::ErrorKind::DirectoryNotEmpty => break,
+            Err(source) if source.kind() == io::ErrorKind::PermissionDenied => break,
+            Err(source) => {
+                return Err(AppError::FilesystemOperation {
+                    action: "prune empty lifecycle parent directory",
+                    path: parent.to_path_buf(),
+                    source,
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn remove_existing_path(path: &Path) -> Result<(), AppError> {
@@ -229,7 +252,10 @@ fn copy_tree(source: &Path, destination: &Path, action: &'static str) -> Result<
                 source: source_error,
             })?;
         }
-        return create_symlink(&target, destination);
+        let is_dir = fs::metadata(source)
+            .map(|metadata| metadata.is_dir())
+            .unwrap_or(false);
+        return create_symlink(&target, destination, is_dir);
     }
 
     if metadata.is_dir() {
@@ -273,7 +299,7 @@ fn copy_tree(source: &Path, destination: &Path, action: &'static str) -> Result<
 }
 
 #[cfg(unix)]
-fn create_symlink(target: &Path, destination: &Path) -> Result<(), AppError> {
+fn create_symlink(target: &Path, destination: &Path, _is_dir: bool) -> Result<(), AppError> {
     std::os::unix::fs::symlink(target, destination).map_err(|source| {
         AppError::FilesystemOperation {
             action: "restore lifecycle symlink",
@@ -284,12 +310,15 @@ fn create_symlink(target: &Path, destination: &Path) -> Result<(), AppError> {
 }
 
 #[cfg(windows)]
-fn create_symlink(target: &Path, destination: &Path) -> Result<(), AppError> {
-    std::os::windows::fs::symlink_file(target, destination).map_err(|source| {
-        AppError::FilesystemOperation {
-            action: "restore lifecycle symlink",
-            path: destination.to_path_buf(),
-            source,
-        }
+fn create_symlink(target: &Path, destination: &Path, is_dir: bool) -> Result<(), AppError> {
+    let create = if is_dir {
+        std::os::windows::fs::symlink_dir
+    } else {
+        std::os::windows::fs::symlink_file
+    };
+    create(target, destination).map_err(|source| AppError::FilesystemOperation {
+        action: "restore lifecycle symlink",
+        path: destination.to_path_buf(),
+        source,
     })
 }

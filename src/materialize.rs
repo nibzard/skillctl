@@ -22,7 +22,7 @@ use crate::{
     planner::{self, ProjectionPlan},
     resolver::{self, InternalSkillId, ProjectionOutcome, ResolvedSkillCandidate, SkillScope},
     response::AppResponse,
-    source::{current_timestamp, imports_store_root},
+    source::{current_timestamp, imports_scope_root},
     state::{
         LocalStateStore, ManagedScope, ManagedSkillRef, ProjectionMode as RecordedProjectionMode,
         ProjectionRecord,
@@ -272,7 +272,7 @@ pub fn handle_sync(context: &AppContext, _request: SyncRequest) -> Result<AppRes
 
         let report = sync_workspace(context)?;
         let timestamp = current_timestamp();
-        let mut store = LocalStateStore::open_default()?;
+        let mut store = LocalStateStore::open_default_for(&context.working_directory)?;
         let current_projections = rebuild_projection_records_for_scope(
             &mut store,
             managed_scope(scope),
@@ -313,14 +313,21 @@ pub fn handle_clean(context: &AppContext, _request: CleanRequest) -> Result<AppR
         for (_, root) in cleanup_candidate_roots(context, &manifest)? {
             transaction.track_path(root)?;
         }
-        transaction.track_path(imports_store_root()?)?;
+        transaction.track_path(imports_scope_root(
+            ManagedScope::Workspace,
+            &context.working_directory,
+        )?)?;
+        transaction.track_path(imports_scope_root(
+            ManagedScope::User,
+            &context.working_directory,
+        )?)?;
         transaction.track_path(
             context
                 .working_directory
                 .join(UNUSED_IMPORTS_PLACEHOLDER_DIR),
         )?;
 
-        let mut store = LocalStateStore::open_default()?;
+        let mut store = LocalStateStore::open_default_for(&context.working_directory)?;
         let installs = store.list_install_records()?;
         let had_projection_records = !store.projection_records(None)?.is_empty();
         let timestamp = current_timestamp();
@@ -510,59 +517,103 @@ fn clean_unused_import_state(
     lockfile: &WorkspaceLockfile,
 ) -> Result<Vec<CleanedPath>, AppError> {
     let mut cleaned = Vec::new();
-    let imports_root = imports_store_root()?;
-    let referenced_imports: BTreeSet<_> = manifest
+    let workspace_referenced: BTreeSet<_> = manifest
         .imports
         .iter()
+        .filter(|import| import.scope == crate::manifest::ManifestScope::Workspace)
         .map(|import| import.id.clone())
-        .chain(lockfile.imports.keys().cloned())
+        .chain(
+            lockfile
+                .imports
+                .keys()
+                .filter(|id| {
+                    manifest
+                        .imports
+                        .iter()
+                        .find(|import| &import.id == *id)
+                        .is_some_and(|import| {
+                            import.scope == crate::manifest::ManifestScope::Workspace
+                        })
+                })
+                .cloned(),
+        )
+        .collect();
+    let user_referenced: BTreeSet<_> = manifest
+        .imports
+        .iter()
+        .filter(|import| import.scope == crate::manifest::ManifestScope::User)
+        .map(|import| import.id.clone())
+        .chain(
+            lockfile
+                .imports
+                .keys()
+                .filter(|id| {
+                    manifest
+                        .imports
+                        .iter()
+                        .find(|import| &import.id == *id)
+                        .is_some_and(|import| import.scope == crate::manifest::ManifestScope::User)
+                })
+                .cloned(),
+        )
         .collect();
 
-    let entries = match fs::read_dir(&imports_root) {
-        Ok(entries) => entries,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(cleaned),
-        Err(source) => {
-            return Err(AppError::FilesystemOperation {
-                action: "read imports store root",
-                path: imports_root,
-                source,
-            });
-        }
-    };
+    for (root, referenced) in [
+        (
+            imports_scope_root(ManagedScope::Workspace, &context.working_directory)?,
+            workspace_referenced,
+        ),
+        (
+            imports_scope_root(ManagedScope::User, &context.working_directory)?,
+            user_referenced,
+        ),
+    ] {
+        let entries = match fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(AppError::FilesystemOperation {
+                    action: "read imports store root",
+                    path: root,
+                    source,
+                });
+            }
+        };
 
-    for entry in entries {
-        let entry = entry.map_err(|source| AppError::FilesystemOperation {
-            action: "read imports store entry",
-            path: imports_root.clone(),
-            source,
-        })?;
-        let path = entry.path();
-        let metadata = entry
-            .file_type()
-            .map_err(|source| AppError::FilesystemOperation {
-                action: "inspect imports store entry",
+        for entry in entries {
+            let entry = entry.map_err(|source| AppError::FilesystemOperation {
+                action: "read imports store entry",
+                path: root.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            let metadata = entry
+                .file_type()
+                .map_err(|source| AppError::FilesystemOperation {
+                    action: "inspect imports store entry",
+                    path: path.clone(),
+                    source,
+                })?;
+            if !metadata.is_dir() {
+                continue;
+            }
+
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if referenced.contains(&name) {
+                continue;
+            }
+
+            fs::remove_dir_all(&path).map_err(|source| AppError::FilesystemOperation {
+                action: "remove unused import state",
                 path: path.clone(),
                 source,
             })?;
-        if !metadata.is_dir() {
-            continue;
+            cleaned.push(CleanedPath {
+                scope: None,
+                skill: None,
+                path: path.display().to_string(),
+            });
         }
-
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if referenced_imports.contains(&name) {
-            continue;
-        }
-
-        fs::remove_dir_all(&path).map_err(|source| AppError::FilesystemOperation {
-            action: "remove unused import state",
-            path: path.clone(),
-            source,
-        })?;
-        cleaned.push(CleanedPath {
-            scope: None,
-            skill: None,
-            path: path.display().to_string(),
-        });
     }
 
     let placeholder = context

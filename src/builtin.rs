@@ -100,7 +100,7 @@ fn ensure_bundled_skill_with_transaction(
 
 fn ensure_bundled_skill_inner(context: &AppContext, force: bool) -> Result<bool, AppError> {
     let skill = bundled_skill_ref();
-    let mut store = LocalStateStore::open_default()?;
+    let mut store = LocalStateStore::open_default_for(&context.working_directory)?;
     let existing = store.install_record(&skill)?;
 
     if let Some(record) = &existing {
@@ -196,7 +196,7 @@ pub(crate) fn handle_remove(context: &AppContext) -> Result<AppResponse, AppErro
         track_bundled_roots(context, transaction)?;
 
         let skill = bundled_skill_ref();
-        let mut store = LocalStateStore::open_default()?;
+        let mut store = LocalStateStore::open_default_for(&context.working_directory)?;
         let timestamp = current_timestamp();
         let removed_paths = prune_owned_projections(context)?;
 
@@ -235,7 +235,7 @@ pub(crate) fn handle_remove(context: &AppContext) -> Result<AppResponse, AppErro
 
 pub(crate) fn handle_enable(context: &AppContext) -> Result<AppResponse, AppError> {
     let changed = ensure_bundled_skill_with_transaction(context, true, "bundled-enable")?;
-    let projections = LocalStateStore::open_default()?
+    let projections = LocalStateStore::open_default_for(&context.working_directory)?
         .projection_records(Some(&bundled_skill_ref()))?
         .into_iter()
         .map(|projection| projection_view(context, &projection))
@@ -341,7 +341,7 @@ pub(crate) fn planned_root_views(context: &AppContext) -> Result<Vec<Value>, App
 }
 
 pub(crate) fn diagnostics(context: &AppContext) -> Result<Vec<BundledSkillDiagnostic>, AppError> {
-    let store = LocalStateStore::open_default()?;
+    let store = LocalStateStore::open_default_for(&context.working_directory)?;
     if store.install_record(&bundled_skill_ref())?.is_none() && is_explicitly_removed(&store)? {
         return Ok(vec![BundledSkillDiagnostic {
             code: "bundled-skill-removed".to_string(),

@@ -20,7 +20,7 @@ use crate::{
     materialize::{self, PROJECTION_METADATA_FILE},
     response::AppResponse,
     skill::SKILL_MANIFEST_FILE,
-    source::{compute_effective_version_hash, current_timestamp, imports_store_root},
+    source::{compute_effective_version_hash, current_timestamp, stored_import_root},
     state::{LocalStateStore, ManagedScope, ManagedSkillRef},
 };
 
@@ -80,7 +80,7 @@ pub fn handle_override(
     lifecycle::run_transaction("override", |transaction| {
         let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
         let mut lockfile = WorkspaceLockfile::load_from_workspace(&context.working_directory)?;
-        let mut store = LocalStateStore::open_default()?;
+        let mut store = LocalStateStore::open_default_for(&context.working_directory)?;
         transaction.track_path(&manifest.path)?;
         transaction.track_path(&lockfile.path)?;
         transaction.track_state_database()?;
@@ -113,9 +113,9 @@ pub fn handle_override(
             }
         })?;
         let mut pin_record = store.pin_record(&managed_skill)?;
-        let stored_skill_root = imports_store_root()?
-            .join(&import.id)
-            .join(lockfile_entry.source.subpath.as_str());
+        let stored_skill_root =
+            stored_import_root(managed_skill.scope, &context.working_directory, &import.id)?
+                .join(lockfile_entry.source.subpath.as_str());
         let source_manifest = stored_skill_root.join(SKILL_MANIFEST_FILE);
         ensure_file(&source_manifest, "inspect stored imported skill manifest")?;
 
@@ -215,7 +215,7 @@ pub fn handle_fork(context: &AppContext, request: ForkRequest) -> Result<AppResp
     lifecycle::run_transaction("fork", |transaction| {
         let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
         let mut lockfile = WorkspaceLockfile::load_from_workspace(&context.working_directory)?;
-        let mut store = LocalStateStore::open_default()?;
+        let mut store = LocalStateStore::open_default_for(&context.working_directory)?;
         transaction.track_path(&manifest.path)?;
         transaction.track_path(&lockfile.path)?;
         transaction.track_state_database()?;
@@ -277,9 +277,9 @@ pub fn handle_fork(context: &AppContext, request: ForkRequest) -> Result<AppResp
             }
         })?;
 
-        let stored_skill_root = imports_store_root()?
-            .join(&import.id)
-            .join(lockfile_entry.source.subpath.as_str());
+        let stored_skill_root =
+            stored_import_root(managed_skill.scope, &context.working_directory, &import.id)?
+                .join(lockfile_entry.source.subpath.as_str());
         ensure_directory_path(&stored_skill_root, "inspect stored imported skill")?;
 
         let local_root_relative = ManifestPath::new(format!(
@@ -336,14 +336,24 @@ pub fn handle_fork(context: &AppContext, request: ForkRequest) -> Result<AppResp
 
         let sync_report = materialize::sync_workspace(&scoped_context)?;
 
-        let projection_records = history::projection_records_for_skill(
+        {
+            let mut ledger = HistoryLedger::new(&mut store);
+            ledger.record_fork(&install_record, local_root_relative.as_str())?;
+        }
+        let projection_records = materialize::rebuild_projection_records_for_scope(
+            &mut store,
+            managed_skill.scope,
             &sync_report,
-            &managed_skill,
-            &install_record.effective_version_hash,
             &timestamp,
-        );
+        )?;
         let mut ledger = HistoryLedger::new(&mut store);
-        ledger.record_fork(&install_record, local_root_relative.as_str())?;
+        materialize::record_pruned_projection_history(
+            &mut ledger,
+            context,
+            managed_skill.scope,
+            &sync_report,
+            &timestamp,
+        )?;
         for record in projection_records {
             ledger.record_projection(&record)?;
         }
@@ -680,7 +690,12 @@ fn ensure_directory_path(path: &Path, action: &'static str) -> Result<(), AppErr
 }
 
 pub(crate) fn hash_overlay_root(root: &Path) -> Result<String, AppError> {
-    match fs::metadata(root) {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(AppError::ResolutionValidation {
+                message: format!("overlay root '{}' must not be a symlink", root.display()),
+            });
+        }
         Ok(metadata) if !metadata.is_dir() => {
             return Err(AppError::PathConflict {
                 path: root.to_path_buf(),
@@ -740,13 +755,22 @@ fn collect_overlay_files(
 
     for entry in entries {
         let path = entry.path();
-        let metadata = entry
-            .metadata()
-            .map_err(|source| AppError::FilesystemOperation {
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|source| AppError::FilesystemOperation {
                 action: "inspect overlay path",
                 path: path.clone(),
                 source,
             })?;
+
+        if metadata.file_type().is_symlink() {
+            return Err(AppError::ResolutionValidation {
+                message: format!(
+                    "overlay '{}' contains unsupported symlink '{}'",
+                    root.display(),
+                    path.display()
+                ),
+            });
+        }
 
         if metadata.is_dir() {
             collect_overlay_files(root, &path, files)?;
@@ -825,4 +849,50 @@ fn hash_file(path: &Path, hasher: &mut Sha256) -> Result<(), AppError> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    #[cfg(unix)]
+    #[test]
+    fn hash_overlay_root_rejects_symlinked_roots() {
+        let temp = tempdir().expect("tempdir exists");
+        let source_root = temp.path().join("source-overlay");
+        let link_root = temp.path().join("overlay-link");
+        fs::create_dir_all(&source_root).expect("source root exists");
+        fs::write(source_root.join("SKILL.md"), "# Overlay\n").expect("overlay manifest exists");
+        symlink(&source_root, &link_root).expect("symlinked root exists");
+
+        let error = hash_overlay_root(&link_root).expect_err("symlinked roots must be rejected");
+
+        assert!(
+            error.to_string().contains("must not be a symlink"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hash_overlay_root_rejects_symlinked_entries() {
+        let temp = tempdir().expect("tempdir exists");
+        let overlay_root = temp.path().join("overlay");
+        let external_file = temp.path().join("external.md");
+        fs::create_dir_all(&overlay_root).expect("overlay root exists");
+        fs::write(&external_file, "# External\n").expect("external file exists");
+        symlink(&external_file, overlay_root.join("SKILL.md")).expect("symlinked entry exists");
+
+        let error =
+            hash_overlay_root(&overlay_root).expect_err("symlinked overlay entries must fail");
+
+        assert!(
+            error.to_string().contains("unsupported symlink"),
+            "unexpected error: {error}"
+        );
+    }
 }

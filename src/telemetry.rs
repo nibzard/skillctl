@@ -87,7 +87,7 @@ pub fn handle_command(
     let workspace = load_workspace_telemetry_config(&context.working_directory)?;
     match command {
         TelemetryCommand::Status => {
-            let store = LocalStateStore::open_default()?;
+            let store = LocalStateStore::open_default_for(&context.working_directory)?;
             let persisted = store.telemetry_settings()?;
             let report = build_report(&workspace, persisted.as_ref(), None, Vec::new(), None);
 
@@ -95,12 +95,18 @@ pub fn handle_command(
                 .with_summary(status_summary(&report))
                 .with_data(serde_json::to_value(report)?))
         }
-        TelemetryCommand::Enable => {
-            update_consent("telemetry-enable", &workspace, TelemetryConsent::Enabled)
-        }
-        TelemetryCommand::Disable => {
-            update_consent("telemetry-disable", &workspace, TelemetryConsent::Disabled)
-        }
+        TelemetryCommand::Enable => update_consent(
+            context,
+            "telemetry-enable",
+            &workspace,
+            TelemetryConsent::Enabled,
+        ),
+        TelemetryCommand::Disable => update_consent(
+            context,
+            "telemetry-disable",
+            &workspace,
+            TelemetryConsent::Disabled,
+        ),
     }
 }
 
@@ -181,7 +187,7 @@ pub(crate) fn prepare_install_report(
     installed: &[InstalledSkill],
 ) -> Result<TelemetryReport, AppError> {
     let workspace = load_workspace_telemetry_config(&context.working_directory)?;
-    let mut store = LocalStateStore::open_default()?;
+    let mut store = LocalStateStore::open_default_for(&context.working_directory)?;
     let (persisted, notice) = ensure_first_run_notice(&mut store)?;
     let effective = effective_settings(&workspace, Some(&persisted));
     let visibility = classify_source_visibility(source);
@@ -204,7 +210,7 @@ pub(crate) fn prepare_update_report(
     plans: &[SkillUpdatePlan],
 ) -> Result<TelemetryReport, AppError> {
     let workspace = load_workspace_telemetry_config(&context.working_directory)?;
-    let mut store = LocalStateStore::open_default()?;
+    let mut store = LocalStateStore::open_default_for(&context.working_directory)?;
     let (persisted, notice) = ensure_first_run_notice(&mut store)?;
     let effective = effective_settings(&workspace, Some(&persisted));
     let events = plans
@@ -306,11 +312,12 @@ fn suppression_reason(
 }
 
 fn update_consent(
+    context: &AppContext,
     command: &'static str,
     workspace: &ManifestTelemetryConfig,
     consent: TelemetryConsent,
 ) -> Result<AppResponse, AppError> {
-    let mut store = LocalStateStore::open_default()?;
+    let mut store = LocalStateStore::open_default_for(&context.working_directory)?;
     let current = store.telemetry_settings()?;
     let timestamp = current_timestamp();
     let notice_seen_at = current
