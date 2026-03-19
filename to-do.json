@@ -790,6 +790,25 @@
         "tests/cli.rs"
       ],
       "updated_at": "2026-03-19T16:03:12Z"
+    },
+    {
+      "id": "T029",
+      "title": "Align the curl installer with the published release artifact matrix",
+      "priority": 1,
+      "status": "done",
+      "details": "scripts/install.sh resolves Linux arm64 installs to aarch64-unknown-linux-gnu, but the release workflow only publishes Linux x86_64, macOS x86_64, macOS arm64, and Windows x86_64 artifacts. Either ship the missing archive or fail and document the unsupported platform consistently so latest-release installs do not 404.",
+      "tags": [
+        "review-followup",
+        "release",
+        "installer"
+      ],
+      "files": [
+        "scripts/install.sh",
+        "README.md",
+        "tests/release.rs",
+        "to-do.json"
+      ],
+      "updated_at": "2026-03-19T16:07:51Z"
     }
   ]
 }

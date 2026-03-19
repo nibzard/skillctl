@@ -58,6 +58,14 @@ download() {
   curl -fsSL "$url" -o "$destination"
 }
 
+unsupported_platform() {
+  local os_name="$1"
+  local arch_name="$2"
+  printf '%s\n' \
+    "error: unsupported platform ${os_name} ${arch_name} for published release artifacts; supported targets are Linux x86_64, macOS x86_64, macOS arm64, and Windows x86_64 (zip only)" >&2
+  exit 1
+}
+
 resolve_latest_version() {
   local api_url="https://api.github.com/repos/${repository}/releases/latest"
   local response
@@ -81,31 +89,22 @@ resolve_target() {
     Linux)
       case "$arch_name" in
         x86_64|amd64) printf 'x86_64-unknown-linux-gnu\n' ;;
-        aarch64|arm64) printf 'aarch64-unknown-linux-gnu\n' ;;
-        *)
-          printf 'error: unsupported Linux architecture %s\n' "$arch_name" >&2
-          exit 1
-          ;;
+        aarch64|arm64) unsupported_platform "Linux" "arm64" ;;
+        *) unsupported_platform "Linux" "$arch_name" ;;
       esac
       ;;
     Darwin)
       case "$arch_name" in
         x86_64) printf 'x86_64-apple-darwin\n' ;;
         arm64|aarch64) printf 'aarch64-apple-darwin\n' ;;
-        *)
-          printf 'error: unsupported macOS architecture %s\n' "$arch_name" >&2
-          exit 1
-          ;;
+        *) unsupported_platform "macOS" "$arch_name" ;;
       esac
       ;;
     MINGW*|MSYS*|CYGWIN*)
       printf 'error: use the published Windows zip artifact instead of the curl installer\n' >&2
       exit 1
       ;;
-    *)
-      printf 'error: unsupported operating system %s\n' "$os_name" >&2
-      exit 1
-      ;;
+    *) unsupported_platform "$os_name" "$arch_name" ;;
   esac
 }
 

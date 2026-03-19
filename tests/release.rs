@@ -7,6 +7,7 @@ use assert_cmd::cargo::cargo_bin;
 use sha2::{Digest, Sha256};
 use std::{
     fs,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
 };
@@ -120,6 +121,64 @@ fn install_script_installs_from_a_versioned_release_layout() {
     assert!(
         String::from_utf8_lossy(&version_output.stdout).contains("skillctl"),
         "installed binary should respond to --version"
+    );
+}
+
+#[test]
+fn install_script_rejects_unsupported_linux_arm64_before_download() {
+    let workspace = TestWorkspace::new();
+    let release_root = workspace.path().join("release-root");
+    let fake_bin = workspace.path().join("fake-bin");
+    fs::create_dir_all(&release_root).expect("release root exists");
+    fs::create_dir_all(&fake_bin).expect("fake bin exists");
+
+    let uname_path = fake_bin.join("uname");
+    fs::write(
+        &uname_path,
+        concat!(
+            "#!/usr/bin/env bash\n",
+            "case \"$1\" in\n",
+            "  -s)\n",
+            "    printf 'Linux\\n'\n",
+            "    ;;\n",
+            "  -m)\n",
+            "    printf 'aarch64\\n'\n",
+            "    ;;\n",
+            "  *)\n",
+            "    /usr/bin/uname \"$@\"\n",
+            "    ;;\n",
+            "esac\n",
+        ),
+    )
+    .expect("fake uname written");
+    let mut permissions = fs::metadata(&uname_path)
+        .expect("fake uname metadata available")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&uname_path, permissions).expect("fake uname is executable");
+
+    let path = std::env::var("PATH").unwrap_or_default();
+    let output = ProcessCommand::new("bash")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .arg("scripts/install.sh")
+        .env("PATH", format!("{}:{path}", fake_bin.display()))
+        .env("SKILLCTL_RELEASE_BASE_URL", file_url(&release_root))
+        .env("SKILLCTL_VERSION", RELEASE_VERSION)
+        .output()
+        .expect("installer script launches");
+
+    assert!(
+        !output.status.success(),
+        "installer should reject unsupported Linux arm64: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("unsupported platform Linux arm64 for published release artifacts"),
+        "installer should explain the unsupported Linux arm64 platform: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

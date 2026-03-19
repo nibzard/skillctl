@@ -18,6 +18,8 @@ Install the latest published release with the versioned release installer:
 curl -fsSL https://github.com/nibzard/skillctl/releases/latest/download/skillctl-install.sh | sh
 ```
 
+The curl installer currently supports Linux `x86_64` and macOS (`x86_64` and `arm64`).
+
 To pin a specific release or install into a custom directory:
 
 ```bash
@@ -25,7 +27,7 @@ curl -fsSL https://github.com/nibzard/skillctl/releases/latest/download/skillctl
   SKILLCTL_VERSION=v0.1.0 SKILLCTL_INSTALL_DIR="$HOME/.local/bin" sh
 ```
 
-The release workflow publishes deterministic archives and checksums for Linux `x86_64`, macOS `x86_64`, macOS `arm64`, and Windows `x86_64`.
+The release workflow publishes deterministic archives and checksums for Linux `x86_64`, macOS `x86_64`, macOS `arm64`, and Windows `x86_64`. Windows users should download the published zip artifact directly, and Linux `arm64` is not currently published.
 
 ## Mental Model
 
