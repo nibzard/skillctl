@@ -561,16 +561,17 @@
         "T016",
         "T018"
       ],
-      "updated_at": "2026-03-19T14:39:51Z",
+      "updated_at": "2026-03-19T14:40:46Z",
       "files": [
-        "src/trust.rs",
-        "src/source.rs",
-        "src/planner.rs",
         "src/doctor.rs",
         "src/history.rs",
         "src/lib.rs",
+        "src/planner.rs",
+        "src/source.rs",
         "src/telemetry.rs",
-        "tests/cli.rs"
+        "src/trust.rs",
+        "tests/cli.rs",
+        "to-do.json"
       ]
     },
     {
@@ -682,7 +683,7 @@
       "id": "T026",
       "title": "Package the binary and release a curl-installable distribution path",
       "priority": 3,
-      "status": "todo",
+      "status": "done",
       "details": "Turn the Rust binary into a shippable product with versioned releases and an installation flow that matches the product shape in the spec.",
       "steps": [
         "Define release artifacts for supported platforms and ensure the binary bundles required built-in assets.",
@@ -694,7 +695,20 @@
         "T015",
         "T019",
         "T025"
-      ]
+      ],
+      "updated_at": "2026-03-19T14:51:47Z",
+      "files": [
+        ".github/workflows/release.yml",
+        ".gitignore",
+        "README.md",
+        "scripts/install.sh",
+        "scripts/package-release.py",
+        "scripts/package-release.sh",
+        "scripts/release-smoke-test.sh",
+        "tests/release.rs",
+        "to-do.json"
+      ],
+      "blockers": []
     },
     {
       "id": "T027",
