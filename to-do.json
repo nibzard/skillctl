@@ -903,6 +903,31 @@
       ],
       "updated_at": "2026-03-19T16:57:55Z",
       "blockers": []
+    },
+    {
+      "id": "T034",
+      "title": "Honor manifest-configured overlay roots in update and inspection flows",
+      "priority": 2,
+      "status": "done",
+      "details": "`planner::overlay_state` hardcodes `.agents/overlays/<skill>`, so `skillctl update` misses overlays when `layout.overlays_dir` is customized. `tui::overlay_view` carries the same default-path assumption instead of consistently using manifest override data.",
+      "steps": [
+        "Thread manifest-driven overlay path lookup into update planning instead of probing a hardcoded `.agents/overlays/<skill>` path.",
+        "Remove the remaining default-overlay-path assumption from TUI overlay inspection so dashboard state matches customized manifest layouts.",
+        "Add regression coverage proving update and TUI overlay reporting still work when `layout.overlays_dir` is set to a non-default path."
+      ],
+      "tags": [
+        "review-followup",
+        "manifest",
+        "overlays"
+      ],
+      "files": [
+        "src/manifest.rs",
+        "src/planner.rs",
+        "src/tui.rs",
+        "tests/cli.rs",
+        "to-do.json"
+      ],
+      "updated_at": "2026-03-19T17:12:55Z"
     }
   ]
 }

@@ -5,7 +5,7 @@
 //! writes on open, so inspection remains deterministic and safe to run
 //! alongside other commands.
 
-use std::{fmt::Write as _, fs, io};
+use std::{fmt::Write as _, fs, io, path::Path};
 
 use serde::Serialize;
 
@@ -13,7 +13,9 @@ use crate::{
     app::AppContext,
     doctor::{self, ExplainReport, ExplainStatus},
     error::AppError,
-    history, planner,
+    history,
+    manifest::WorkspaceManifest,
+    planner,
     response::AppResponse,
     skill,
     source::SourceKind,
@@ -145,13 +147,14 @@ pub fn handle_open(
 }
 
 fn build_app(context: &AppContext) -> Result<TuiApp, AppError> {
+    let manifest = load_manifest_or_default(&context.working_directory)?;
     let store = LocalStateStore::open_default()?;
     let selected_skill = context.selector.skill_name.clone();
     let managed_skills = selected_managed_skills(context, &store)?;
     let mut skills = Vec::with_capacity(managed_skills.len());
 
     for managed_skill in &managed_skills {
-        skills.push(build_skill_card(context, &store, managed_skill)?);
+        skills.push(build_skill_card(context, &manifest, &store, managed_skill)?);
     }
 
     Ok(TuiApp {
@@ -193,6 +196,7 @@ fn selected_managed_skills(
 
 fn build_skill_card(
     context: &AppContext,
+    manifest: &WorkspaceManifest,
     store: &LocalStateStore,
     managed_skill: &ManagedSkillRef,
 ) -> Result<TuiSkillCard, AppError> {
@@ -217,7 +221,7 @@ fn build_skill_card(
         installed: install,
         pin: snapshot.pin.clone(),
         update: snapshot.latest_update_check.clone(),
-        overlay: overlay_view(context, managed_skill, &snapshot, &visibility)?,
+        overlay: overlay_view(context, manifest, managed_skill, &snapshot, &visibility)?,
         local_modifications: snapshot.local_modifications.clone(),
         rollback: rollback_summary(&snapshot),
         visibility,
@@ -266,14 +270,15 @@ fn skill_history_preview(
 
 fn overlay_view(
     context: &AppContext,
+    manifest: &WorkspaceManifest,
     managed_skill: &ManagedSkillRef,
     snapshot: &SkillStateSnapshot,
     visibility: &ExplainReport,
 ) -> Result<TuiOverlayView, AppError> {
+    let overlay_manifest_path = manifest.overlay_path_for(&managed_skill.skill_id);
     let overlay_root = context
         .working_directory
-        .join(".agents/overlays")
-        .join(&managed_skill.skill_id);
+        .join(overlay_manifest_path.as_str());
     let path = overlay_path(context, &overlay_root)?;
     let present = path.is_some()
         || visibility
@@ -299,6 +304,18 @@ fn overlay_view(
                 .and_then(|winner| winner.overlay_root.clone())
         }),
     })
+}
+
+fn load_manifest_or_default(working_directory: &Path) -> Result<WorkspaceManifest, AppError> {
+    match WorkspaceManifest::load_from_workspace(working_directory) {
+        Ok(manifest) => Ok(manifest),
+        Err(AppError::FilesystemOperation { path, source, .. })
+            if source.kind() == io::ErrorKind::NotFound =>
+        {
+            Ok(WorkspaceManifest::default_at(path))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn overlay_path(

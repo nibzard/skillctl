@@ -116,6 +116,14 @@ impl WorkspaceManifest {
         Self::load_from_path(working_directory.join(DEFAULT_MANIFEST_PATH))
     }
 
+    /// Resolve the managed overlay path for one imported skill.
+    pub fn overlay_path_for(&self, skill_id: &str) -> ManifestPath {
+        self.overrides.get(skill_id).cloned().unwrap_or_else(|| {
+            let overlays_root = self.layout.overlays_dir.as_str().trim_end_matches('/');
+            ManifestPath::new(format!("{overlays_root}/{skill_id}"))
+        })
+    }
+
     /// Load, parse, and validate a manifest from disk.
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, AppError> {
         let path = path.as_ref().to_path_buf();

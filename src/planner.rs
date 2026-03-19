@@ -123,6 +123,7 @@ pub fn handle_update(
         let snapshot = store.skill_snapshot(&managed_skill)?;
         let prepared = prepare_update_plan(
             context,
+            &manifest,
             &snapshot
                 .install
                 .ok_or_else(|| AppError::ResolutionValidation {
@@ -270,6 +271,7 @@ struct OverlayState {
 
 fn prepare_update_plan(
     context: &AppContext,
+    manifest: &WorkspaceManifest,
     install: &InstallRecord,
     projections: &[ProjectionRecord],
     candidate: Option<&ResolvedSkillCandidate>,
@@ -349,7 +351,7 @@ fn prepare_update_plan(
         });
     }
 
-    let overlay_state = overlay_state(context, install)?;
+    let overlay_state = overlay_state(context, manifest, install)?;
 
     if let Some(overlay_state) = &overlay_state {
         let details = if overlay_state.changed_since_recorded_state {
@@ -604,12 +606,11 @@ fn imported_candidate_map(
 
 fn overlay_state(
     context: &AppContext,
+    manifest: &WorkspaceManifest,
     install: &InstallRecord,
 ) -> Result<Option<OverlayState>, AppError> {
-    let overlay_root = context
-        .working_directory
-        .join(".agents/overlays")
-        .join(&install.skill.skill_id);
+    let overlay_path = manifest.overlay_path_for(&install.skill.skill_id);
+    let overlay_root = context.working_directory.join(overlay_path.as_str());
     let current_hash = hash_overlay_root(&overlay_root)?;
     if current_hash == NO_OVERLAY_HASH && install.overlay_hash == NO_OVERLAY_HASH {
         return Ok(None);

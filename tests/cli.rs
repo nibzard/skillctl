@@ -324,6 +324,87 @@ fn tui_json_output_aggregates_skill_state_for_the_selected_skill() {
 }
 
 #[test]
+fn tui_reports_manifest_configured_overlay_roots() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "layout:\n",
+        "  overlays_dir: .agents/custom-overlays\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_skill_source("shared-skills", "release-notes");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770000000")
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770000060")
+        .args(["override", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770000120")
+        .args(["disable", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--json", "--name", "release-notes", "tui"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let body: Value = serde_json::from_slice(&assert.get_output().stdout).expect("stdout is json");
+    assert_eq!(
+        body["data"]["skills"][0]["overlay"]["path"],
+        ".agents/custom-overlays/release-notes"
+    );
+    assert_eq!(body["data"]["skills"][0]["overlay"]["present"], true);
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["tui"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is utf-8");
+    assert!(
+        stdout.contains(".agents/custom-overlays/release-notes"),
+        "stdout was {stdout}"
+    );
+}
+
+#[test]
 fn bare_invocation_prints_help() {
     let mut cmd = Command::cargo_bin("skillctl").expect("binary exists");
 
@@ -2358,6 +2439,76 @@ fn update_treats_managed_overlays_as_safe_and_does_not_flag_stale_projections() 
         )
         .expect("history query succeeds");
     assert_eq!(direct_modification_events, 0);
+}
+
+#[test]
+fn update_uses_manifest_configured_overlay_roots_when_detecting_managed_overlays() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "layout:\n",
+        "  overlays_dir: .agents/custom-overlays\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_skill_source("git-source", "release-notes");
+    workspace.init_git_repo("git-source");
+    let repo_url = workspace.git_repo_url("git-source");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            repo_url.as_str(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["override", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    workspace.write_skill_source_at(
+        "git-source",
+        ".agents/skills/release-notes",
+        "release-notes",
+        "Updated upstream release notes helper.",
+    );
+    workspace.commit_all("git-source", "update release notes");
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--json", "update", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let output = assert.get_output();
+    let body: Value = serde_json::from_slice(&output.stdout).expect("stdout is valid json");
+    let plan = &body["data"]["plans"][0];
+
+    assert_eq!(plan["overlay_detected"], true);
+    assert_eq!(plan["local_modification_detected"], false);
+    assert_eq!(plan["modifications"][0]["kind"], "overlay");
+    assert_eq!(plan["modifications"][0]["managed"], true);
+    assert_eq!(
+        plan["modifications"][0]["path"],
+        ".agents/custom-overlays/release-notes"
+    );
 }
 
 #[test]
