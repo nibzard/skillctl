@@ -952,6 +952,30 @@
       ],
       "created_at": "2026-03-19T17:21:23Z",
       "updated_at": "2026-03-19T17:31:35Z"
+    },
+    {
+      "id": "T036",
+      "title": "Add release-test coverage for the Windows zip packaging path",
+      "priority": 3,
+      "status": "done",
+      "details": "The published release matrix includes Windows `x86_64` zip artifacts, but `tests/release.rs` is Unix-only and only exercises the tar.gz branch. The `package-release.py` zip path and the release workflow’s Windows artifact shape can regress without any automated coverage.",
+      "steps": [
+        "Refactor the release tests so the packager can be exercised with both tar.gz and zip targets from the same host CI environment.",
+        "Add assertions that the Windows archive uses the expected `skillctl.exe` layout and deterministic zip metadata.",
+        "Keep the existing Unix installer coverage while extending the suite to catch release-asset regressions before publish time."
+      ],
+      "tags": [
+        "review-followup",
+        "release",
+        "testing"
+      ],
+      "files": [
+        "scripts/package-release.py",
+        "tests/release.rs",
+        "to-do.json"
+      ],
+      "created_at": "2026-03-19T17:21:23Z",
+      "updated_at": "2026-03-19T17:41:11Z"
     }
   ]
 }

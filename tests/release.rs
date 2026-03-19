@@ -4,7 +4,8 @@
 mod support;
 
 use assert_cmd::cargo::cargo_bin;
-use serde_yaml::{Mapping, Value};
+use serde::Deserialize;
+use serde_yaml::{Mapping, Value as YamlValue};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -16,15 +17,25 @@ use std::{
 use support::TestWorkspace;
 
 const RELEASE_VERSION: &str = "v0.1.0-test";
-const RELEASE_TARGET: &str = "x86_64-unknown-linux-gnu";
+const LINUX_RELEASE_TARGET: &str = "x86_64-unknown-linux-gnu";
+const WINDOWS_RELEASE_TARGET: &str = "x86_64-pc-windows-msvc";
+const ZIP_DEFLATED: u16 = 8;
 
 #[test]
 fn packaging_script_produces_deterministic_archives_for_same_inputs() {
     let workspace = TestWorkspace::new();
     let binary_path = cargo_bin("skillctl");
 
-    let first_archive = package_release(&binary_path, &workspace.path().join("dist-one"));
-    let second_archive = package_release(&binary_path, &workspace.path().join("dist-two"));
+    let first_archive = package_release(
+        &binary_path,
+        &workspace.path().join("dist-one"),
+        LINUX_RELEASE_TARGET,
+    );
+    let second_archive = package_release(
+        &binary_path,
+        &workspace.path().join("dist-two"),
+        LINUX_RELEASE_TARGET,
+    );
 
     assert_eq!(
         sha256_file(&first_archive),
@@ -37,7 +48,11 @@ fn packaging_script_produces_deterministic_archives_for_same_inputs() {
 fn packaged_binary_bootstraps_bundled_skill_without_source_tree_assets() {
     let workspace = TestWorkspace::new();
     let binary_path = cargo_bin("skillctl");
-    let archive_path = package_release(&binary_path, &workspace.path().join("dist"));
+    let archive_path = package_release(
+        &binary_path,
+        &workspace.path().join("dist"),
+        LINUX_RELEASE_TARGET,
+    );
     let unpack_root = workspace.path().join("unpacked");
     let run_root = workspace.path().join("isolated-run");
     fs::create_dir_all(&unpack_root).expect("unpack root exists");
@@ -45,7 +60,9 @@ fn packaged_binary_bootstraps_bundled_skill_without_source_tree_assets() {
 
     extract_archive(&archive_path, &unpack_root);
 
-    let packaged_binary = unpack_root.join(release_archive_stem()).join("skillctl");
+    let packaged_binary = unpack_root
+        .join(release_archive_stem(LINUX_RELEASE_TARGET))
+        .join(binary_name(LINUX_RELEASE_TARGET));
     let home_path = workspace.home_path();
     let output = ProcessCommand::new(&packaged_binary)
         .current_dir(&run_root)
@@ -70,14 +87,18 @@ fn packaged_binary_bootstraps_bundled_skill_without_source_tree_assets() {
 fn install_script_installs_from_a_versioned_release_layout() {
     let workspace = TestWorkspace::new();
     let binary_path = cargo_bin("skillctl");
-    let archive_path = package_release(&binary_path, &workspace.path().join("dist"));
+    let archive_path = package_release(
+        &binary_path,
+        &workspace.path().join("dist"),
+        LINUX_RELEASE_TARGET,
+    );
     let release_root = workspace.path().join("release-root");
     let download_root = release_root.join("download").join(RELEASE_VERSION);
     let install_dir = workspace.path().join("bin");
     fs::create_dir_all(&download_root).expect("release download root exists");
     fs::create_dir_all(&install_dir).expect("install dir exists");
 
-    let archive_name = archive_name();
+    let archive_name = archive_name(LINUX_RELEASE_TARGET);
     fs::copy(&archive_path, download_root.join(&archive_name)).expect("archive copied");
     fs::write(
         download_root.join(checksums_name()),
@@ -122,6 +143,124 @@ fn install_script_installs_from_a_versioned_release_layout() {
     assert!(
         String::from_utf8_lossy(&version_output.stdout).contains("skillctl"),
         "installed binary should respond to --version"
+    );
+}
+
+#[test]
+fn packaging_script_produces_deterministic_windows_zip_archives_for_same_inputs() {
+    let workspace = TestWorkspace::new();
+    let binary_path = cargo_bin("skillctl");
+
+    let first_archive = package_release(
+        &binary_path,
+        &workspace.path().join("windows-dist-one"),
+        WINDOWS_RELEASE_TARGET,
+    );
+    let second_archive = package_release(
+        &binary_path,
+        &workspace.path().join("windows-dist-two"),
+        WINDOWS_RELEASE_TARGET,
+    );
+
+    assert_eq!(
+        sha256_file(&first_archive),
+        sha256_file(&second_archive),
+        "windows release zips should be byte-for-byte reproducible for the same inputs"
+    );
+}
+
+#[test]
+fn windows_release_zip_uses_expected_layout_and_deterministic_metadata() {
+    let workspace = TestWorkspace::new();
+    let binary_path = cargo_bin("skillctl");
+    let archive_path = package_release(
+        &binary_path,
+        &workspace.path().join("windows-dist"),
+        WINDOWS_RELEASE_TARGET,
+    );
+    let entries = inspect_zip_entries(&archive_path);
+    let archive_root = release_archive_stem(WINDOWS_RELEASE_TARGET);
+
+    assert_eq!(
+        archive_path.file_name().and_then(|name| name.to_str()),
+        Some(archive_name(WINDOWS_RELEASE_TARGET).as_str()),
+        "windows target should produce a zip artifact with the expected release filename"
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.filename.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            format!("{archive_root}/LICENSE"),
+            format!("{archive_root}/README.md"),
+            format!("{archive_root}/release-manifest.json"),
+            format!("{archive_root}/skillctl.exe"),
+        ],
+        "windows release zip should contain the expected top-level layout"
+    );
+
+    for entry in &entries {
+        assert_eq!(
+            entry.date_time,
+            vec![1980, 1, 1, 0, 0, 0],
+            "{} should use the fixed DOS epoch timestamp for deterministic zips",
+            entry.filename
+        );
+        assert_eq!(
+            entry.create_system, 3,
+            "{} should record Unix metadata so file modes are preserved",
+            entry.filename
+        );
+        assert_eq!(
+            entry.compress_type, ZIP_DEFLATED,
+            "{} should use deflate compression in the published Windows zip",
+            entry.filename
+        );
+    }
+
+    assert_eq!(
+        mode_for_entry(&entries, &format!("{archive_root}/skillctl.exe")),
+        0o755,
+        "windows binary should remain executable when unpacked on Unix hosts"
+    );
+    for filename in [
+        format!("{archive_root}/LICENSE"),
+        format!("{archive_root}/README.md"),
+        format!("{archive_root}/release-manifest.json"),
+    ] {
+        assert_eq!(
+            mode_for_entry(&entries, &filename),
+            0o644,
+            "{filename} should be packaged with read-only data file permissions"
+        );
+    }
+
+    let manifest_entry = entries
+        .iter()
+        .find(|entry| entry.filename == format!("{archive_root}/release-manifest.json"))
+        .expect("release manifest entry is present");
+    let manifest: ReleaseManifest = serde_json::from_str(
+        manifest_entry
+            .contents
+            .as_deref()
+            .expect("release manifest contents are captured"),
+    )
+    .expect("release manifest should parse as json");
+
+    assert_eq!(manifest.name, "skillctl");
+    assert_eq!(manifest.version, RELEASE_VERSION);
+    assert_eq!(manifest.target, WINDOWS_RELEASE_TARGET);
+    assert_eq!(manifest.binary, "skillctl.exe");
+    assert_eq!(
+        manifest.files,
+        vec![
+            "skillctl.exe".to_owned(),
+            "LICENSE".to_owned(),
+            "README.md".to_owned(),
+            "release-manifest.json".to_owned(),
+        ],
+        "release manifest should describe the published Windows archive contents"
     );
 }
 
@@ -187,7 +326,7 @@ fn install_script_rejects_unsupported_linux_arm64_before_download() {
 fn release_workflow_manual_dispatch_requires_explicit_release_tag_checkout() {
     let workflow_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/release.yml");
     let workflow_source = fs::read_to_string(&workflow_path).expect("release workflow exists");
-    let workflow: Value =
+    let workflow: YamlValue =
         serde_yaml::from_str(&workflow_source).expect("release workflow should parse as yaml");
 
     let on = mapping_entry(root_mapping(&workflow), "on");
@@ -238,7 +377,7 @@ fn release_workflow_manual_dispatch_requires_explicit_release_tag_checkout() {
     );
 }
 
-fn package_release(binary_path: &Path, output_dir: &Path) -> PathBuf {
+fn package_release(binary_path: &Path, output_dir: &Path, target: &str) -> PathBuf {
     fs::create_dir_all(output_dir).expect("output dir exists");
 
     let output = ProcessCommand::new("bash")
@@ -250,7 +389,7 @@ fn package_release(binary_path: &Path, output_dir: &Path) -> PathBuf {
             "--version",
             RELEASE_VERSION,
             "--target",
-            RELEASE_TARGET,
+            target,
             "--output",
             output_dir.to_str().expect("output path is utf-8"),
         ])
@@ -264,7 +403,7 @@ fn package_release(binary_path: &Path, output_dir: &Path) -> PathBuf {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    output_dir.join(archive_name())
+    output_dir.join(archive_name(target))
 }
 
 fn extract_archive(archive_path: &Path, destination: &Path) {
@@ -287,16 +426,21 @@ fn sha256_file(path: &Path) -> String {
     format!("{digest:x}")
 }
 
-fn archive_name() -> String {
-    format!("skillctl-{RELEASE_VERSION}-{RELEASE_TARGET}.tar.gz")
+fn archive_name(target: &str) -> String {
+    let extension = if is_windows_target(target) {
+        "zip"
+    } else {
+        "tar.gz"
+    };
+    format!("skillctl-{RELEASE_VERSION}-{target}.{extension}")
 }
 
 fn checksums_name() -> String {
     format!("skillctl-{RELEASE_VERSION}-checksums.txt")
 }
 
-fn release_archive_stem() -> String {
-    format!("skillctl-{RELEASE_VERSION}-{RELEASE_TARGET}")
+fn release_archive_stem(target: &str) -> String {
+    format!("skillctl-{RELEASE_VERSION}-{target}")
 }
 
 fn file_url(path: &Path) -> String {
@@ -308,23 +452,23 @@ fn file_url(path: &Path) -> String {
     )
 }
 
-fn root_mapping(value: &Value) -> &Mapping {
+fn root_mapping(value: &YamlValue) -> &Mapping {
     value.as_mapping().expect("yaml root should be a mapping")
 }
 
-fn as_mapping<'a>(value: &'a Value, context: &str) -> &'a Mapping {
+fn as_mapping<'a>(value: &'a YamlValue, context: &str) -> &'a Mapping {
     value
         .as_mapping()
         .unwrap_or_else(|| panic!("{context} should be a yaml mapping"))
 }
 
-fn mapping_entry<'a>(mapping: &'a Mapping, key: &str) -> &'a Value {
-    let string_key = Value::String(key.to_owned());
+fn mapping_entry<'a>(mapping: &'a Mapping, key: &str) -> &'a YamlValue {
+    let string_key = YamlValue::String(key.to_owned());
     mapping
         .get(&string_key)
         .or_else(|| {
             if key == "on" {
-                mapping.get(Value::Bool(true))
+                mapping.get(YamlValue::Bool(true))
             } else {
                 None
             }
@@ -353,8 +497,107 @@ fn checkout_step<'a>(job: &'a Mapping, job_name: &str) -> &'a Mapping {
         .iter()
         .find_map(|step| {
             let step = step.as_mapping()?;
-            let uses = step.get(Value::String("uses".to_owned()))?.as_str()?;
+            let uses = step.get(YamlValue::String("uses".to_owned()))?.as_str()?;
             (uses == "actions/checkout@v4").then_some(step)
         })
         .unwrap_or_else(|| panic!("{job_name} should include actions/checkout@v4"))
+}
+
+fn is_windows_target(target: &str) -> bool {
+    target.contains("windows")
+}
+
+fn binary_name(target: &str) -> &'static str {
+    if is_windows_target(target) {
+        "skillctl.exe"
+    } else {
+        "skillctl"
+    }
+}
+
+fn inspect_zip_entries(archive_path: &Path) -> Vec<ZipEntry> {
+    let python = detect_python();
+    let output = ProcessCommand::new(&python)
+        .arg("-c")
+        .arg(
+            r#"import json
+import sys
+import zipfile
+
+with zipfile.ZipFile(sys.argv[1]) as archive:
+    entries = []
+    for info in archive.infolist():
+        entry = {
+            "filename": info.filename,
+            "date_time": list(info.date_time),
+            "create_system": info.create_system,
+            "mode": (info.external_attr >> 16) & 0xFFFF,
+            "compress_type": info.compress_type,
+        }
+        if info.filename.endswith("release-manifest.json"):
+            entry["contents"] = archive.read(info).decode("utf-8")
+        entries.append(entry)
+    print(json.dumps(entries))
+"#,
+        )
+        .arg(archive_path)
+        .output()
+        .expect("zip inspection launches");
+
+    assert!(
+        output.status.success(),
+        "zip inspection should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    serde_json::from_slice(&output.stdout).expect("zip inspection output should parse")
+}
+
+fn detect_python() -> String {
+    if let Some(path) = std::env::var("PYTHON")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        return path;
+    }
+
+    for candidate in ["python3", "python"] {
+        if ProcessCommand::new(candidate)
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return candidate.to_owned();
+        }
+    }
+
+    panic!("python3 or python is required for release packaging tests");
+}
+
+fn mode_for_entry(entries: &[ZipEntry], filename: &str) -> u32 {
+    entries
+        .iter()
+        .find(|entry| entry.filename == filename)
+        .unwrap_or_else(|| panic!("missing zip entry {filename}"))
+        .mode
+}
+
+#[derive(Debug, Deserialize)]
+struct ZipEntry {
+    filename: String,
+    date_time: Vec<u16>,
+    create_system: u8,
+    mode: u32,
+    compress_type: u16,
+    contents: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseManifest {
+    name: String,
+    version: String,
+    target: String,
+    binary: String,
+    files: Vec<String>,
 }

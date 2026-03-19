@@ -115,7 +115,12 @@ def write_zip(destination: Path, entries: list[tuple[str, bytes, int]]) -> None:
             info.date_time = (1980, 1, 1, 0, 0, 0)
             info.create_system = 3
             info.external_attr = mode << 16
-            archive.writestr(info, contents)
+            archive.writestr(
+                info,
+                contents,
+                compress_type=zipfile.ZIP_DEFLATED,
+                compresslevel=9,
+            )
 
 
 def main() -> int:
