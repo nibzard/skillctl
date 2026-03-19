@@ -175,7 +175,7 @@
       "id": "T007",
       "title": "Implement source detection, normalization, and fetch support for Git, local paths, and archives",
       "priority": 1,
-      "status": "todo",
+      "status": "done",
       "details": "Support the install pipeline’s input sources, detect skills in the required directory layouts, and normalize candidates into a stable internal representation.",
       "steps": [
         "Detect candidate skills in `.agents/skills/`, `.claude/skills/`, `.opencode/skills/`, and repo-root `skills/`.",
@@ -185,7 +185,17 @@
       "depends_on": [
         "T001",
         "T005"
-      ]
+      ],
+      "updated_at": "2026-03-19T10:24:02Z",
+      "files": [
+        "Cargo.lock",
+        "Cargo.toml",
+        "src/error.rs",
+        "src/source.rs",
+        "tests/cli.rs",
+        "to-do.json"
+      ],
+      "blockers": []
     },
     {
       "id": "T008",

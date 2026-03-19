@@ -77,10 +77,10 @@ fn json_output_uses_stable_response_contract_for_command_errors() {
     let mut cmd = Command::cargo_bin("skillctl").expect("binary exists");
 
     let assert = cmd
-        .args(["--json", "install", "https://example.com/skills.git"])
+        .args(["--json", "install", "./missing-source"])
         .assert()
         .failure()
-        .code(1)
+        .code(3)
         .stderr(predicate::str::is_empty());
 
     let output = assert.get_output();
@@ -92,7 +92,7 @@ fn json_output_uses_stable_response_contract_for_command_errors() {
             "ok": false,
             "command": "install",
             "warnings": [],
-            "errors": ["command 'install' is not implemented yet"],
+            "errors": ["install source './missing-source' is invalid: source must be a Git URL, existing local directory, or existing local archive"],
             "data": {}
         })
     );
@@ -100,9 +100,12 @@ fn json_output_uses_stable_response_contract_for_command_errors() {
 
 #[test]
 fn global_execution_flags_are_accepted_before_the_subcommand() {
+    let workspace = TestWorkspace::new();
+    workspace.write_skill_source("shared-skills", "release-notes");
     let mut cmd = Command::cargo_bin("skillctl").expect("binary exists");
 
     let assert = cmd
+        .current_dir(workspace.path())
         .args([
             "--json",
             "--no-input",
@@ -115,18 +118,19 @@ fn global_execution_flags_are_accepted_before_the_subcommand() {
             "--cwd",
             ".",
             "install",
-            "../shared-skills",
+            "shared-skills",
         ])
         .assert()
-        .failure()
-        .code(1)
+        .success()
         .stderr(predicate::str::is_empty());
 
     let output = assert.get_output();
     let body: Value = serde_json::from_slice(&output.stdout).expect("stdout is valid json");
 
     assert_eq!(body["command"], "install");
-    assert_eq!(body["ok"], false);
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["data"]["source"]["type"], "local-path");
+    assert_eq!(body["data"]["candidates"][0]["name"], "release-notes");
 }
 
 #[test]
@@ -309,6 +313,30 @@ impl TestWorkspace {
 
     fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn write_skill_source(&self, source_dir: &str, skill_name: &str) {
+        let skill_root = self
+            .path
+            .join(source_dir)
+            .join(".agents/skills")
+            .join(skill_name);
+        fs::create_dir_all(&skill_root).expect("skill source root exists");
+        fs::write(
+            skill_root.join("SKILL.md"),
+            format!(
+                concat!(
+                    "---\n",
+                    "name: {skill_name}\n",
+                    "description: Summarize release notes.\n",
+                    "---\n",
+                    "\n",
+                    "# Release Notes\n"
+                ),
+                skill_name = skill_name
+            ),
+        )
+        .expect("skill manifest exists");
     }
 }
 

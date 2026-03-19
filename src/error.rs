@@ -172,6 +172,23 @@ pub enum AppError {
         /// Validation message.
         message: String,
     },
+    /// Install source normalization, staging, or detection failed validation.
+    #[error("install source '{input}' is invalid: {message}")]
+    SourceValidation {
+        /// User-provided install source.
+        input: String,
+        /// Validation message.
+        message: String,
+    },
+    /// An external helper command required by source staging failed to launch.
+    #[error("failed to run external command '{command}': {source}")]
+    ExternalCommand {
+        /// Command binary that failed to launch.
+        command: String,
+        /// Underlying process-spawn error.
+        #[source]
+        source: io::Error,
+    },
 }
 
 impl AppError {
@@ -194,7 +211,9 @@ impl AppError {
             | Self::LockfileValidation { .. }
             | Self::LockfileSerialize { .. }
             | Self::SkillParse { .. }
-            | Self::SkillValidation { .. } => ExitStatus::ValidationFailure,
+            | Self::SkillValidation { .. }
+            | Self::SourceValidation { .. } => ExitStatus::ValidationFailure,
+            Self::ExternalCommand { .. } => ExitStatus::OperationalError,
             Self::InputRequired { .. } => ExitStatus::InputRequired,
         }
     }
