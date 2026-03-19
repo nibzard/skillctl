@@ -412,8 +412,9 @@ fn install_updates_manifest_lockfile_store_state_and_projection_records() {
         .expect("state database opens");
     let install_row: (String, String, String) = connection
         .query_row(
-            "SELECT scope, skill_id, source_kind FROM install_records",
-            [],
+            "SELECT scope, skill_id, source_kind FROM install_records \
+             WHERE scope = ?1 AND skill_id = ?2",
+            params!["workspace", "release-notes"],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("install record exists");
@@ -584,9 +585,9 @@ fn telemetry_status_enable_and_disable_use_the_local_state_store() {
     assert_eq!(telemetry_row.2, "2026-02-02T03:00:34Z");
 
     let history_kinds: Vec<String> = connection
-        .prepare("SELECT kind FROM history_events ORDER BY occurred_at ASC, id ASC")
+        .prepare("SELECT kind FROM history_events WHERE kind = ?1 ORDER BY occurred_at ASC, id ASC")
         .expect("statement prepares")
-        .query_map([], |row| row.get(0))
+        .query_map(params!["telemetry-consent-changed"], |row| row.get(0))
         .expect("history query succeeds")
         .collect::<Result<_, _>>()
         .expect("history rows decode");
@@ -2291,23 +2292,23 @@ fn list_and_path_report_managed_skill_inventory_and_filesystem_locations() {
 
     assert_eq!(list_body["command"], "list");
     assert_eq!(list_body["ok"], true);
-    assert_eq!(list_body["data"]["skills"][0]["skill"], "release-notes");
-    assert_eq!(list_body["data"]["skills"][0]["scope"], "workspace");
-    assert_eq!(list_body["data"]["skills"][0]["managed_import"], true);
+    let release_notes = list_body["data"]["skills"]
+        .as_array()
+        .expect("skills array exists")
+        .iter()
+        .find(|skill| skill["skill"] == "release-notes" && skill["scope"] == "workspace")
+        .expect("release-notes workspace skill exists");
+    assert_eq!(release_notes["skill"], "release-notes");
+    assert_eq!(release_notes["scope"], "workspace");
+    assert_eq!(release_notes["managed_import"], true);
+    assert_eq!(release_notes["managed_import_enabled"], true);
     assert_eq!(
-        list_body["data"]["skills"][0]["managed_import_enabled"],
-        true
-    );
-    assert_eq!(
-        list_body["data"]["skills"][0]["overlay_root"],
+        release_notes["overlay_root"],
         ".agents/overlays/release-notes"
     );
+    assert_eq!(release_notes["source"]["type"], "local-path");
     assert_eq!(
-        list_body["data"]["skills"][0]["source"]["type"],
-        "local-path"
-    );
-    assert_eq!(
-        list_body["data"]["skills"][0]["projections"][0]["path"],
+        release_notes["projections"][0]["path"],
         ".claude/skills/release-notes"
     );
 
@@ -2349,6 +2350,188 @@ fn list_and_path_report_managed_skill_inventory_and_filesystem_locations() {
     assert_eq!(
         path_body["data"]["projections"][0]["path"],
         ".claude/skills/release-notes"
+    );
+}
+
+#[test]
+fn bundled_skill_is_installed_in_user_scope_on_first_command() {
+    let workspace = TestWorkspace::new();
+    let home_path = workspace.home_path();
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", &home_path)
+        .args(["--json", "telemetry", "status"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+    let body: Value = serde_json::from_slice(&assert.get_output().stdout).expect("stdout is json");
+
+    assert_eq!(body["command"], "telemetry-status");
+    assert!(
+        home_path.join(".agents/skills/skillctl/SKILL.md").is_file(),
+        "bundled skill should project into the neutral user root",
+    );
+    assert!(
+        home_path.join(".claude/skills/skillctl/SKILL.md").is_file(),
+        "bundled skill should project into the claude-compatible user root",
+    );
+    assert!(
+        home_path
+            .join(".config/agents/skills/skillctl/SKILL.md")
+            .is_file(),
+        "bundled skill should project into the amp-compatible user root",
+    );
+    assert!(
+        !home_path.join(".copilot/skills/skillctl").exists(),
+        "planner should prefer the shared claude root over an extra copilot root",
+    );
+
+    let connection =
+        Connection::open(home_path.join(".skillctl/state.db")).expect("state database opens");
+    let install_row: (String, String, String, String) = connection
+        .query_row(
+            "SELECT scope, skill_id, source_url, resolved_revision FROM install_records \
+             WHERE scope = ?1 AND skill_id = ?2",
+            params!["user", "skillctl"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("bundled install record exists");
+
+    assert_eq!(install_row.0, "user");
+    assert_eq!(install_row.1, "skillctl");
+    assert_eq!(install_row.2, "builtin://skillctl");
+    assert_eq!(install_row.3, env!("CARGO_PKG_VERSION"));
+}
+
+#[test]
+fn bundled_skill_removal_is_explicit_and_persists_across_later_runs() {
+    let workspace = TestWorkspace::new();
+    let home_path = workspace.home_path();
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", &home_path)
+        .args(["--json", "telemetry", "status"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let remove_assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", &home_path)
+        .args(["--json", "--scope", "user", "remove", "skillctl"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+    let remove_body: Value =
+        serde_json::from_slice(&remove_assert.get_output().stdout).expect("stdout is json");
+
+    assert_eq!(remove_body["command"], "remove");
+    assert_eq!(remove_body["data"]["skill"], "skillctl");
+    assert_eq!(remove_body["data"]["scope"], "user");
+    assert!(
+        !home_path.join(".agents/skills/skillctl").exists(),
+        "explicit removal should prune bundled user projections",
+    );
+    assert!(
+        !home_path.join(".claude/skills/skillctl").exists(),
+        "explicit removal should prune bundled user projections",
+    );
+    assert!(
+        !home_path.join(".config/agents/skills/skillctl").exists(),
+        "explicit removal should prune bundled user projections",
+    );
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", &home_path)
+        .args(["--json", "telemetry", "status"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    assert!(
+        !home_path.join(".agents/skills/skillctl").exists(),
+        "explicit removal should suppress later automatic reinstall",
+    );
+
+    let history_assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", &home_path)
+        .args(["--json", "--scope", "user", "history", "skillctl"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+    let history_body: Value =
+        serde_json::from_slice(&history_assert.get_output().stdout).expect("stdout is json");
+    let latest_kind = history_body["data"]["entries"][0]["kind"]
+        .as_str()
+        .expect("history kind exists");
+    let latest_reason = history_body["data"]["entries"][0]["details"]["reason"]
+        .as_str()
+        .expect("cleanup reason exists");
+
+    assert_eq!(latest_kind, "cleanup");
+    assert_eq!(latest_reason, "explicit-remove");
+}
+
+#[test]
+fn bundled_skill_does_not_overwrite_hand_authored_user_skill_roots() {
+    let workspace = TestWorkspace::new();
+    let home_path = workspace.home_path();
+    let custom_skill_root = home_path.join(".claude/skills/skillctl");
+    fs::create_dir_all(&custom_skill_root).expect("custom skill root exists");
+    fs::write(
+        custom_skill_root.join("SKILL.md"),
+        concat!(
+            "---\n",
+            "name: skillctl\n",
+            "description: User-managed skillctl variant.\n",
+            "---\n",
+            "\n",
+            "# custom skillctl\n",
+        ),
+    )
+    .expect("custom skill manifest exists");
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", &home_path)
+        .args(["--json", "doctor"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::is_empty());
+    let body: Value = serde_json::from_slice(&assert.get_output().stdout).expect("stdout is json");
+
+    assert!(
+        home_path.join(".agents/skills/skillctl/SKILL.md").is_file(),
+        "bundled skill should still install into other compatible roots",
+    );
+    assert_eq!(
+        fs::read_to_string(custom_skill_root.join("SKILL.md")).expect("custom skill remains"),
+        concat!(
+            "---\n",
+            "name: skillctl\n",
+            "description: User-managed skillctl variant.\n",
+            "---\n",
+            "\n",
+            "# custom skillctl\n",
+        ),
+    );
+    assert!(
+        body["data"]["issues"]
+            .as_array()
+            .expect("doctor issues is an array")
+            .iter()
+            .any(|issue| issue["code"] == "bundled-skill-conflict"),
+        "doctor should surface the blocked bundled-skill projection",
     );
 }
 
@@ -2712,7 +2895,11 @@ fn clean_removes_generated_projections_and_unused_import_state_without_touching_
     let connection = Connection::open(workspace.home_path().join(".skillctl/state.db"))
         .expect("state database opens");
     let install_count: i64 = connection
-        .query_row("SELECT COUNT(*) FROM install_records", [], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM install_records WHERE scope = ?1 AND skill_id = ?2",
+            params!["workspace", "release-notes"],
+            |row| row.get(0),
+        )
         .expect("install count query succeeds");
     assert_eq!(install_count, 1);
     let projection_count: i64 = connection

@@ -540,7 +540,8 @@ impl LocalStateStore {
                 "SELECT scope, skill_id, source_kind, source_url, source_subpath, \
                  resolved_revision, upstream_revision, content_hash, overlay_hash, \
                  effective_version_hash, installed_at, updated_at, detached, forked \
-                 FROM install_records ORDER BY scope, skill_id",
+                 FROM install_records \
+                 ORDER BY CASE scope WHEN 'workspace' THEN 0 ELSE 1 END, skill_id",
             )
             .map_err(|source| {
                 local_state_query(&self.path, "prepare install records query", source)

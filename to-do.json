@@ -475,7 +475,7 @@
         "T011",
         "T013"
       ],
-      "updated_at": "2026-03-19T13:53:20Z",
+      "updated_at": "2026-03-19T13:54:45Z",
       "files": [
         "src/planner.rs",
         "src/source.rs",
@@ -489,7 +489,7 @@
       "id": "T019",
       "title": "Implement the bundled `skillctl` management skill at user scope",
       "priority": 3,
-      "status": "todo",
+      "status": "done",
       "details": "Ship and manage a built-in `skillctl` skill that helps agents use the CLI and debug missing or stale skills.",
       "steps": [
         "Package the bundled skill as a managed built-in asset with explicit versioning.",
@@ -500,7 +500,20 @@
         "T006",
         "T011",
         "T018"
-      ]
+      ],
+      "updated_at": "2026-03-19T14:20:58Z",
+      "files": [
+        "assets/bundled/skillctl/SKILL.md",
+        "src/builtin.rs",
+        "src/doctor.rs",
+        "src/lib.rs",
+        "src/runtime.rs",
+        "src/skill.rs",
+        "src/state.rs",
+        "tests/cli.rs",
+        "to-do.json"
+      ],
+      "blockers": []
     },
     {
       "id": "T020",
@@ -604,24 +617,24 @@
       "depends_on": [
         "T001"
       ],
-      "updated_at": "2026-03-19T13:29:53Z",
+      "updated_at": "2026-03-19T13:30:23Z",
       "files": [
         "src/telemetry.rs",
-        "tests/integration_matrix.rs",
-        "tests/support/mod.rs",
+        "tests/fixtures/broken-symlink/.agents/skills/release-notes/SKILL.md",
+        "tests/fixtures/broken-symlink/.agents/skills/release-notes/notes.md",
         "tests/fixtures/canonical-only/.agents/skills/release-notes/SKILL.md",
         "tests/fixtures/canonical-only/.agents/skills/release-notes/notes.md",
         "tests/fixtures/imported-with-overlay/.agents/skills/release-notes/SKILL.md",
         "tests/fixtures/imported-with-overlay/.agents/skills/release-notes/notes.md",
+        "tests/fixtures/nested-monorepo/packages/platform/.agents/skills/bug-triage/SKILL.md",
+        "tests/fixtures/opencode-layout/.opencode/skills/ai-sdk/SKILL.md",
+        "tests/fixtures/private-source/.agents/skills/private-skill/SKILL.md",
+        "tests/fixtures/repo-root-layout/skills/ai-sdk/SKILL.md",
         "tests/fixtures/same-name-conflict/.agents/skills/release-notes/SKILL.md",
         "tests/fixtures/same-name-conflict/skills/release-notes/SKILL.md",
-        "tests/fixtures/nested-monorepo/packages/platform/.agents/skills/bug-triage/SKILL.md",
-        "tests/fixtures/broken-symlink/.agents/skills/release-notes/SKILL.md",
-        "tests/fixtures/broken-symlink/.agents/skills/release-notes/notes.md",
-        "tests/fixtures/opencode-layout/.opencode/skills/ai-sdk/SKILL.md",
-        "tests/fixtures/repo-root-layout/skills/ai-sdk/SKILL.md",
         "tests/fixtures/update-blocker/.agents/skills/release-notes/SKILL.md",
-        "tests/fixtures/private-source/.agents/skills/private-skill/SKILL.md",
+        "tests/integration_matrix.rs",
+        "tests/support/mod.rs",
         "to-do.json"
       ],
       "blockers": []
@@ -641,16 +654,17 @@
         "T001",
         "T024"
       ],
-      "updated_at": "2026-03-19T13:35:08Z",
+      "updated_at": "2026-03-19T13:37:59Z",
       "files": [
         ".github/workflows/ci.yml",
         "README.md",
-        "src/lib.rs",
         "src/cli.rs",
-        "src/source.rs",
-        "src/planner.rs",
         "src/doctor.rs",
-        "tests/cli.rs"
+        "src/lib.rs",
+        "src/planner.rs",
+        "src/source.rs",
+        "tests/cli.rs",
+        "to-do.json"
       ]
     },
     {

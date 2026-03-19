@@ -7,6 +7,7 @@
 
 pub mod adapter;
 pub mod app;
+mod builtin;
 pub mod cli;
 pub mod doctor;
 pub mod error;

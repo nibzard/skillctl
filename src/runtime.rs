@@ -6,6 +6,7 @@ use clap::{CommandFactory, Parser, error::ErrorKind};
 
 use crate::{
     app::{AppContext, OutputMode, Verbosity},
+    builtin,
     cli::{Cli, Command},
     doctor,
     error::{AppError, ExitStatus},
@@ -56,7 +57,12 @@ pub fn run(cli: Cli) -> Result<RunResult, AppError> {
             },
             exit_status: ExitStatus::Success,
         }),
-        Some(command) => run_command(command, &context),
+        Some(command) => {
+            if let Err(error) = builtin::ensure_bundled_skill(&context, false) {
+                return render_failure(output_mode, verbosity, command.name(), error);
+            }
+            run_command(command, &context)
+        }
     }
 }
 

@@ -9,6 +9,7 @@ use std::{
 use crate::{
     adapter::{AdapterRegistry, InstallModeRisk, TargetRuntime, TargetScope},
     app::AppContext,
+    builtin,
     cli::Scope,
     error::{AppError, ExitStatus},
     lockfile::WorkspaceLockfile,
@@ -210,6 +211,20 @@ pub fn handle_doctor(
     let analysis = analyze_workspace(context)?;
     let mut issues = analysis.validation.issues.clone();
     issues.extend(doctor_issues(context, &analysis)?);
+    issues.extend(
+        builtin::diagnostics(context)?
+            .into_iter()
+            .map(|diagnostic| DiagnosticIssue {
+                severity: DiagnosticSeverity::Warning,
+                code: diagnostic.code,
+                skill: Some("skillctl".to_string()),
+                scope: Some("user".to_string()),
+                target: None,
+                path: diagnostic.path,
+                message: diagnostic.message,
+                fix: diagnostic.fix,
+            }),
+    );
     let report = report_from_issues(analysis.validation.checked_skill_count, issues);
     render_diagnostic_report("doctor", report)
 }

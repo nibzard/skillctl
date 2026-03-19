@@ -12,6 +12,7 @@ use serde_yaml::Value;
 use crate::{
     adapter::{AdapterRegistry, TargetScope},
     app::AppContext,
+    builtin,
     cli::Scope,
     doctor,
     error::AppError,
@@ -302,10 +303,11 @@ pub fn handle_list(context: &AppContext, _request: ListRequest) -> Result<AppRes
         skills.push(json!({
             "skill": install.skill.skill_id,
             "scope": install.skill.scope.as_str(),
+            "builtin": builtin::is_bundled_install(&install),
             "managed_import": managed_import.is_some(),
             "managed_import_enabled": managed_import.map(|import| import.enabled),
             "source": {
-                "type": install.source_kind,
+                "type": source_type_label(&install),
                 "url": install.source_url,
                 "subpath": install.source_subpath,
             },
@@ -353,11 +355,17 @@ pub fn handle_remove(
     context: &AppContext,
     request: RemoveRequest,
 ) -> Result<AppResponse, AppError> {
-    let mut manifest = load_manifest_or_default(&context.working_directory)?;
-    let mut lockfile = load_lockfile_or_default(&context.working_directory)?;
     let mut store = LocalStateStore::open_default()?;
     let managed_skill =
-        resolve_installed_skill(&store, request.skill.as_str(), context.selector.scope)?;
+        match resolve_installed_skill(&store, request.skill.as_str(), context.selector.scope) {
+            Ok(skill) => skill,
+            Err(_error)
+                if builtin::is_bundled_request(request.skill.as_str(), context.selector.scope) =>
+            {
+                return builtin::handle_remove(context);
+            }
+            Err(error) => return Err(error),
+        };
     let install_record =
         store
             .install_record(&managed_skill)?
@@ -367,6 +375,12 @@ pub fn handle_remove(
                     request.skill.as_str()
                 ),
             })?;
+    if builtin::is_bundled_install(&install_record) {
+        return builtin::handle_remove(context);
+    }
+
+    let mut manifest = load_manifest_or_default(&context.working_directory)?;
+    let mut lockfile = load_lockfile_or_default(&context.working_directory)?;
     let timestamp = current_timestamp();
     let mut removed_paths = Vec::new();
     let mut retained_paths = Vec::new();
@@ -468,6 +482,25 @@ pub fn handle_enable(
     context: &AppContext,
     request: EnableRequest,
 ) -> Result<AppResponse, AppError> {
+    if builtin::is_bundled_request(request.skill.as_str(), context.selector.scope) {
+        let store = LocalStateStore::open_default()?;
+        match resolve_installed_skill(&store, request.skill.as_str(), context.selector.scope) {
+            Ok(managed_skill) => {
+                let install_record = store.install_record(&managed_skill)?.ok_or_else(|| {
+                    AppError::ResolutionValidation {
+                        message: format!(
+                            "skill '{}' does not have an installed state record",
+                            request.skill.as_str()
+                        ),
+                    }
+                })?;
+                if builtin::is_bundled_install(&install_record) {
+                    return builtin::handle_enable(context);
+                }
+            }
+            Err(_) => return builtin::handle_enable(context),
+        }
+    }
     toggle_managed_import(context, request.skill.as_str(), true, "enable")
 }
 
@@ -498,18 +531,23 @@ pub fn handle_path(context: &AppContext, request: PathRequest) -> Result<AppResp
     let snapshot = store.skill_snapshot(&managed_skill)?;
     let managed_import = managed_import(&manifest, &managed_skill);
     let lockfile_entry = managed_import.and_then(|import| lockfile.imports.get(&import.id));
-    let planned_roots = planned_root_views(
-        context,
-        &manifest,
-        managed_skill.scope,
-        request.skill.as_str(),
-    )?;
+    let planned_roots = if builtin::is_bundled_install(&install_record) {
+        builtin::planned_root_views(context)?
+    } else {
+        planned_root_views(
+            context,
+            &manifest,
+            managed_skill.scope,
+            request.skill.as_str(),
+        )?
+    };
 
     Ok(AppResponse::success("path")
         .with_summary(format!("Resolved filesystem paths for {}.", request.skill.as_str()))
         .with_data(json!({
             "skill": request.skill.as_str(),
             "scope": managed_skill.scope.as_str(),
+            "builtin": builtin::is_bundled_install(&install_record),
             "managed_import": managed_import.is_some(),
             "managed_import_enabled": managed_import.map(|import| import.enabled),
             "stored_source_root": lockfile_entry
@@ -536,7 +574,7 @@ pub fn handle_path(context: &AppContext, request: PathRequest) -> Result<AppResp
                 None
             },
             "source": {
-                "type": install_record.source_kind,
+                "type": source_type_label(&install_record),
                 "url": install_record.source_url,
                 "subpath": install_record.source_subpath,
             },
@@ -622,6 +660,18 @@ fn projection_view(
         "generated_at": projection.generated_at,
         "effective_version_hash": projection.effective_version_hash,
     }))
+}
+
+fn source_type_label(install: &crate::state::InstallRecord) -> &'static str {
+    if builtin::is_bundled_install(install) {
+        "built-in"
+    } else {
+        match install.source_kind {
+            crate::source::SourceKind::Git => "git",
+            crate::source::SourceKind::LocalPath => "local-path",
+            crate::source::SourceKind::Archive => "archive",
+        }
+    }
 }
 
 fn planned_root_views(
