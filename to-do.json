@@ -928,6 +928,30 @@
         "to-do.json"
       ],
       "updated_at": "2026-03-19T17:12:55Z"
+    },
+    {
+      "id": "T035",
+      "title": "Enable positive public-source telemetry classification for verified public Git remotes",
+      "priority": 2,
+      "status": "done",
+      "details": "The telemetry model, CLI copy, README, and spec all describe public-source install and update events, but `classify_git_source_visibility` never returns `public` for any real remote input. That leaves `emitted` permanently false and `public_source` permanently null for real Git installs and updates.",
+      "steps": [
+        "Design a conservative allowlist or proof mechanism that can classify known-public Git remotes as `public` without regressing the existing private-source suppression guarantees.",
+        "Wire that positive classification through install and update telemetry reports so real public Git events can set `emitted: true` and include the normalized public source identifier.",
+        "Add CLI and unit regression coverage for both positive public Git cases and the existing local or private suppression cases."
+      ],
+      "tags": [
+        "review-followup",
+        "telemetry",
+        "privacy"
+      ],
+      "files": [
+        "src/telemetry.rs",
+        "tests/cli.rs",
+        "to-do.json"
+      ],
+      "created_at": "2026-03-19T17:21:23Z",
+      "updated_at": "2026-03-19T17:31:35Z"
     }
   ]
 }

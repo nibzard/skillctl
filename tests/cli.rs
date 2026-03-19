@@ -947,6 +947,62 @@ fn install_suppresses_remote_telemetry_for_private_https_git_sources() {
 }
 
 #[test]
+fn install_emits_remote_telemetry_for_verified_public_https_git_sources() {
+    let workspace = TestWorkspace::new();
+    workspace.write_skill_source("git-source", "release-notes");
+    workspace.init_git_repo("git-source");
+
+    let public_https_url = "https://github.com/vercel/ai.git";
+    let git_config_path = workspace.path().join("gitconfig");
+    fs::write(
+        &git_config_path,
+        format!(
+            "[url \"{}\"]\n\tinsteadOf = {}\n",
+            workspace.git_repo_url("git-source"),
+            public_https_url
+        ),
+    )
+    .expect("git config written");
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("GIT_CONFIG_GLOBAL", &git_config_path)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args([
+            "--json",
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            public_https_url,
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let body: Value = serde_json::from_slice(&assert.get_output().stdout).expect("stdout is json");
+
+    assert_eq!(body["command"], "install");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["data"]["source"]["type"], "git");
+    assert_eq!(body["data"]["source"]["url"], public_https_url);
+    assert_eq!(body["data"]["telemetry"]["events"][0]["kind"], "install");
+    assert_eq!(body["data"]["telemetry"]["events"][0]["emitted"], true);
+    assert!(body["data"]["telemetry"]["events"][0]["suppression_reason"].is_null());
+    assert_eq!(
+        body["data"]["telemetry"]["events"][0]["source_visibility"],
+        "public"
+    );
+    assert_eq!(
+        body["data"]["telemetry"]["events"][0]["public_source"],
+        public_https_url
+    );
+}
+
+#[test]
 fn install_warns_and_reports_trust_for_unreviewed_script_imports() {
     let workspace = TestWorkspace::new();
     workspace.write_skill_source("shared-skills", "release-notes");
@@ -2362,6 +2418,74 @@ fn update_checks_git_upstream_and_records_a_safe_apply_plan() {
         body["data"]["telemetry"]["events"][0]["source_visibility"],
         "suppressed-local"
     );
+}
+
+#[test]
+fn update_emits_remote_telemetry_for_verified_public_https_git_sources() {
+    let workspace = TestWorkspace::new();
+    workspace.write_skill_source("git-source", "release-notes");
+    workspace.init_git_repo("git-source");
+
+    let public_https_url = "https://github.com/vercel/ai.git";
+    let git_config_path = workspace.path().join("gitconfig");
+    fs::write(
+        &git_config_path,
+        format!(
+            "[url \"{}\"]\n\tinsteadOf = {}\n",
+            workspace.git_repo_url("git-source"),
+            public_https_url
+        ),
+    )
+    .expect("git config written");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("GIT_CONFIG_GLOBAL", &git_config_path)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            public_https_url,
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    workspace.write_skill_source_at(
+        "git-source",
+        ".agents/skills/release-notes",
+        "release-notes",
+        "Updated upstream release notes helper.",
+    );
+    workspace.commit_all("git-source", "update release notes");
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("GIT_CONFIG_GLOBAL", &git_config_path)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["--json", "update", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let body: Value = serde_json::from_slice(&assert.get_output().stdout).expect("stdout is json");
+    let telemetry = &body["data"]["telemetry"]["events"][0];
+
+    assert_eq!(body["command"], "update");
+    assert_eq!(body["ok"], true);
+    assert_eq!(telemetry["kind"], "update");
+    assert_eq!(telemetry["emitted"], true);
+    assert!(telemetry["suppression_reason"].is_null());
+    assert_eq!(telemetry["source_visibility"], "public");
+    assert_eq!(telemetry["public_source"], public_https_url);
 }
 
 #[test]

@@ -25,6 +25,10 @@ const FIRST_RUN_NOTICE: &str = concat!(
     "It never includes private repo identifiers or skill contents. ",
     "Run `skillctl telemetry disable` to opt out."
 );
+const VERIFIED_PUBLIC_GIT_REPOSITORIES: &[(&str, &str)] = &[
+    ("github.com", "nibzard/skillctl"),
+    ("github.com", "vercel/ai"),
+];
 
 /// Supported telemetry collection modes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -513,8 +517,11 @@ fn classify_git_source_visibility(source: &NormalizedInstallSource) -> SourceVis
 
             match parsed.host_str() {
                 Some(host) if is_local_host(host) => SourceVisibility::SuppressedLocal,
+                Some(host) if is_verified_public_git_repository(host, parsed.path()) => {
+                    SourceVisibility::Public
+                }
                 // Remote Git URLs can represent private repositories even on public forges.
-                // Keep them suppressed until visibility is proven by a stronger signal.
+                // Keep them suppressed until visibility is proven by an explicit allowlist.
                 Some(_) => SourceVisibility::SuppressedPrivate,
                 None => SourceVisibility::SuppressedPrivate,
             }
@@ -525,6 +532,20 @@ fn classify_git_source_visibility(source: &NormalizedInstallSource) -> SourceVis
 
 fn is_local_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+fn is_verified_public_git_repository(host: &str, path: &str) -> bool {
+    let normalized_host = host.to_ascii_lowercase();
+    let normalized_path = path
+        .trim_matches('/')
+        .trim_end_matches(".git")
+        .to_ascii_lowercase();
+
+    VERIFIED_PUBLIC_GIT_REPOSITORIES
+        .iter()
+        .any(|(verified_host, verified_path)| {
+            normalized_host == *verified_host && normalized_path == *verified_path
+        })
 }
 
 #[cfg(test)]
@@ -571,6 +592,25 @@ mod tests {
         );
         assert!(!allows_remote_emission(settings, &https));
         assert!(!allows_remote_emission(settings, &git));
+    }
+
+    #[test]
+    fn verified_public_git_sources_enable_remote_emission() {
+        let settings = TelemetrySettings {
+            enabled: true,
+            mode: TelemetryMode::PublicOnly,
+        };
+        let public = source(
+            SourceKind::Git,
+            "https://github.com/vercel/ai.git",
+            "https://github.com/vercel/ai.git",
+        );
+
+        assert_eq!(
+            classify_source_visibility(&public),
+            SourceVisibility::Public
+        );
+        assert!(allows_remote_emission(settings, &public));
     }
 
     #[test]
