@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -106,6 +107,7 @@ fn global_execution_flags_are_accepted_before_the_subcommand() {
 
     let assert = cmd
         .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
         .args([
             "--json",
             "--no-input",
@@ -130,7 +132,14 @@ fn global_execution_flags_are_accepted_before_the_subcommand() {
     assert_eq!(body["command"], "install");
     assert_eq!(body["ok"], true);
     assert_eq!(body["data"]["source"]["type"], "local-path");
-    assert_eq!(body["data"]["candidates"][0]["name"], "release-notes");
+    assert_eq!(body["data"]["selected"][0]["name"], "release-notes");
+    assert_eq!(body["data"]["installed"][0]["scope"], "workspace");
+    assert!(
+        workspace
+            .path()
+            .join(".agents/skills/release-notes/SKILL.md")
+            .is_file()
+    );
 }
 
 #[test]
@@ -141,6 +150,207 @@ fn install_alias_help_is_available() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Install"));
+}
+
+#[test]
+fn install_requires_explicit_selection_when_non_interactive() {
+    let workspace = TestWorkspace::new();
+    workspace.write_skill_source("shared-skills", "release-notes");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--no-input", "install", "shared-skills"])
+        .assert()
+        .failure()
+        .code(5)
+        .stderr(predicate::str::contains(
+            "interactive input is required for command 'install'",
+        ));
+}
+
+#[test]
+fn install_rejects_ambiguous_exact_name_selection() {
+    let workspace = TestWorkspace::new();
+    workspace.write_skill_source_at(
+        "shared-skills",
+        ".agents/skills/release-notes",
+        "release-notes",
+        "Canonical release notes helper.",
+    );
+    workspace.write_skill_source_at(
+        "shared-skills",
+        "skills/release-notes",
+        "release-notes",
+        "Packaged release notes helper.",
+    );
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "exact skill name 'release-notes' is ambiguous",
+        ));
+}
+
+#[test]
+fn install_interactively_selects_a_candidate_and_scope() {
+    let workspace = TestWorkspace::new();
+    workspace.write_skill_source("shared-skills", "release-notes");
+    workspace.write_skill_source("shared-skills", "bug-triage");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--interactive", "install", "shared-skills"])
+        .write_stdin("1\n1\n")
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty())
+        .stdout(predicate::str::contains("Select skills"))
+        .stdout(predicate::str::contains("Select scope"))
+        .stdout(predicate::str::contains("Installed 1 skill"));
+
+    let manifest = fs::read_to_string(workspace.path().join(".agents/skillctl.yaml"))
+        .expect("manifest exists");
+    assert!(
+        manifest.contains("id: bug-triage"),
+        "manifest was {manifest}"
+    );
+    assert!(
+        workspace.path().join(".agents/skills/bug-triage").is_dir(),
+        "selected skill should be materialized into the workspace root",
+    );
+    assert!(
+        !workspace
+            .path()
+            .join(".agents/skills/release-notes")
+            .exists(),
+        "unselected skill should not be installed",
+    );
+}
+
+#[test]
+fn install_updates_manifest_lockfile_store_state_and_projection_records() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_skill_source("shared-skills", "release-notes");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770000000")
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty())
+        .stdout(predicate::str::contains("Installed 1 skill"))
+        .stdout(predicate::str::contains(
+            "Materialized 1 generated projection",
+        ));
+
+    let manifest = fs::read_to_string(workspace.path().join(".agents/skillctl.yaml"))
+        .expect("manifest exists");
+    assert!(
+        manifest.contains("id: release-notes"),
+        "manifest was {manifest}"
+    );
+    assert!(
+        manifest.contains("type: local-path"),
+        "manifest should record the installed source kind: {manifest}",
+    );
+
+    let lockfile = fs::read_to_string(workspace.path().join(".agents/skillctl.lock"))
+        .expect("lockfile exists");
+    assert!(
+        lockfile.contains("imports:\n  release-notes:"),
+        "lockfile was {lockfile}",
+    );
+    assert!(
+        lockfile.contains("type: local-path"),
+        "lockfile should record the installed source kind: {lockfile}",
+    );
+
+    assert!(
+        workspace
+            .home_path()
+            .join(".skillctl/store/imports/release-notes/.agents/skills/release-notes/SKILL.md")
+            .is_file(),
+        "stored import checkout should exist",
+    );
+    assert!(
+        workspace
+            .path()
+            .join(".claude/skills/release-notes/.skillctl-projection.json")
+            .is_file(),
+        "generated projection metadata should exist",
+    );
+
+    let connection = Connection::open(workspace.home_path().join(".skillctl/state.db"))
+        .expect("state database opens");
+    let install_row: (String, String, String) = connection
+        .query_row(
+            "SELECT scope, skill_id, source_kind FROM install_records",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("install record exists");
+    assert_eq!(
+        install_row,
+        (
+            "workspace".to_string(),
+            "release-notes".to_string(),
+            "local-path".to_string()
+        )
+    );
+
+    let projection_target: String = connection
+        .query_row(
+            "SELECT target FROM projection_records WHERE skill_id = ?1",
+            params!["release-notes"],
+            |row| row.get(0),
+        )
+        .expect("projection record exists");
+    assert_eq!(projection_target, "claude-code");
+
+    let history_kinds: Vec<String> = connection
+        .prepare(
+            "SELECT kind FROM history_events WHERE skill_id = ?1 ORDER BY occurred_at ASC, id ASC",
+        )
+        .expect("statement prepares")
+        .query_map(params!["release-notes"], |row| row.get(0))
+        .expect("history query succeeds")
+        .collect::<Result<_, _>>()
+        .expect("history rows decode");
+    assert_eq!(
+        history_kinds,
+        vec!["install".to_string(), "projection".to_string()]
+    );
 }
 
 #[test]
@@ -502,6 +712,12 @@ impl TestWorkspace {
         &self.path
     }
 
+    fn home_path(&self) -> PathBuf {
+        let path = self.path.join("home");
+        fs::create_dir_all(&path).expect("home directory exists");
+        path
+    }
+
     fn write_manifest(&self, contents: &str) {
         self.write_file(".agents/skillctl.yaml", contents);
     }
@@ -553,11 +769,22 @@ impl TestWorkspace {
     }
 
     fn write_skill_source(&self, source_dir: &str, skill_name: &str) {
-        let skill_root = self
-            .path
-            .join(source_dir)
-            .join(".agents/skills")
-            .join(skill_name);
+        self.write_skill_source_at(
+            source_dir,
+            &format!(".agents/skills/{skill_name}"),
+            skill_name,
+            "Summarize release notes.",
+        );
+    }
+
+    fn write_skill_source_at(
+        &self,
+        source_dir: &str,
+        relative_skill_root: &str,
+        skill_name: &str,
+        description: &str,
+    ) {
+        let skill_root = self.path.join(source_dir).join(relative_skill_root);
         fs::create_dir_all(&skill_root).expect("skill source root exists");
         fs::write(
             skill_root.join("SKILL.md"),
@@ -565,12 +792,13 @@ impl TestWorkspace {
                 concat!(
                     "---\n",
                     "name: {skill_name}\n",
-                    "description: Summarize release notes.\n",
+                    "description: {description}\n",
                     "---\n",
                     "\n",
-                    "# Release Notes\n"
+                    "# {skill_name}\n"
                 ),
-                skill_name = skill_name
+                skill_name = skill_name,
+                description = description,
             ),
         )
         .expect("skill manifest exists");

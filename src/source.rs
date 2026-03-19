@@ -1,9 +1,11 @@
 //! Source detection, normalization, staging, and install inspection.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
+    env,
     ffi::OsStr,
     fs::{self, File},
-    io::{self, Read},
+    io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -12,14 +14,31 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+use time::{OffsetDateTime, macros::format_description};
 use url::Url;
 
 use crate::{
     adapter::{AdapterRegistry, TargetRuntime, TargetScope},
-    app::AppContext,
+    app::{AppContext, InteractionMode, OutputMode},
+    cli::Scope,
     error::AppError,
+    history::HistoryLedger,
+    lockfile::{
+        LockedHashes, LockedImport, LockedRevision, LockedSource, LockedTimestamps, LockfilePath,
+        LockfileTimestamp, WorkspaceLockfile,
+    },
+    manifest::{
+        DEFAULT_MANIFEST_PATH, ImportDefinition, ImportSourceType, ManifestPath, ManifestScope,
+        WorkspaceManifest,
+    },
+    materialize::{self, MaterializationReport},
+    overlay::DEFAULT_OVERLAYS_DIR,
     response::AppResponse,
-    skill::SkillDefinition,
+    skill::{DEFAULT_SKILLS_DIR, SkillDefinition},
+    state::{
+        InstallRecord, LocalStateStore, ManagedScope, ManagedSkillRef, PinRecord, ProjectionMode,
+        ProjectionRecord,
+    },
 };
 
 const DETECTION_ROOTS: &[DetectionRoot] = &[
@@ -176,20 +195,64 @@ struct PreparedSource {
     _staging_dir: Option<TempDir>,
 }
 
+struct PreparedInstall {
+    source: NormalizedInstallSource,
+    revision: SourceRevision,
+    candidates: Vec<InstallCandidate>,
+    root: PathBuf,
+    _staging_dir: Option<TempDir>,
+}
+
+impl PreparedInstall {
+    fn inspection(&self) -> InstallInspection {
+        InstallInspection {
+            source: self.source.clone(),
+            revision: self.revision.clone(),
+            candidates: self.candidates.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct InstalledSkill {
+    /// Stable manifest import identifier created for this install.
+    pub id: String,
+    /// Installed skill name.
+    pub name: String,
+    /// Selected management scope.
+    pub scope: String,
+    /// Relative source path where the skill was detected.
+    pub source_path: String,
+    /// Stable selected source subpath stored in the lockfile.
+    pub selected_subpath: String,
+    /// Filesystem root storing the staged immutable source copy.
+    pub stored_source_root: String,
+    /// Exact installed revision or digest.
+    pub resolved_revision: String,
+    /// Last observed upstream revision, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_revision: Option<String>,
+    /// Hash of the selected skill contents.
+    pub content_hash: String,
+    /// Hash of the applied overlay set.
+    pub overlay_hash: String,
+    /// Effective version hash derived from the pinned inputs.
+    pub effective_version_hash: String,
+}
+
+#[derive(Clone, Debug)]
+struct InstallOperation {
+    installed: InstalledSkill,
+    import: ImportDefinition,
+    locked_import: LockedImport,
+}
+
 /// Inspect, normalize, and stage an install source before later lifecycle steps.
 pub fn inspect_install_source(
     working_directory: &Path,
     request: &InstallRequest,
 ) -> Result<InstallInspection, AppError> {
-    let resolved = resolve_install_source(&request.source, working_directory)?;
-    let prepared = prepare_source(&resolved)?;
-    let candidates = detect_install_candidates(&prepared.root, &prepared.source.raw)?;
-
-    Ok(InstallInspection {
-        source: prepared.source,
-        revision: prepared.revision,
-        candidates,
-    })
+    Ok(prepare_install_source(working_directory, request)?.inspection())
 }
 
 /// Handle `skillctl install`.
@@ -197,17 +260,909 @@ pub fn handle_install(
     context: &AppContext,
     request: InstallRequest,
 ) -> Result<AppResponse, AppError> {
-    let inspection = inspect_install_source(&context.working_directory, &request)?;
-    let candidate_count = inspection.candidates.len();
-    let plural = if candidate_count == 1 { "" } else { "s" };
-    let summary = format!(
-        "Detected {candidate_count} install candidate{plural} from {} at {}",
-        inspection.source.display, inspection.revision.resolved
-    );
+    let prepared = prepare_install_source(&context.working_directory, &request)?;
+    let inspection = prepared.inspection();
+    let selected = select_install_candidates(context, &inspection)?;
+    let scope = select_install_scope(context)?;
+
+    ensure_workspace_bootstrap(&context.working_directory)?;
+
+    let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
+    let mut lockfile = WorkspaceLockfile::load_from_workspace(&context.working_directory)?;
+
+    validate_install_selection(
+        &context.working_directory,
+        &manifest,
+        &inspection.source,
+        scope,
+        &selected,
+    )?;
+
+    let install_timestamp = current_timestamp();
+    let imports_root = imports_store_root()?;
+    let mut operations = Vec::with_capacity(selected.len());
+
+    for candidate in &selected {
+        let operation = build_install_operation(
+            &prepared,
+            &inspection.source,
+            &inspection.revision,
+            &lockfile,
+            scope,
+            candidate,
+            &imports_root,
+            &install_timestamp,
+        )?;
+        upsert_manifest_import(&mut manifest, operation.import.clone());
+        lockfile.imports.insert(
+            operation.installed.id.clone(),
+            operation.locked_import.clone(),
+        );
+        operations.push(operation);
+    }
+
+    write_manifest(&manifest)?;
+    lockfile.write_to_path()?;
+
+    for operation in &operations {
+        copy_source_tree(
+            &prepared.root,
+            Path::new(&operation.installed.stored_source_root),
+        )?;
+    }
+
+    let sync_report = materialize::sync_workspace(&install_context_for_scope(context, scope))?;
+    record_install_state(scope, &operations, &sync_report, &install_timestamp)?;
+
+    let installed: Vec<_> = operations
+        .iter()
+        .map(|operation| operation.installed.clone())
+        .collect();
+    let summary = install_summary(&installed, &sync_report);
 
     Ok(AppResponse::success("install")
         .with_summary(summary)
-        .with_data(json!(inspection)))
+        .with_data(json!({
+            "source": inspection.source,
+            "revision": inspection.revision,
+            "candidates": inspection.candidates,
+            "selected": selected,
+            "installed": installed,
+            "projection": sync_report,
+        })))
+}
+
+fn prepare_install_source(
+    working_directory: &Path,
+    request: &InstallRequest,
+) -> Result<PreparedInstall, AppError> {
+    let resolved = resolve_install_source(&request.source, working_directory)?;
+    let prepared = prepare_source(&resolved)?;
+    let candidates = detect_install_candidates(&prepared.root, &prepared.source.raw)?;
+
+    Ok(PreparedInstall {
+        source: prepared.source,
+        revision: prepared.revision,
+        candidates,
+        root: prepared.root,
+        _staging_dir: prepared._staging_dir,
+    })
+}
+
+fn select_install_candidates(
+    context: &AppContext,
+    inspection: &InstallInspection,
+) -> Result<Vec<InstallCandidate>, AppError> {
+    if let Some(skill_name) = &context.selector.skill_name {
+        return select_by_exact_name(inspection, skill_name);
+    }
+
+    if install_requires_non_interactive_selection(context) {
+        return Err(AppError::InputRequired { command: "install" });
+    }
+
+    prompt_for_install_candidates(inspection)
+}
+
+fn select_install_scope(context: &AppContext) -> Result<TargetScope, AppError> {
+    if let Some(scope) = context.selector.scope {
+        return Ok(target_scope(scope));
+    }
+
+    if should_prompt_for_scope(context) {
+        prompt_for_install_scope()
+    } else {
+        Ok(TargetScope::Workspace)
+    }
+}
+
+fn select_by_exact_name(
+    inspection: &InstallInspection,
+    skill_name: &str,
+) -> Result<Vec<InstallCandidate>, AppError> {
+    let matches: Vec<_> = inspection
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.name == skill_name)
+        .cloned()
+        .collect();
+
+    match matches.len() {
+        0 => Err(source_validation(
+            inspection.source.raw.clone(),
+            format!("exact skill name '{skill_name}' was not found in the detected candidates"),
+        )),
+        1 => Ok(matches),
+        _ => Err(source_validation(
+            inspection.source.raw.clone(),
+            format!(
+                "exact skill name '{skill_name}' is ambiguous; matches {}",
+                matches
+                    .iter()
+                    .map(|candidate| candidate.source_path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )),
+    }
+}
+
+fn install_requires_non_interactive_selection(context: &AppContext) -> bool {
+    if matches!(context.output_mode, OutputMode::Json) {
+        return true;
+    }
+
+    match context.interaction_mode {
+        InteractionMode::Interactive => false,
+        InteractionMode::NonInteractive => true,
+        InteractionMode::Auto => !(io::stdin().is_terminal() && io::stdout().is_terminal()),
+    }
+}
+
+fn should_prompt_for_scope(context: &AppContext) -> bool {
+    if matches!(context.output_mode, OutputMode::Json) {
+        return false;
+    }
+
+    match context.interaction_mode {
+        InteractionMode::Interactive => true,
+        InteractionMode::NonInteractive => false,
+        InteractionMode::Auto => io::stdin().is_terminal() && io::stdout().is_terminal(),
+    }
+}
+
+fn prompt_for_install_candidates(
+    inspection: &InstallInspection,
+) -> Result<Vec<InstallCandidate>, AppError> {
+    let candidate_count = inspection.candidates.len();
+    println!(
+        "Detected {candidate_count} install candidate{} from {} at {}",
+        plural_suffix(candidate_count),
+        inspection.source.display,
+        inspection.revision.resolved
+    );
+    println!("Pinned revision: {}", inspection.revision.resolved);
+    for (index, candidate) in inspection.candidates.iter().enumerate() {
+        let compatible_targets = if candidate.compatible_targets.is_empty() {
+            "generic".to_string()
+        } else {
+            candidate
+                .compatible_targets
+                .iter()
+                .map(|target| target.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        println!(
+            "  {}. {} ({}) [{}]",
+            index + 1,
+            candidate.display_name,
+            candidate.source_path,
+            compatible_targets
+        );
+    }
+
+    let answer =
+        prompt_line("Select skills by number, exact name, comma-separated list, or '*' for all: ")?;
+    parse_candidate_selection(&answer, inspection)
+}
+
+fn parse_candidate_selection(
+    answer: &str,
+    inspection: &InstallInspection,
+) -> Result<Vec<InstallCandidate>, AppError> {
+    let trimmed = answer.trim();
+    if trimmed.is_empty() {
+        return Err(source_validation(
+            inspection.source.raw.clone(),
+            "interactive install selection must not be empty",
+        ));
+    }
+
+    if matches!(trimmed, "*" | "all" | "ALL") {
+        return Ok(inspection.candidates.clone());
+    }
+
+    let mut selected_indexes = BTreeSet::new();
+    for token in trimmed.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+
+        if let Ok(position) = token.parse::<usize>() {
+            if !(1..=inspection.candidates.len()).contains(&position) {
+                return Err(source_validation(
+                    inspection.source.raw.clone(),
+                    format!(
+                        "interactive install selection index '{position}' is out of range 1..{}",
+                        inspection.candidates.len()
+                    ),
+                ));
+            }
+            selected_indexes.insert(position - 1);
+            continue;
+        }
+
+        let matches: Vec<_> = inspection
+            .candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| candidate.name == token)
+            .map(|(index, _)| index)
+            .collect();
+        match matches.len() {
+            0 => {
+                return Err(source_validation(
+                    inspection.source.raw.clone(),
+                    format!("interactive install selection '{token}' did not match any candidate"),
+                ));
+            }
+            1 => {
+                selected_indexes.insert(matches[0]);
+            }
+            _ => {
+                return Err(source_validation(
+                    inspection.source.raw.clone(),
+                    format!("interactive install selection '{token}' is ambiguous"),
+                ));
+            }
+        }
+    }
+
+    if selected_indexes.is_empty() {
+        return Err(source_validation(
+            inspection.source.raw.clone(),
+            "interactive install selection must choose at least one candidate",
+        ));
+    }
+
+    Ok(selected_indexes
+        .into_iter()
+        .map(|index| inspection.candidates[index].clone())
+        .collect())
+}
+
+fn prompt_for_install_scope() -> Result<TargetScope, AppError> {
+    println!("Select scope:");
+    println!("  1. workspace");
+    println!("  2. user");
+
+    let answer = prompt_line("Select scope [1]: ")?;
+    match answer.trim() {
+        "" | "1" | "workspace" | "w" => Ok(TargetScope::Workspace),
+        "2" | "user" | "u" => Ok(TargetScope::User),
+        other => Err(source_validation(
+            "install",
+            format!("interactive scope selection '{other}' is invalid"),
+        )),
+    }
+}
+
+fn prompt_line(prompt: &str) -> Result<String, AppError> {
+    print!("{prompt}");
+    let _ = io::stdout().flush();
+
+    let mut buffer = String::new();
+    let bytes_read = io::stdin().read_line(&mut buffer).map_err(|source| {
+        source_validation(
+            "install",
+            format!("failed to read interactive input: {source}"),
+        )
+    })?;
+    if bytes_read == 0 {
+        return Err(AppError::InputRequired { command: "install" });
+    }
+
+    Ok(buffer)
+}
+
+fn ensure_workspace_bootstrap(working_directory: &Path) -> Result<(), AppError> {
+    ensure_directory_path(&working_directory.join(DEFAULT_SKILLS_DIR))?;
+    ensure_directory_path(&working_directory.join(DEFAULT_OVERLAYS_DIR))?;
+    ensure_manifest_file(&working_directory.join(DEFAULT_MANIFEST_PATH))?;
+    ensure_lockfile_file(&working_directory.join(crate::lockfile::DEFAULT_LOCKFILE_PATH))?;
+    Ok(())
+}
+
+fn ensure_directory_path(path: &Path) -> Result<(), AppError> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(AppError::PathConflict {
+            path: path.to_path_buf(),
+            expected: "directory",
+        }),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => fs::create_dir_all(path)
+            .map_err(|source| AppError::FilesystemOperation {
+                action: "create directory",
+                path: path.to_path_buf(),
+                source,
+            }),
+        Err(source) => Err(AppError::FilesystemOperation {
+            action: "inspect directory",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn ensure_manifest_file(path: &Path) -> Result<(), AppError> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(AppError::PathConflict {
+            path: path.to_path_buf(),
+            expected: "file",
+        }),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            write_manifest(&WorkspaceManifest::default_at(path.to_path_buf()))
+        }
+        Err(source) => Err(AppError::FilesystemOperation {
+            action: "inspect manifest",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn ensure_lockfile_file(path: &Path) -> Result<(), AppError> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(AppError::PathConflict {
+            path: path.to_path_buf(),
+            expected: "file",
+        }),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            WorkspaceLockfile::default_at(path.to_path_buf()).write_to_path()
+        }
+        Err(source) => Err(AppError::FilesystemOperation {
+            action: "inspect lockfile",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn validate_install_selection(
+    working_directory: &Path,
+    manifest: &WorkspaceManifest,
+    source: &NormalizedInstallSource,
+    scope: TargetScope,
+    selected: &[InstallCandidate],
+) -> Result<(), AppError> {
+    let mut seen_names = BTreeSet::new();
+    for candidate in selected {
+        if !seen_names.insert(candidate.name.clone()) {
+            return Err(source_validation(
+                source.raw.clone(),
+                format!("skill '{}' was selected more than once", candidate.name),
+            ));
+        }
+
+        if let Some(existing) = manifest
+            .imports
+            .iter()
+            .find(|import| import.id == candidate.name)
+        {
+            let same_install = existing.kind == import_source_type(source.kind)
+                && existing.url == source.url
+                && existing.path.as_str() == candidate.selected_subpath
+                && existing.scope == manifest_scope(scope);
+            if !same_install {
+                return Err(source_validation(
+                    source.raw.clone(),
+                    format!(
+                        "skill '{}' is already managed by import '{}'",
+                        candidate.name, existing.id
+                    ),
+                ));
+            }
+        }
+
+        if scope == TargetScope::Workspace {
+            let existing_path = working_directory
+                .join(manifest.layout.skills_dir.as_str())
+                .join(&candidate.name);
+            match fs::metadata(&existing_path) {
+                Ok(metadata) if !metadata.is_dir() => {
+                    return Err(AppError::PathConflict {
+                        path: existing_path,
+                        expected: "directory",
+                    });
+                }
+                Ok(_) if !is_skillctl_generated_directory(&existing_path)? => {
+                    return Err(source_validation(
+                        source.raw.clone(),
+                        format!(
+                            "workspace skill '{}' already exists at '{}'",
+                            candidate.name,
+                            existing_path.display()
+                        ),
+                    ));
+                }
+                Ok(_) => {}
+                Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(AppError::FilesystemOperation {
+                        action: "inspect installed workspace skill",
+                        path: existing_path,
+                        source,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn build_install_operation(
+    prepared: &PreparedInstall,
+    source: &NormalizedInstallSource,
+    revision: &SourceRevision,
+    lockfile: &WorkspaceLockfile,
+    scope: TargetScope,
+    candidate: &InstallCandidate,
+    imports_root: &Path,
+    install_timestamp: &str,
+) -> Result<InstallOperation, AppError> {
+    let import_id = candidate.name.clone();
+    let source_subpath = Path::new(&candidate.selected_subpath);
+    let skill_root = prepared.root.join(source_subpath);
+    let content_hash = hash_directory_contents(&skill_root)?;
+    let overlay_hash = "sha256:none".to_string();
+    let effective_version_hash =
+        compute_effective_version_hash(&revision.resolved, &content_hash, &overlay_hash);
+    let stored_source_root = imports_root.join(&import_id);
+    let first_installed_at = lockfile
+        .imports
+        .get(&import_id)
+        .map(|entry| entry.timestamps.first_installed_at.clone())
+        .unwrap_or_else(|| LockfileTimestamp::new(install_timestamp.to_string()));
+
+    Ok(InstallOperation {
+        installed: InstalledSkill {
+            id: import_id.clone(),
+            name: candidate.name.clone(),
+            scope: scope_label(scope).to_string(),
+            source_path: candidate.source_path.clone(),
+            selected_subpath: candidate.selected_subpath.clone(),
+            stored_source_root: stored_source_root.display().to_string(),
+            resolved_revision: revision.resolved.clone(),
+            upstream_revision: revision.upstream.clone(),
+            content_hash: content_hash.clone(),
+            overlay_hash: overlay_hash.clone(),
+            effective_version_hash: effective_version_hash.clone(),
+        },
+        import: ImportDefinition {
+            id: import_id,
+            kind: import_source_type(source.kind),
+            url: source.url.clone(),
+            ref_spec: revision.resolved.clone(),
+            path: ManifestPath::new(candidate.selected_subpath.clone()),
+            scope: manifest_scope(scope),
+            enabled: true,
+        },
+        locked_import: LockedImport {
+            source: LockedSource {
+                kind: source.kind,
+                url: source.url.clone(),
+                subpath: LockfilePath::new(candidate.selected_subpath.clone()),
+            },
+            revision: LockedRevision {
+                resolved: revision.resolved.clone(),
+                upstream: revision.upstream.clone(),
+            },
+            timestamps: LockedTimestamps {
+                fetched_at: LockfileTimestamp::new(install_timestamp.to_string()),
+                first_installed_at,
+                last_updated_at: LockfileTimestamp::new(install_timestamp.to_string()),
+            },
+            hashes: LockedHashes {
+                content: content_hash,
+                overlay: overlay_hash,
+                effective_version: effective_version_hash,
+            },
+        },
+    })
+}
+
+fn upsert_manifest_import(manifest: &mut WorkspaceManifest, import: ImportDefinition) {
+    if let Some(existing) = manifest
+        .imports
+        .iter_mut()
+        .find(|existing| existing.id == import.id)
+    {
+        *existing = import;
+    } else {
+        manifest.imports.push(import);
+        manifest.imports.sort_by(|left, right| {
+            left.id
+                .cmp(&right.id)
+                .then_with(|| left.path.as_str().cmp(right.path.as_str()))
+        });
+    }
+}
+
+fn write_manifest(manifest: &WorkspaceManifest) -> Result<(), AppError> {
+    manifest.validate()?;
+    let contents = manifest.to_minimal_yaml_string()?;
+
+    if let Some(parent) = manifest.path.parent() {
+        fs::create_dir_all(parent).map_err(|source| AppError::FilesystemOperation {
+            action: "create manifest parent directory",
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+
+    fs::write(&manifest.path, contents).map_err(|source| AppError::FilesystemOperation {
+        action: "write manifest",
+        path: manifest.path.clone(),
+        source,
+    })
+}
+
+fn copy_source_tree(source_root: &Path, destination_root: &Path) -> Result<(), AppError> {
+    match fs::metadata(destination_root) {
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(AppError::PathConflict {
+                path: destination_root.to_path_buf(),
+                expected: "directory",
+            });
+        }
+        Ok(_) => {
+            fs::remove_dir_all(destination_root).map_err(|source| {
+                AppError::FilesystemOperation {
+                    action: "replace stored import root",
+                    path: destination_root.to_path_buf(),
+                    source,
+                }
+            })?;
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(AppError::FilesystemOperation {
+                action: "inspect stored import root",
+                path: destination_root.to_path_buf(),
+                source,
+            });
+        }
+    }
+
+    fs::create_dir_all(destination_root).map_err(|source| AppError::FilesystemOperation {
+        action: "create stored import root",
+        path: destination_root.to_path_buf(),
+        source,
+    })?;
+    copy_directory_contents(source_root, destination_root)
+}
+
+fn copy_directory_contents(source_root: &Path, destination_root: &Path) -> Result<(), AppError> {
+    let mut entries = fs::read_dir(source_root)
+        .map_err(|source| AppError::FilesystemOperation {
+            action: "read install source directory",
+            path: source_root.to_path_buf(),
+            source,
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| AppError::FilesystemOperation {
+            action: "read install source directory entry",
+            path: source_root.to_path_buf(),
+            source,
+        })?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let source_path = entry.path();
+        let destination_path = destination_root.join(entry.file_name());
+        let metadata =
+            fs::symlink_metadata(&source_path).map_err(|source| AppError::FilesystemOperation {
+                action: "inspect install source entry",
+                path: source_path.clone(),
+                source,
+            })?;
+
+        if metadata.is_dir() {
+            fs::create_dir_all(&destination_path).map_err(|source| {
+                AppError::FilesystemOperation {
+                    action: "create stored import directory",
+                    path: destination_path.clone(),
+                    source,
+                }
+            })?;
+            copy_directory_contents(&source_path, &destination_path)?;
+            continue;
+        }
+
+        if metadata.file_type().is_symlink() {
+            return Err(source_validation(
+                source_path.display().to_string(),
+                "symlinked install source entries are not supported for stored imports",
+            ));
+        }
+
+        fs::copy(&source_path, &destination_path).map_err(|source| {
+            AppError::FilesystemOperation {
+                action: "copy stored import file",
+                path: destination_path,
+                source,
+            }
+        })?;
+    }
+
+    Ok(())
+}
+
+fn install_context_for_scope(context: &AppContext, scope: TargetScope) -> AppContext {
+    let mut install_context = context.clone();
+    install_context.selector.scope = Some(match scope {
+        TargetScope::Workspace => Scope::Workspace,
+        TargetScope::User => Scope::User,
+    });
+    install_context
+}
+
+fn record_install_state(
+    scope: TargetScope,
+    operations: &[InstallOperation],
+    sync_report: &MaterializationReport,
+    install_timestamp: &str,
+) -> Result<(), AppError> {
+    let mut store = LocalStateStore::open_default()?;
+    let managed_scope = managed_scope(scope);
+    let mut installed_at_by_skill = BTreeMap::new();
+
+    for operation in operations {
+        let skill = ManagedSkillRef::new(managed_scope, operation.installed.name.clone());
+        let installed_at = store
+            .install_record(&skill)?
+            .map(|record| record.installed_at)
+            .unwrap_or_else(|| install_timestamp.to_string());
+        installed_at_by_skill.insert(operation.installed.name.clone(), installed_at);
+
+        store.upsert_pin_record(&PinRecord {
+            skill,
+            requested_reference: operation.installed.resolved_revision.clone(),
+            resolved_revision: operation.installed.resolved_revision.clone(),
+            effective_version_hash: Some(operation.installed.effective_version_hash.clone()),
+            pinned_at: install_timestamp.to_string(),
+        })?;
+    }
+
+    let projection_records =
+        projection_records_for_install(managed_scope, operations, sync_report, install_timestamp);
+    let mut ledger = HistoryLedger::new(&mut store);
+
+    for operation in operations {
+        ledger.record_install(&InstallRecord {
+            skill: ManagedSkillRef::new(managed_scope, operation.installed.name.clone()),
+            source_kind: operation.locked_import.source.kind,
+            source_url: operation.locked_import.source.url.clone(),
+            source_subpath: operation.locked_import.source.subpath.as_str().to_string(),
+            resolved_revision: operation.locked_import.revision.resolved.clone(),
+            upstream_revision: operation.locked_import.revision.upstream.clone(),
+            content_hash: operation.locked_import.hashes.content.clone(),
+            overlay_hash: operation.locked_import.hashes.overlay.clone(),
+            effective_version_hash: operation.locked_import.hashes.effective_version.clone(),
+            installed_at: installed_at_by_skill
+                .get(&operation.installed.name)
+                .cloned()
+                .unwrap_or_else(|| install_timestamp.to_string()),
+            updated_at: install_timestamp.to_string(),
+            detached: false,
+            forked: false,
+        })?;
+    }
+
+    for record in projection_records {
+        ledger.record_projection(&record)?;
+    }
+
+    Ok(())
+}
+
+fn projection_records_for_install(
+    scope: ManagedScope,
+    operations: &[InstallOperation],
+    sync_report: &MaterializationReport,
+    install_timestamp: &str,
+) -> Vec<ProjectionRecord> {
+    let targets_by_root: BTreeMap<_, _> = sync_report
+        .plan
+        .physical_roots
+        .iter()
+        .map(|root| (root.path.clone(), root.targets.clone()))
+        .collect();
+    let operations_by_name: BTreeMap<_, _> = operations
+        .iter()
+        .map(|operation| (operation.installed.name.clone(), operation))
+        .collect();
+    let mut records = Vec::new();
+
+    for generated_root in &sync_report.generated_roots {
+        let Some(targets) = targets_by_root.get(&generated_root.path) else {
+            continue;
+        };
+
+        for skill_name in &generated_root.materialized {
+            let Some(operation) = operations_by_name.get(skill_name) else {
+                continue;
+            };
+
+            for target in targets {
+                records.push(ProjectionRecord {
+                    skill: ManagedSkillRef::new(scope, skill_name.clone()),
+                    target: *target,
+                    generation_mode: ProjectionMode::Copy,
+                    physical_root: generated_root.path.clone(),
+                    projected_path: skill_name.clone(),
+                    effective_version_hash: operation.installed.effective_version_hash.clone(),
+                    generated_at: install_timestamp.to_string(),
+                });
+            }
+        }
+    }
+
+    records
+}
+
+fn install_summary(installed: &[InstalledSkill], sync_report: &MaterializationReport) -> String {
+    let count = installed.len();
+    let names = installed
+        .iter()
+        .map(|skill| skill.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut summary = format!(
+        "Installed {count} skill{} ({names}) into {} scope.",
+        plural_suffix(count),
+        installed
+            .first()
+            .map(|skill| skill.scope.as_str())
+            .unwrap_or("workspace")
+    );
+
+    if sync_report.materialized_skills == 0 {
+        summary.push_str(" No generated projections were required.");
+    } else {
+        summary.push_str(&format!(
+            " Materialized {} generated projection{}.",
+            sync_report.materialized_skills,
+            plural_suffix(sync_report.materialized_skills),
+        ));
+    }
+    if sync_report.pruned_skills > 0 {
+        summary.push_str(&format!(
+            " Pruned {} stale projection{}.",
+            sync_report.pruned_skills,
+            plural_suffix(sync_report.pruned_skills),
+        ));
+    }
+
+    summary
+}
+
+fn imports_store_root() -> Result<PathBuf, AppError> {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .map(|path| path.join(".skillctl/store/imports"))
+        .ok_or(AppError::HomeDirectoryUnavailable)
+}
+
+fn current_timestamp() -> String {
+    let format = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
+
+    if let Some(value) = env::var_os("SOURCE_DATE_EPOCH")
+        && let Ok(timestamp) = value.to_string_lossy().parse::<i64>()
+        && let Ok(timestamp) = OffsetDateTime::from_unix_timestamp(timestamp)
+        && let Ok(formatted) = timestamp.format(format)
+    {
+        return formatted;
+    }
+
+    OffsetDateTime::now_utc()
+        .format(format)
+        .expect("current timestamp formats as RFC3339")
+}
+
+fn compute_effective_version_hash(
+    resolved_revision: &str,
+    content_hash: &str,
+    overlay_hash: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(resolved_revision.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(content_hash.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(overlay_hash.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn import_source_type(kind: SourceKind) -> ImportSourceType {
+    match kind {
+        SourceKind::Git => ImportSourceType::Git,
+        SourceKind::LocalPath => ImportSourceType::LocalPath,
+        SourceKind::Archive => ImportSourceType::Archive,
+    }
+}
+
+fn target_scope(scope: Scope) -> TargetScope {
+    match scope {
+        Scope::Workspace => TargetScope::Workspace,
+        Scope::User => TargetScope::User,
+    }
+}
+
+fn manifest_scope(scope: TargetScope) -> ManifestScope {
+    match scope {
+        TargetScope::Workspace => ManifestScope::Workspace,
+        TargetScope::User => ManifestScope::User,
+    }
+}
+
+fn managed_scope(scope: TargetScope) -> ManagedScope {
+    match scope {
+        TargetScope::Workspace => ManagedScope::Workspace,
+        TargetScope::User => ManagedScope::User,
+    }
+}
+
+fn scope_label(scope: TargetScope) -> &'static str {
+    match scope {
+        TargetScope::Workspace => "workspace",
+        TargetScope::User => "user",
+    }
+}
+
+fn is_skillctl_generated_directory(path: &Path) -> Result<bool, AppError> {
+    let metadata_path = path.join(materialize::PROJECTION_METADATA_FILE);
+    let contents = match fs::read_to_string(&metadata_path) {
+        Ok(contents) => contents,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(AppError::FilesystemOperation {
+                action: "read projection metadata",
+                path: metadata_path,
+                source,
+            });
+        }
+    };
+    let parsed = serde_json::from_str::<serde_json::Value>(&contents).map_err(|source| {
+        AppError::MaterializationValidation {
+            message: format!(
+                "projection metadata '{}' is invalid JSON: {source}",
+                metadata_path.display()
+            ),
+        }
+    })?;
+
+    Ok(parsed.get("tool").and_then(|value| value.as_str()) == Some("skillctl"))
+}
+
+fn plural_suffix(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
 }
 
 fn resolve_install_source(

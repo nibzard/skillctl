@@ -330,10 +330,14 @@ impl LayoutConfig {
 
 /// Supported manifest import sources.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum ImportSourceType {
     /// Git repository source.
     Git,
+    /// Local directory source.
+    LocalPath,
+    /// Local archive source.
+    Archive,
 }
 
 /// Supported import scope targets.

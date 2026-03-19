@@ -64,8 +64,8 @@ pub struct SyncRequest;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CleanRequest;
 
-/// Handle `skillctl sync`.
-pub fn handle_sync(context: &AppContext, _request: SyncRequest) -> Result<AppResponse, AppError> {
+/// Compute the materialization report for the current workspace inputs.
+pub fn sync_workspace(context: &AppContext) -> Result<MaterializationReport, AppError> {
     let manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
     if manifest.projection.mode != ProjectionMode::Copy {
         return Err(AppError::MaterializationValidation {
@@ -117,15 +117,27 @@ pub fn handle_sync(context: &AppContext, _request: SyncRequest) -> Result<AppRes
 
     for root in &plan.physical_roots {
         let resolved_root = normalize_path(&resolve_runtime_root_path(context, &root.path)?);
-        if canonical_root.as_ref() == Some(&resolved_root) {
-            canonical_roots.push(root.path.clone());
-            continue;
+        let root_winners: Vec<_> = if canonical_root.as_ref() == Some(&resolved_root) {
+            winners
+                .iter()
+                .copied()
+                .filter(|winner| winner.import.is_some())
+                .collect()
+        } else {
+            winners.clone()
+        };
+
+        if root_winners.is_empty() {
+            if canonical_root.as_ref() == Some(&resolved_root) {
+                canonical_roots.push(root.path.clone());
+                continue;
+            }
         }
 
         let report = materialize_generated_root(
             &resolved_root,
             &root.path,
-            &winners,
+            &root_winners,
             manifest.projection.prune,
         )?;
         materialized_skills += report.materialized.len();
@@ -133,14 +145,19 @@ pub fn handle_sync(context: &AppContext, _request: SyncRequest) -> Result<AppRes
         generated_roots.push(report);
     }
 
-    let report = MaterializationReport {
+    Ok(MaterializationReport {
         plan,
         mode: manifest.projection.mode,
         canonical_roots,
         generated_roots,
         materialized_skills,
         pruned_skills,
-    };
+    })
+}
+
+/// Handle `skillctl sync`.
+pub fn handle_sync(context: &AppContext, _request: SyncRequest) -> Result<AppResponse, AppError> {
+    let report = sync_workspace(context)?;
     let summary = sync_summary(&report);
 
     Ok(AppResponse::success("sync")

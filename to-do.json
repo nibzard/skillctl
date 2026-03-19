@@ -262,7 +262,7 @@
         "T001",
         "T004"
       ],
-      "updated_at": "2026-03-19T11:17:38Z",
+      "updated_at": "2026-03-19T11:19:17Z",
       "files": [
         "Cargo.lock",
         "Cargo.toml",
@@ -277,7 +277,7 @@
       "id": "T011",
       "title": "Implement `skillctl install` end to end for interactive and non-interactive workflows",
       "priority": 1,
-      "status": "todo",
+      "status": "done",
       "details": "Support the main install journey from source inspection through selection, lockfile updates, projection, and history recording.",
       "steps": [
         "Implement interactive selection that lists detected skills, locations, pinned revisions, and scope choices.",
@@ -292,7 +292,18 @@
         "T008",
         "T009",
         "T010"
-      ]
+      ],
+      "updated_at": "2026-03-19T11:40:08Z",
+      "files": [
+        "Cargo.lock",
+        "Cargo.toml",
+        "src/manifest.rs",
+        "src/materialize.rs",
+        "src/source.rs",
+        "tests/cli.rs",
+        "to-do.json"
+      ],
+      "blockers": []
     },
     {
       "id": "T012",
