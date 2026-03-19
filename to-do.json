@@ -361,7 +361,7 @@
       "id": "T014",
       "title": "Implement pinning, rollback, and fork or detach workflows",
       "priority": 2,
-      "status": "todo",
+      "status": "done",
       "details": "Let users pin revisions, inspect prior effective versions, roll back safely, and detach imported skills into canonical local ownership when needed.",
       "steps": [
         "Implement `pin` and `rollback` against exact recorded versions in the lockfile and state database.",
@@ -373,7 +373,18 @@
         "T011",
         "T012",
         "T013"
-      ]
+      ],
+      "updated_at": "2026-03-19T12:25:41Z",
+      "files": [
+        "src/history.rs",
+        "src/materialize.rs",
+        "src/overlay.rs",
+        "src/planner.rs",
+        "src/source.rs",
+        "tests/cli.rs",
+        "to-do.json"
+      ],
+      "blockers": []
     },
     {
       "id": "T015",

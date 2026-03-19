@@ -827,7 +827,10 @@ fn write_manifest(manifest: &WorkspaceManifest) -> Result<(), AppError> {
     manifest.write_to_path()
 }
 
-fn copy_source_tree(source_root: &Path, destination_root: &Path) -> Result<(), AppError> {
+pub(crate) fn copy_source_tree(
+    source_root: &Path,
+    destination_root: &Path,
+) -> Result<(), AppError> {
     match fs::metadata(destination_root) {
         Ok(metadata) if !metadata.is_dir() => {
             return Err(AppError::PathConflict {
@@ -1618,7 +1621,7 @@ fn normalized_extraction_root(extract_root: &Path) -> Result<PathBuf, AppError> 
     }
 }
 
-fn hash_directory_contents(root: &Path) -> Result<String, AppError> {
+pub(crate) fn hash_directory_contents(root: &Path) -> Result<String, AppError> {
     let mut entries = Vec::new();
     collect_relative_paths(root, root, &mut entries)?;
     entries.sort();

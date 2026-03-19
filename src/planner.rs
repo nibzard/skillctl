@@ -242,10 +242,76 @@ fn prepare_update_plan(
     candidate: Option<&ResolvedSkillCandidate>,
     checked_at: &str,
 ) -> Result<PreparedUpdatePlan, AppError> {
-    let overlay_state = overlay_state(context, install)?;
     let mut modifications = Vec::new();
     let mut local_modification_records = Vec::new();
     let mut notes = Vec::new();
+
+    if install.detached || install.forked {
+        let detail = if install.forked {
+            "skill is forked into local ownership and no longer tracks upstream updates"
+        } else {
+            "skill is detached from upstream lifecycle management"
+        };
+        notes.push(detail.to_string());
+        local_modification_records.push(LocalModificationRecord {
+            id: None,
+            skill: install.skill.clone(),
+            detected_at: checked_at.to_string(),
+            kind: LocalModificationKind::DetachedFork,
+            path: None,
+            details: Some(detail.to_string()),
+        });
+        modifications.push(PlannedModification {
+            kind: LocalModificationKind::DetachedFork,
+            managed: false,
+            path: None,
+            details: Some(detail.to_string()),
+        });
+        let notes = deduplicate_notes(notes);
+        let note_text = if notes.is_empty() {
+            None
+        } else {
+            Some(notes.join(" "))
+        };
+
+        let update_check = UpdateCheckRecord {
+            id: None,
+            skill: install.skill.clone(),
+            checked_at: checked_at.to_string(),
+            pinned_revision: install.resolved_revision.clone(),
+            latest_revision: install.upstream_revision.clone(),
+            outcome: UpdateCheckOutcome::Detached,
+            overlay_detected: false,
+            local_modification_detected: true,
+            notes: note_text,
+        };
+
+        return Ok(PreparedUpdatePlan {
+            plan: SkillUpdatePlan {
+                skill: install.skill.skill_id.clone(),
+                scope: install.skill.scope,
+                checked_at: checked_at.to_string(),
+                source: UpdateSourceSummary {
+                    kind: install.source_kind,
+                    url: install.source_url.clone(),
+                    subpath: install.source_subpath.clone(),
+                },
+                pinned_revision: install.resolved_revision.clone(),
+                latest_revision: install.upstream_revision.clone(),
+                outcome: UpdateCheckOutcome::Detached,
+                overlay_detected: false,
+                local_modification_detected: true,
+                recommended_action: UpdateAction::Skip,
+                available_actions: vec![UpdateAction::Skip],
+                modifications,
+                notes,
+            },
+            update_check,
+            local_modification_records,
+        });
+    }
+
+    let overlay_state = overlay_state(context, install)?;
 
     if let Some(overlay_state) = &overlay_state {
         let details = if overlay_state.changed_since_recorded_state {
@@ -269,80 +335,76 @@ fn prepare_update_plan(
     let recommended_action;
     let available_actions;
 
-    if install.detached || install.forked {
-        latest_revision = install.upstream_revision.clone();
-        outcome = UpdateCheckOutcome::Detached;
-        recommended_action = UpdateAction::Skip;
-        available_actions = vec![UpdateAction::Skip];
-        let detail = if install.forked {
-            "skill is forked into local ownership and no longer tracks upstream updates"
-        } else {
-            "skill is detached from upstream lifecycle management"
-        };
-        notes.push(detail.to_string());
-        local_modification_records.push(LocalModificationRecord {
-            id: None,
-            skill: install.skill.clone(),
-            detected_at: checked_at.to_string(),
-            kind: LocalModificationKind::DetachedFork,
-            path: None,
-            details: Some(detail.to_string()),
-        });
-        modifications.push(PlannedModification {
-            kind: LocalModificationKind::DetachedFork,
-            managed: false,
-            path: None,
-            details: Some(detail.to_string()),
-        });
-    } else {
-        match install.source_kind {
-            SourceKind::LocalPath | SourceKind::Archive => {
-                latest_revision = None;
-                outcome = UpdateCheckOutcome::LocalSource;
-                recommended_action = UpdateAction::Skip;
-                available_actions = vec![UpdateAction::Skip];
-                notes.push("local sources do not support upstream update checks".to_string());
-            }
-            SourceKind::Git => {
-                let upstream_result = latest_git_revision(&install.source_url);
-                match upstream_result {
-                    Ok(upstream_revision) => {
-                        latest_revision = Some(upstream_revision.clone());
-                        if overlay_state
-                            .as_ref()
-                            .is_some_and(|state| state.changed_since_recorded_state)
-                        {
-                            notes.push(
-                                "projection copies may be stale because the managed overlay changed"
-                                    .to_string(),
-                            );
-                        } else {
-                            let projection_modifications = detect_projected_copy_modifications(
-                                context,
-                                install,
-                                projections,
-                                candidate,
-                            )?;
-                            for modification in projection_modifications {
-                                local_modification_records.push(LocalModificationRecord {
-                                    id: None,
-                                    skill: install.skill.clone(),
-                                    detected_at: checked_at.to_string(),
-                                    kind: modification.kind,
-                                    path: modification.path.clone(),
-                                    details: modification.details.clone(),
-                                });
-                                modifications.push(modification);
-                            }
+    match install.source_kind {
+        SourceKind::LocalPath | SourceKind::Archive => {
+            latest_revision = None;
+            outcome = UpdateCheckOutcome::LocalSource;
+            recommended_action = UpdateAction::Skip;
+            available_actions = vec![UpdateAction::Skip];
+            notes.push("local sources do not support upstream update checks".to_string());
+        }
+        SourceKind::Git => {
+            let upstream_result = latest_git_revision(&install.source_url);
+            match upstream_result {
+                Ok(upstream_revision) => {
+                    latest_revision = Some(upstream_revision.clone());
+                    if overlay_state
+                        .as_ref()
+                        .is_some_and(|state| state.changed_since_recorded_state)
+                    {
+                        notes.push(
+                            "projection copies may be stale because the managed overlay changed"
+                                .to_string(),
+                        );
+                    } else {
+                        let projection_modifications = detect_projected_copy_modifications(
+                            context,
+                            install,
+                            projections,
+                            candidate,
+                        )?;
+                        for modification in projection_modifications {
+                            local_modification_records.push(LocalModificationRecord {
+                                id: None,
+                                skill: install.skill.clone(),
+                                detected_at: checked_at.to_string(),
+                                kind: modification.kind,
+                                path: modification.path.clone(),
+                                details: modification.details.clone(),
+                            });
+                            modifications.push(modification);
                         }
+                    }
 
-                        let update_available = upstream_revision != pinned_revision;
-                        let local_modification_detected = modifications
-                            .iter()
-                            .any(|modification| !modification.managed);
+                    let update_available = upstream_revision != pinned_revision;
+                    let local_modification_detected = modifications
+                        .iter()
+                        .any(|modification| !modification.managed);
 
-                        if update_available && local_modification_detected {
-                            outcome = UpdateCheckOutcome::Blocked;
+                    if update_available && local_modification_detected {
+                        outcome = UpdateCheckOutcome::Blocked;
+                        recommended_action = UpdateAction::CreateOverlay;
+                        available_actions = vec![
+                            UpdateAction::CreateOverlay,
+                            UpdateAction::Detach,
+                            UpdateAction::PublishVariant,
+                            UpdateAction::Skip,
+                        ];
+                        notes.push(format!(
+                            "unmanaged projected-copy edits are blocking an update from {} to {}",
+                            pinned_revision, upstream_revision
+                        ));
+                    } else if update_available {
+                        outcome = UpdateCheckOutcome::UpdateAvailable;
+                        recommended_action = UpdateAction::Apply;
+                        available_actions = vec![UpdateAction::Apply, UpdateAction::Skip];
+                        notes.push(format!(
+                            "upstream revision {} is newer than the pinned revision {}",
+                            upstream_revision, pinned_revision
+                        ));
+                    } else {
+                        outcome = UpdateCheckOutcome::UpToDate;
+                        if local_modification_detected {
                             recommended_action = UpdateAction::CreateOverlay;
                             available_actions = vec![
                                 UpdateAction::CreateOverlay,
@@ -350,46 +412,23 @@ fn prepare_update_plan(
                                 UpdateAction::PublishVariant,
                                 UpdateAction::Skip,
                             ];
-                            notes.push(format!(
-                                "unmanaged projected-copy edits are blocking an update from {} to {}",
-                                pinned_revision, upstream_revision
-                            ));
-                        } else if update_available {
-                            outcome = UpdateCheckOutcome::UpdateAvailable;
-                            recommended_action = UpdateAction::Apply;
-                            available_actions = vec![UpdateAction::Apply, UpdateAction::Skip];
-                            notes.push(format!(
-                                "upstream revision {} is newer than the pinned revision {}",
-                                upstream_revision, pinned_revision
-                            ));
-                        } else {
-                            outcome = UpdateCheckOutcome::UpToDate;
-                            if local_modification_detected {
-                                recommended_action = UpdateAction::CreateOverlay;
-                                available_actions = vec![
-                                    UpdateAction::CreateOverlay,
-                                    UpdateAction::Detach,
-                                    UpdateAction::PublishVariant,
-                                    UpdateAction::Skip,
-                                ];
-                                notes.push(
+                            notes.push(
                                     "no upstream update is available, but unmanaged projected-copy edits were detected"
                                         .to_string(),
                                 );
-                            } else {
-                                recommended_action = UpdateAction::Skip;
-                                available_actions = vec![UpdateAction::Skip];
-                                notes.push("pinned revision already matches upstream".to_string());
-                            }
+                        } else {
+                            recommended_action = UpdateAction::Skip;
+                            available_actions = vec![UpdateAction::Skip];
+                            notes.push("pinned revision already matches upstream".to_string());
                         }
                     }
-                    Err(message) => {
-                        latest_revision = None;
-                        outcome = UpdateCheckOutcome::Failed;
-                        recommended_action = UpdateAction::Skip;
-                        available_actions = vec![UpdateAction::Skip];
-                        notes.push(message);
-                    }
+                }
+                Err(message) => {
+                    latest_revision = None;
+                    outcome = UpdateCheckOutcome::Failed;
+                    recommended_action = UpdateAction::Skip;
+                    available_actions = vec![UpdateAction::Skip];
+                    notes.push(message);
                 }
             }
         }

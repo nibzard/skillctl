@@ -13,9 +13,10 @@ use crate::{
     app::AppContext,
     cli::Scope,
     error::AppError,
-    history::HistoryLedger,
+    history::{self, HistoryLedger},
     lockfile::{LockfileTimestamp, WorkspaceLockfile},
     manifest::{ImportDefinition, ManifestPath, ManifestScope, WorkspaceManifest},
+    materialize::{self, PROJECTION_METADATA_FILE},
     response::AppResponse,
     skill::SKILL_MANIFEST_FILE,
     source::{compute_effective_version_hash, current_timestamp, imports_store_root},
@@ -202,8 +203,140 @@ pub fn handle_override(
 }
 
 /// Handle `skillctl fork`.
-pub fn handle_fork(_context: &AppContext, _request: ForkRequest) -> Result<AppResponse, AppError> {
-    Err(AppError::NotYetImplemented { command: "fork" })
+pub fn handle_fork(context: &AppContext, request: ForkRequest) -> Result<AppResponse, AppError> {
+    let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
+    let mut lockfile = WorkspaceLockfile::load_from_workspace(&context.working_directory)?;
+    let mut store = LocalStateStore::open_default()?;
+    let managed_skill = resolve_managed_skill(&store, &request.skill, context.selector.scope)?;
+    if managed_skill.scope != ManagedScope::Workspace {
+        return Err(AppError::ResolutionValidation {
+            message: format!(
+                "skill '{}' can only be forked from workspace scope",
+                request.skill
+            ),
+        });
+    }
+
+    let mut install_record =
+        store
+            .install_record(&managed_skill)?
+            .ok_or_else(|| AppError::ResolutionValidation {
+                message: format!(
+                    "skill '{}' does not have an installed state record",
+                    request.skill
+                ),
+            })?;
+    if install_record.detached || install_record.forked {
+        return Err(AppError::ResolutionValidation {
+            message: format!(
+                "skill '{}' is already detached from upstream lifecycle management",
+                request.skill
+            ),
+        });
+    }
+
+    let import_index = manifest
+        .imports
+        .iter()
+        .position(|import| import.id == request.skill && import.scope == ManifestScope::Workspace)
+        .ok_or_else(|| AppError::ResolutionValidation {
+            message: format!(
+                "skill '{}' is not a managed import in the workspace manifest",
+                request.skill
+            ),
+        })?;
+    let import = manifest.imports[import_index].clone();
+    let lockfile_entry = lockfile.imports.get(&import.id).cloned().ok_or_else(|| {
+        AppError::ResolutionValidation {
+            message: format!(
+                "managed import '{}' is missing from the lockfile",
+                import.id
+            ),
+        }
+    })?;
+
+    let stored_skill_root = imports_store_root()?
+        .join(&import.id)
+        .join(lockfile_entry.source.subpath.as_str());
+    ensure_directory_path(&stored_skill_root, "inspect stored imported skill")?;
+
+    let local_root_relative = ManifestPath::new(format!(
+        "{}/{}",
+        manifest.layout.skills_dir.as_str().trim_end_matches('/'),
+        request.skill
+    ));
+    let local_root = context.working_directory.join(local_root_relative.as_str());
+    prepare_local_root(&local_root, &request.skill)?;
+    copy_tree_contents(&stored_skill_root, &local_root)?;
+
+    if let Some(overlay_path) = manifest.overrides.remove(&import.id) {
+        let overlay_root = context.working_directory.join(overlay_path.as_str());
+        match fs::metadata(&overlay_root) {
+            Ok(metadata) if metadata.is_dir() => {
+                copy_tree_contents(&overlay_root, &local_root)?;
+                fs::remove_dir_all(&overlay_root).map_err(|source| {
+                    AppError::FilesystemOperation {
+                        action: "remove detached overlay root",
+                        path: overlay_root,
+                        source,
+                    }
+                })?;
+            }
+            Ok(_) => {
+                return Err(AppError::PathConflict {
+                    path: overlay_root,
+                    expected: "directory",
+                });
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(AppError::FilesystemOperation {
+                    action: "inspect detached overlay root",
+                    path: overlay_root,
+                    source,
+                });
+            }
+        }
+    }
+    remove_projection_metadata(&local_root)?;
+
+    manifest.imports.remove(import_index);
+    manifest.write_to_path()?;
+    lockfile.imports.remove(&import.id);
+    lockfile.write_to_path()?;
+
+    let timestamp = current_timestamp();
+    install_record.detached = true;
+    install_record.forked = true;
+    install_record.updated_at = timestamp.clone();
+
+    let sync_report =
+        materialize::sync_workspace(&history::context_for_scope(context, managed_skill.scope))?;
+
+    let projection_records = history::projection_records_for_skill(
+        &sync_report,
+        &managed_skill,
+        &install_record.effective_version_hash,
+        &timestamp,
+    );
+    let mut ledger = HistoryLedger::new(&mut store);
+    ledger.record_fork(&install_record, local_root_relative.as_str())?;
+    for record in projection_records {
+        ledger.record_projection(&record)?;
+    }
+
+    Ok(AppResponse::success("fork")
+        .with_summary(format!(
+            "Forked {} into {}",
+            request.skill,
+            local_root_relative.as_str()
+        ))
+        .with_data(json!({
+            "skill": request.skill,
+            "scope": managed_skill.scope.as_str(),
+            "local_root": local_root_relative.as_str(),
+            "projection": sync_report,
+        })))
 }
 
 fn resolve_managed_skill(
@@ -357,6 +490,168 @@ fn record_path_action(
 
 fn join_relative_path(root: &str, child: &str) -> String {
     format!("{}/{}", root.trim_end_matches('/'), child)
+}
+
+fn prepare_local_root(path: &Path, skill: &str) -> Result<(), AppError> {
+    match fs::metadata(path) {
+        Ok(metadata) if !metadata.is_dir() => Err(AppError::PathConflict {
+            path: path.to_path_buf(),
+            expected: "directory",
+        }),
+        Ok(_) if is_generated_skill_directory(path)? => {
+            fs::remove_dir_all(path).map_err(|source| AppError::FilesystemOperation {
+                action: "remove generated workspace skill projection",
+                path: path.to_path_buf(),
+                source,
+            })?;
+            fs::create_dir_all(path).map_err(|source| AppError::FilesystemOperation {
+                action: "recreate canonical local skill root",
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+        Ok(_) => Err(AppError::ResolutionValidation {
+            message: format!(
+                "refusing to overwrite hand-authored canonical skill directory '{}' for '{}'",
+                path.display(),
+                skill,
+            ),
+        }),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => fs::create_dir_all(path)
+            .map_err(|source| AppError::FilesystemOperation {
+                action: "create canonical local skill root",
+                path: path.to_path_buf(),
+                source,
+            }),
+        Err(source) => Err(AppError::FilesystemOperation {
+            action: "inspect canonical local skill root",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn copy_tree_contents(source_root: &Path, destination_root: &Path) -> Result<(), AppError> {
+    let mut entries = fs::read_dir(source_root)
+        .map_err(|source| AppError::FilesystemOperation {
+            action: "read fork source directory",
+            path: source_root.to_path_buf(),
+            source,
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| AppError::FilesystemOperation {
+            action: "read fork source directory entry",
+            path: source_root.to_path_buf(),
+            source,
+        })?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let source_path = entry.path();
+        if entry.file_name() == PROJECTION_METADATA_FILE {
+            continue;
+        }
+
+        let destination_path = destination_root.join(entry.file_name());
+        let metadata =
+            fs::symlink_metadata(&source_path).map_err(|source| AppError::FilesystemOperation {
+                action: "inspect fork source entry",
+                path: source_path.clone(),
+                source,
+            })?;
+
+        if metadata.is_dir() {
+            fs::create_dir_all(&destination_path).map_err(|source| {
+                AppError::FilesystemOperation {
+                    action: "create fork destination directory",
+                    path: destination_path.clone(),
+                    source,
+                }
+            })?;
+            copy_tree_contents(&source_path, &destination_path)?;
+            continue;
+        }
+
+        if metadata.file_type().is_symlink() {
+            return Err(AppError::ResolutionValidation {
+                message: format!(
+                    "fork source '{}' contains unsupported symlink '{}'",
+                    source_root.display(),
+                    source_path.display()
+                ),
+            });
+        }
+
+        if let Some(parent) = destination_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| AppError::FilesystemOperation {
+                action: "create fork destination parent",
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        fs::copy(&source_path, &destination_path).map_err(|source| {
+            AppError::FilesystemOperation {
+                action: "copy forked skill file",
+                path: destination_path,
+                source,
+            }
+        })?;
+    }
+
+    Ok(())
+}
+
+fn remove_projection_metadata(root: &Path) -> Result<(), AppError> {
+    let metadata_path = root.join(PROJECTION_METADATA_FILE);
+    match fs::remove_file(&metadata_path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(AppError::FilesystemOperation {
+            action: "remove canonical local projection metadata",
+            path: metadata_path,
+            source,
+        }),
+    }
+}
+
+fn is_generated_skill_directory(path: &Path) -> Result<bool, AppError> {
+    let metadata_path = path.join(PROJECTION_METADATA_FILE);
+    let contents = match fs::read_to_string(&metadata_path) {
+        Ok(contents) => contents,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(AppError::FilesystemOperation {
+                action: "read local projection metadata",
+                path: metadata_path,
+                source,
+            });
+        }
+    };
+    let parsed = serde_json::from_str::<serde_json::Value>(&contents).map_err(|source| {
+        AppError::MaterializationValidation {
+            message: format!(
+                "projection metadata '{}' is invalid JSON: {source}",
+                metadata_path.display()
+            ),
+        }
+    })?;
+    Ok(parsed.get("tool").and_then(|value| value.as_str()) == Some("skillctl"))
+}
+
+fn ensure_directory_path(path: &Path, action: &'static str) -> Result<(), AppError> {
+    let metadata = fs::metadata(path).map_err(|source| AppError::FilesystemOperation {
+        action,
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if metadata.is_dir() {
+        Ok(())
+    } else {
+        Err(AppError::PathConflict {
+            path: path.to_path_buf(),
+            expected: "directory",
+        })
+    }
 }
 
 pub(crate) fn hash_overlay_root(root: &Path) -> Result<String, AppError> {
