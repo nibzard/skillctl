@@ -77,130 +77,137 @@ pub fn handle_override(
     context: &AppContext,
     request: OverrideRequest,
 ) -> Result<AppResponse, AppError> {
-    let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
-    let mut lockfile = WorkspaceLockfile::load_from_workspace(&context.working_directory)?;
-    let mut store = LocalStateStore::open_default()?;
-    let managed_skill = resolve_managed_skill(&store, &request.skill, context.selector.scope)?;
-    let scope = manifest_scope(managed_skill.scope);
-    let import = managed_import(&manifest, &request.skill, scope)?;
-    let lockfile_entry =
-        lockfile
-            .imports
-            .get_mut(&import.id)
-            .ok_or_else(|| AppError::ResolutionValidation {
-                message: format!(
-                    "managed import '{}' is missing from the lockfile",
-                    import.id
-                ),
-            })?;
-    let mut install_record =
-        store
-            .install_record(&managed_skill)?
-            .ok_or_else(|| AppError::ResolutionValidation {
+    lifecycle::run_transaction("override", |transaction| {
+        let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
+        let mut lockfile = WorkspaceLockfile::load_from_workspace(&context.working_directory)?;
+        let mut store = LocalStateStore::open_default()?;
+        transaction.track_path(&manifest.path)?;
+        transaction.track_path(&lockfile.path)?;
+        transaction.track_state_database()?;
+        let managed_skill = resolve_managed_skill(&store, &request.skill, context.selector.scope)?;
+        let scope = manifest_scope(managed_skill.scope);
+        let import = managed_import(&manifest, &request.skill, scope)?;
+        let overlay_path = manifest
+            .overrides
+            .get(&import.id)
+            .cloned()
+            .unwrap_or_else(|| default_overlay_path(&manifest, &import.id));
+        let overlay_root = context.working_directory.join(overlay_path.as_str());
+        transaction.track_path(&overlay_root)?;
+        let lockfile_entry =
+            lockfile
+                .imports
+                .get_mut(&import.id)
+                .ok_or_else(|| AppError::ResolutionValidation {
+                    message: format!(
+                        "managed import '{}' is missing from the lockfile",
+                        import.id
+                    ),
+                })?;
+        let mut install_record = store.install_record(&managed_skill)?.ok_or_else(|| {
+            AppError::ResolutionValidation {
                 message: format!(
                     "skill '{}' does not have an installed state record",
                     request.skill
                 ),
-            })?;
-    let mut pin_record = store.pin_record(&managed_skill)?;
-    let overlay_path = manifest
-        .overrides
-        .get(&import.id)
-        .cloned()
-        .unwrap_or_else(|| default_overlay_path(&manifest, &import.id));
-    let stored_skill_root = imports_store_root()?
-        .join(&import.id)
-        .join(lockfile_entry.source.subpath.as_str());
-    let source_manifest = stored_skill_root.join(SKILL_MANIFEST_FILE);
-    ensure_file(&source_manifest, "inspect stored imported skill manifest")?;
+            }
+        })?;
+        let mut pin_record = store.pin_record(&managed_skill)?;
+        let stored_skill_root = imports_store_root()?
+            .join(&import.id)
+            .join(lockfile_entry.source.subpath.as_str());
+        let source_manifest = stored_skill_root.join(SKILL_MANIFEST_FILE);
+        ensure_file(&source_manifest, "inspect stored imported skill manifest")?;
 
-    let overlay_root = context.working_directory.join(overlay_path.as_str());
-    let overlay_manifest = overlay_root.join(SKILL_MANIFEST_FILE);
-    let overlay_manifest_display = join_relative_path(overlay_path.as_str(), SKILL_MANIFEST_FILE);
+        let overlay_manifest = overlay_root.join(SKILL_MANIFEST_FILE);
+        let overlay_manifest_display =
+            join_relative_path(overlay_path.as_str(), SKILL_MANIFEST_FILE);
 
-    let mut created = Vec::new();
-    let mut skipped = Vec::new();
-    let overlay_root_created = ensure_directory(&overlay_root, "overlay directory")?;
-    record_path_action(
-        overlay_root_created,
-        overlay_path.as_str(),
-        &mut created,
-        &mut skipped,
-    );
-    let overlay_manifest_created =
-        copy_if_missing(&source_manifest, &overlay_manifest, "overlay manifest")?;
-    record_path_action(
-        overlay_manifest_created,
-        &overlay_manifest_display,
-        &mut created,
-        &mut skipped,
-    );
+        let mut created = Vec::new();
+        let mut skipped = Vec::new();
+        let overlay_root_created = ensure_directory(&overlay_root, "overlay directory")?;
+        record_path_action(
+            overlay_root_created,
+            overlay_path.as_str(),
+            &mut created,
+            &mut skipped,
+        );
+        let overlay_manifest_created =
+            copy_if_missing(&source_manifest, &overlay_manifest, "overlay manifest")?;
+        record_path_action(
+            overlay_manifest_created,
+            &overlay_manifest_display,
+            &mut created,
+            &mut skipped,
+        );
 
-    let manifest_updated = match manifest.overrides.get(&import.id) {
-        Some(existing) if existing == &overlay_path => false,
-        _ => {
-            manifest
-                .overrides
-                .insert(import.id.clone(), overlay_path.clone());
-            manifest.write_to_path()?;
-            true
+        let manifest_updated = match manifest.overrides.get(&import.id) {
+            Some(existing) if existing == &overlay_path => false,
+            _ => {
+                manifest
+                    .overrides
+                    .insert(import.id.clone(), overlay_path.clone());
+                manifest.write_to_path()?;
+                true
+            }
+        };
+
+        let timestamp = current_timestamp();
+        let overlay_hash = hash_overlay_root(&overlay_root)?;
+        let effective_version_hash = compute_effective_version_hash(
+            &lockfile_entry.revision.resolved,
+            &lockfile_entry.hashes.content,
+            &overlay_hash,
+        );
+
+        lockfile_entry.hashes.overlay = overlay_hash.clone();
+        lockfile_entry.hashes.effective_version = effective_version_hash.clone();
+        lockfile_entry.timestamps.last_updated_at = LockfileTimestamp::new(timestamp.clone());
+        lockfile.write_to_path()?;
+
+        install_record.overlay_hash = overlay_hash.clone();
+        install_record.effective_version_hash = effective_version_hash.clone();
+        install_record.updated_at = timestamp.clone();
+        store.upsert_install_record(&install_record)?;
+
+        if let Some(pin_record) = pin_record.as_mut() {
+            pin_record.effective_version_hash = Some(effective_version_hash.clone());
+            store.upsert_pin_record(pin_record)?;
         }
-    };
 
-    let timestamp = current_timestamp();
-    let overlay_hash = hash_overlay_root(&overlay_root)?;
-    let effective_version_hash = compute_effective_version_hash(
-        &lockfile_entry.revision.resolved,
-        &lockfile_entry.hashes.content,
-        &overlay_hash,
-    );
+        if overlay_root_created || overlay_manifest_created || manifest_updated {
+            let mut ledger = HistoryLedger::new(&mut store);
+            ledger.record_overlay_created(&managed_skill, overlay_path.as_str(), &timestamp)?;
+        }
+        transaction.checkpoint("after-state")?;
 
-    lockfile_entry.hashes.overlay = overlay_hash.clone();
-    lockfile_entry.hashes.effective_version = effective_version_hash.clone();
-    lockfile_entry.timestamps.last_updated_at = LockfileTimestamp::new(timestamp.clone());
-    lockfile.write_to_path()?;
+        let summary = if overlay_root_created || overlay_manifest_created || manifest_updated {
+            format!(
+                "Created overlay for {} at {}",
+                request.skill,
+                overlay_path.as_str()
+            )
+        } else {
+            format!(
+                "Overlay for {} is ready at {}",
+                request.skill,
+                overlay_path.as_str()
+            )
+        };
 
-    install_record.overlay_hash = overlay_hash.clone();
-    install_record.effective_version_hash = effective_version_hash.clone();
-    install_record.updated_at = timestamp.clone();
-    store.upsert_install_record(&install_record)?;
-
-    if let Some(pin_record) = pin_record.as_mut() {
-        pin_record.effective_version_hash = Some(effective_version_hash.clone());
-        store.upsert_pin_record(pin_record)?;
-    }
-
-    if overlay_root_created || overlay_manifest_created || manifest_updated {
-        let mut ledger = HistoryLedger::new(&mut store);
-        ledger.record_overlay_created(&managed_skill, overlay_path.as_str(), &timestamp)?;
-    }
-
-    let summary = if overlay_root_created || overlay_manifest_created || manifest_updated {
-        format!(
-            "Created overlay for {} at {}",
-            request.skill,
-            overlay_path.as_str()
-        )
-    } else {
-        format!(
-            "Overlay for {} is ready at {}",
-            request.skill,
-            overlay_path.as_str()
-        )
-    };
-
-    Ok(AppResponse::success("override")
-        .with_summary(summary)
-        .with_data(json!({
-            "skill": request.skill,
-            "scope": managed_skill.scope.as_str(),
-            "overlay_root": overlay_path.as_str(),
-            "overlay_hash": overlay_hash,
-            "effective_version_hash": effective_version_hash,
-            "created": created,
-            "skipped": skipped,
-            "manifest_updated": manifest_updated,
-        })))
+        Ok(AppResponse::success("override")
+            .with_summary(summary)
+            .with_data(json!({
+                "skill": request.skill,
+                "scope": managed_skill.scope.as_str(),
+                "overlay_root": overlay_path.as_str(),
+                "overlay_hash": overlay_hash,
+                "effective_version_hash": effective_version_hash,
+                "created": created,
+                "skipped": skipped,
+                "manifest_updated": manifest_updated,
+            })))
+    })
 }
 
 /// Handle `skillctl fork`.

@@ -879,6 +879,30 @@
       ],
       "blockers": [],
       "updated_at": "2026-03-19T16:44:00Z"
+    },
+    {
+      "id": "T033",
+      "title": "Make `skillctl override` transactional across overlay, manifest, lockfile, and state updates",
+      "priority": 1,
+      "status": "done",
+      "details": "The override workflow still mutates the overlay root, .agents/skillctl.yaml, .agents/skillctl.lock, install state, pin state, and history without the lifecycle transaction wrapper. A later filesystem or state-store failure can leave those layers disagreeing about whether an overlay exists and which effective version is active.",
+      "steps": [
+        "Wrap `skillctl override` in the lifecycle transaction helper and track the overlay root, manifest, lockfile, and state database before mutation.",
+        "Make the command roll back partial filesystem and state changes if any later manifest, lockfile, or SQLite write fails.",
+        "Add failure-path coverage that injects a mid-operation error and proves the overlay workflow leaves the workspace and local state consistent."
+      ],
+      "tags": [
+        "review-followup",
+        "reliability",
+        "state-management"
+      ],
+      "files": [
+        "src/overlay.rs",
+        "tests/cli.rs",
+        "to-do.json"
+      ],
+      "updated_at": "2026-03-19T16:57:55Z",
+      "blockers": []
     }
   ]
 }

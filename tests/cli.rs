@@ -2141,6 +2141,43 @@ fn override_is_idempotent_and_does_not_clobber_existing_overlay_edits() {
 }
 
 #[test]
+fn override_rolls_back_when_the_transaction_fails_after_state_write() {
+    let workspace = TestWorkspace::new();
+    workspace.write_skill_source("shared-skills", "release-notes");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770000000")
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let snapshot = workspace.snapshot_paths(&[
+        ".agents/skillctl.yaml",
+        ".agents/skillctl.lock",
+        ".agents/overlays/release-notes",
+        "home/.skillctl/state.db",
+    ]);
+
+    assert_transaction_rolled_back(
+        &workspace,
+        "override:after-state",
+        "1770001234",
+        &["override", "release-notes"],
+        &snapshot,
+    );
+}
+
+#[test]
 fn update_checks_git_upstream_and_records_a_safe_apply_plan() {
     let workspace = TestWorkspace::new();
     workspace.write_skill_source("git-source", "release-notes");
