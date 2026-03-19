@@ -38,7 +38,9 @@ fn init_help_is_available() {
     cmd.args(["init", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Initialize"));
+        .stdout(predicate::str::contains(
+            "Create the default .agents workspace layout for skillctl.",
+        ));
 }
 
 #[test]
@@ -48,7 +50,100 @@ fn install_help_is_available() {
     cmd.args(["install", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Install"));
+        .stdout(predicate::str::contains(
+            "Usage: skillctl install [OPTIONS] <SOURCE>",
+        ));
+}
+
+#[test]
+fn root_help_describes_the_operating_model_and_placeholder_surfaces() {
+    let mut cmd = Command::cargo_bin("skillctl").expect("binary exists");
+
+    cmd.arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Canonical workspace skills live in .agents/skills.",
+        ))
+        .stdout(predicate::str::contains(
+            "Local history and telemetry consent live in ~/.skillctl/state.db.",
+        ))
+        .stdout(predicate::str::contains(
+            "'tui' and 'mcp serve' are placeholder commands today.",
+        ));
+}
+
+#[test]
+fn install_help_includes_examples_and_non_interactive_guidance() {
+    let mut cmd = Command::cargo_bin("skillctl").expect("binary exists");
+
+    cmd.args(["install", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Non-interactive installs never guess",
+        ))
+        .stdout(predicate::str::contains(
+            "skillctl install ../shared-skills --interactive",
+        ))
+        .stdout(predicate::str::contains("~/.skillctl/store/imports"));
+}
+
+#[test]
+fn update_doctor_and_explain_help_include_recovery_guidance() {
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .args(["update", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Recommended follow-up actions:"))
+        .stdout(predicate::str::contains("create-overlay:"))
+        .stdout(predicate::str::contains("skillctl history <skill>"));
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .args(["doctor", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Start here when:"))
+        .stdout(predicate::str::contains("a generated copy looks stale"))
+        .stdout(predicate::str::contains("trust warnings"));
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .args(["explain", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("same-name conflicts"))
+        .stdout(predicate::str::contains(
+            "skillctl explain ai-sdk --target codex",
+        ))
+        .stdout(predicate::str::contains("skillctl path <skill>"));
+}
+
+#[test]
+fn tui_and_mcp_help_point_to_current_cli_equivalents() {
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .args(["tui", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "The terminal UI command is a placeholder today",
+        ))
+        .stdout(predicate::str::contains("installed skills: skillctl list"));
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .args(["mcp", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "The MCP bridge is a placeholder today.",
+        ))
+        .stdout(predicate::str::contains(
+            "skills_update -> skillctl update [skill] --json",
+        ));
 }
 
 #[test]
@@ -246,7 +341,9 @@ fn install_alias_help_is_available() {
     cmd.args(["i", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Install"));
+        .stdout(predicate::str::contains(
+            "Usage: skillctl install [OPTIONS] <SOURCE>",
+        ));
 }
 
 #[test]

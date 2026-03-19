@@ -714,7 +714,7 @@
       "id": "T027",
       "title": "Write end-user documentation, command help, and troubleshooting guides",
       "priority": 3,
-      "status": "todo",
+      "status": "done",
       "details": "Document the model, command surface, and debugging flows so a new user can understand the system quickly and recover from common failures with one command.",
       "steps": [
         "Expand the README and command help to explain canonical roots, imports, overlays, projections, history, telemetry, and trust states.",
@@ -729,7 +729,16 @@
         "T020",
         "T022",
         "T023"
-      ]
+      ],
+      "updated_at": "2026-03-19T15:02:36Z",
+      "files": [
+        "README.md",
+        "docs/troubleshooting.md",
+        "src/cli.rs",
+        "tests/cli.rs",
+        "to-do.json"
+      ],
+      "blockers": []
     }
   ]
 }
