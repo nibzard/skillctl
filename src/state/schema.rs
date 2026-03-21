@@ -68,19 +68,17 @@ fn migrate_schema(
         ));
     }
 
-    connection
-        .execute_batch(
-            "
-ALTER TABLE install_records RENAME TO install_records_v1;
-ALTER TABLE projection_records RENAME TO projection_records_v1;
-ALTER TABLE update_checks RENAME TO update_checks_v1;
-ALTER TABLE local_modifications RENAME TO local_modifications_v1;
-ALTER TABLE pins RENAME TO pins_v1;
-ALTER TABLE rollback_records RENAME TO rollback_records_v1;
-ALTER TABLE history_events RENAME TO history_events_v1;
-",
-        )
-        .map_err(|source| local_state_query(path, "rename legacy schema tables", source))?;
+    for (legacy_name, migrated_name) in [
+        ("install_records", "install_records_v1"),
+        ("projection_records", "projection_records_v1"),
+        ("update_checks", "update_checks_v1"),
+        ("local_modifications", "local_modifications_v1"),
+        ("pins", "pins_v1"),
+        ("rollback_records", "rollback_records_v1"),
+        ("history_events", "history_events_v1"),
+    ] {
+        rename_legacy_table_if_needed(connection, path, legacy_name, migrated_name)?;
+    }
 
     connection
         .execute_batch(&local_state_schema_sql())
@@ -168,6 +166,29 @@ DROP TABLE history_events_v1;
     Ok(())
 }
 
+fn rename_legacy_table_if_needed(
+    connection: &Connection,
+    path: &Path,
+    legacy_name: &str,
+    migrated_name: &str,
+) -> Result<(), AppError> {
+    if sqlite_table_exists(connection, path, migrated_name)? {
+        return Ok(());
+    }
+    if !sqlite_table_exists(connection, path, legacy_name)? {
+        return Ok(());
+    }
+
+    connection
+        .execute(
+            &format!("ALTER TABLE {legacy_name} RENAME TO {migrated_name}"),
+            [],
+        )
+        .map_err(|source| local_state_query(path, "rename legacy schema table", source))?;
+
+    Ok(())
+}
+
 pub(super) fn schema_version(connection: &Connection, path: &Path) -> Result<u32, AppError> {
     let found: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -191,6 +212,26 @@ fn database_has_user_tables(connection: &Connection, path: &Path) -> Result<bool
         .map_err(|source| local_state_query(path, "inspect existing tables", source))?;
 
     Ok(count > 0)
+}
+
+fn sqlite_table_exists(
+    connection: &Connection,
+    path: &Path,
+    table: &str,
+) -> Result<bool, AppError> {
+    let exists = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                  FROM sqlite_master
+                 WHERE type = 'table' AND name = ?1
+            )",
+            [table],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|source| local_state_query(path, "inspect table presence", source))?;
+
+    Ok(exists)
 }
 
 fn validate_required_tables(connection: &Connection, path: &Path) -> Result<(), AppError> {
@@ -224,7 +265,7 @@ fn validate_required_tables(connection: &Connection, path: &Path) -> Result<(), 
 fn local_state_schema_sql() -> String {
     format!(
         r"
-CREATE TABLE install_records (
+CREATE TABLE IF NOT EXISTS install_records (
     scope TEXT NOT NULL CHECK (scope IN ('workspace', 'user')),
     workspace_key TEXT NOT NULL,
     skill_id TEXT NOT NULL,
@@ -243,7 +284,7 @@ CREATE TABLE install_records (
     PRIMARY KEY (scope, workspace_key, skill_id)
 );
 
-CREATE TABLE projection_records (
+CREATE TABLE IF NOT EXISTS projection_records (
     scope TEXT NOT NULL CHECK (scope IN ('workspace', 'user')),
     workspace_key TEXT NOT NULL,
     skill_id TEXT NOT NULL,
@@ -258,7 +299,7 @@ CREATE TABLE projection_records (
     PRIMARY KEY (scope, workspace_key, skill_id, target, physical_root)
 );
 
-CREATE TABLE update_checks (
+CREATE TABLE IF NOT EXISTS update_checks (
     id INTEGER PRIMARY KEY,
     scope TEXT NOT NULL CHECK (scope IN ('workspace', 'user')),
     workspace_key TEXT NOT NULL,
@@ -281,10 +322,10 @@ CREATE TABLE update_checks (
     notes TEXT
 );
 
-CREATE INDEX idx_update_checks_skill_time
+CREATE INDEX IF NOT EXISTS idx_update_checks_skill_time
     ON update_checks (scope, workspace_key, skill_id, checked_at DESC, id DESC);
 
-CREATE TABLE local_modifications (
+CREATE TABLE IF NOT EXISTS local_modifications (
     id INTEGER PRIMARY KEY,
     scope TEXT NOT NULL CHECK (scope IN ('workspace', 'user')),
     workspace_key TEXT NOT NULL,
@@ -295,10 +336,10 @@ CREATE TABLE local_modifications (
     details TEXT
 );
 
-CREATE INDEX idx_local_modifications_skill_time
+CREATE INDEX IF NOT EXISTS idx_local_modifications_skill_time
     ON local_modifications (scope, workspace_key, skill_id, detected_at DESC, id DESC);
 
-CREATE TABLE pins (
+CREATE TABLE IF NOT EXISTS pins (
     scope TEXT NOT NULL CHECK (scope IN ('workspace', 'user')),
     workspace_key TEXT NOT NULL,
     skill_id TEXT NOT NULL,
@@ -309,7 +350,7 @@ CREATE TABLE pins (
     PRIMARY KEY (scope, workspace_key, skill_id)
 );
 
-CREATE TABLE rollback_records (
+CREATE TABLE IF NOT EXISTS rollback_records (
     id INTEGER PRIMARY KEY,
     scope TEXT NOT NULL CHECK (scope IN ('workspace', 'user')),
     workspace_key TEXT NOT NULL,
@@ -319,17 +360,17 @@ CREATE TABLE rollback_records (
     to_reference TEXT NOT NULL
 );
 
-CREATE INDEX idx_rollback_records_skill_time
+CREATE INDEX IF NOT EXISTS idx_rollback_records_skill_time
     ON rollback_records (scope, workspace_key, skill_id, rolled_back_at DESC, id DESC);
 
-CREATE TABLE telemetry_settings (
+CREATE TABLE IF NOT EXISTS telemetry_settings (
     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
     consent TEXT NOT NULL CHECK (consent IN ('unknown', 'enabled', 'disabled')),
     notice_seen_at TEXT,
     updated_at TEXT NOT NULL
 );
 
-CREATE TABLE history_events (
+CREATE TABLE IF NOT EXISTS history_events (
     id INTEGER PRIMARY KEY,
     workspace_key TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (
@@ -360,7 +401,7 @@ CREATE TABLE history_events (
     details_json TEXT
 );
 
-CREATE INDEX idx_history_events_skill_time
+CREATE INDEX IF NOT EXISTS idx_history_events_skill_time
     ON history_events (scope, workspace_key, skill_id, occurred_at DESC, id DESC);
 
 PRAGMA user_version = {version};

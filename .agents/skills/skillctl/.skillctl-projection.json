@@ -1,0 +1,23 @@
+{
+  "generated_at": "1774113831",
+  "generation_mode": "copy",
+  "internal_id": "import:workspace:skillctl:.agents/skills/skillctl",
+  "physical_root": ".agents/skills",
+  "skill_name": "skillctl",
+  "source": {
+    "content_hash": "sha256:4760121a74ee3e698fea9d5fd8cc981f0dbaf361cd3a3fe8f01f137a44afbe2c",
+    "effective_version_hash": "sha256:4cedbbdbd659250a008addde5958951603896434797a554ed4848f0c04b2ccd4",
+    "import_id": "skillctl",
+    "kind": "imported",
+    "overlay_hash": "sha256:none",
+    "overlay_path": null,
+    "requested_ref": "sha256:b6441df1c4a5dbace12850905b02e14712352ddf3acd19d4818d5594b9c2058b",
+    "resolved_revision": "sha256:b6441df1c4a5dbace12850905b02e14712352ddf3acd19d4818d5594b9c2058b",
+    "scope": "workspace",
+    "selected_subpath": ".agents/skills/skillctl",
+    "source_url": "file:///tmp/skillctl-demo-source.jPBB6w/",
+    "upstream_revision": null
+  },
+  "tool": "skillctl",
+  "version": "0.1.0"
+}

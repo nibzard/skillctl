@@ -2,21 +2,21 @@ version: 1
 
 state:
   manifest_version: 1
-  local_state_version: 1
+  local_state_version: 2
 
 imports:
-  release-notes:
+  skillctl:
     source:
       type: local-path
-      url: file:///tmp/tmp.TArWpWNOSk/repo/
-      subpath: .agents/skills/release-notes
+      url: file:///tmp/skillctl-demo-source.jPBB6w/
+      subpath: .agents/skills/skillctl
     revision:
-      resolved: sha256:b5aaf56bf01e8d745101a2a7bebcd6e42c31196cbd622748039f17fe9b369d52
+      resolved: sha256:b6441df1c4a5dbace12850905b02e14712352ddf3acd19d4818d5594b9c2058b
     timestamps:
-      fetched_at: 2026-03-19T18:47:42Z
-      first_installed_at: 2026-03-19T18:47:42Z
-      last_updated_at: 2026-03-19T18:47:42Z
+      fetched_at: 2026-03-21T17:23:51Z
+      first_installed_at: 2026-03-21T17:23:51Z
+      last_updated_at: 2026-03-21T17:23:51Z
     hashes:
-      content: sha256:59dde5bd2a05e1cb814100751a9b5b7378dd129371e84e899990aa472fbe73e2
+      content: sha256:4760121a74ee3e698fea9d5fd8cc981f0dbaf361cd3a3fe8f01f137a44afbe2c
       overlay: sha256:none
-      effective_version: sha256:0ad259a7e0b4803c3c5474e79cf3640e58f65b7b2d4bb5e870d440ce2c8c21cb
+      effective_version: sha256:4cedbbdbd659250a008addde5958951603896434797a554ed4848f0c04b2ccd4

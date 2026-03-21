@@ -396,3 +396,163 @@ PRAGMA user_version = 999;
         "unexpected error: {error}"
     );
 }
+
+#[test]
+fn reopening_recovers_from_partially_migrated_v1_state() {
+    let temp = tempdir().expect("tempdir exists");
+    let path = temp.path().join("state.db");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("workspace exists");
+
+    let connection = Connection::open(&path).expect("sqlite opens");
+    connection
+        .execute_batch(
+            "
+CREATE TABLE install_records_v1 (
+    scope TEXT NOT NULL,
+    skill_id TEXT NOT NULL,
+    source_kind TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    source_subpath TEXT NOT NULL,
+    resolved_revision TEXT NOT NULL,
+    upstream_revision TEXT,
+    content_hash TEXT NOT NULL,
+    overlay_hash TEXT NOT NULL,
+    effective_version_hash TEXT NOT NULL,
+    installed_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    detached INTEGER NOT NULL,
+    forked INTEGER NOT NULL,
+    PRIMARY KEY (scope, skill_id)
+);
+CREATE TABLE install_records (
+    scope TEXT NOT NULL CHECK (scope IN ('workspace', 'user')),
+    workspace_key TEXT NOT NULL,
+    skill_id TEXT NOT NULL,
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('git', 'local-path', 'archive')),
+    source_url TEXT NOT NULL,
+    source_subpath TEXT NOT NULL,
+    resolved_revision TEXT NOT NULL,
+    upstream_revision TEXT,
+    content_hash TEXT NOT NULL,
+    overlay_hash TEXT NOT NULL,
+    effective_version_hash TEXT NOT NULL,
+    installed_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    detached INTEGER NOT NULL CHECK (detached IN (0, 1)),
+    forked INTEGER NOT NULL CHECK (forked IN (0, 1)),
+    PRIMARY KEY (scope, workspace_key, skill_id)
+);
+CREATE TABLE projection_records (
+    scope TEXT NOT NULL,
+    skill_id TEXT NOT NULL,
+    target TEXT NOT NULL,
+    generation_mode TEXT NOT NULL,
+    physical_root TEXT NOT NULL,
+    projected_path TEXT NOT NULL,
+    effective_version_hash TEXT NOT NULL,
+    generated_at TEXT NOT NULL,
+    PRIMARY KEY (scope, skill_id, target, physical_root)
+);
+CREATE TABLE update_checks (
+    id INTEGER PRIMARY KEY,
+    scope TEXT NOT NULL,
+    skill_id TEXT NOT NULL,
+    checked_at TEXT NOT NULL,
+    pinned_revision TEXT NOT NULL,
+    latest_revision TEXT,
+    outcome TEXT NOT NULL,
+    overlay_detected INTEGER NOT NULL,
+    local_modification_detected INTEGER NOT NULL,
+    notes TEXT
+);
+CREATE TABLE local_modifications (
+    id INTEGER PRIMARY KEY,
+    scope TEXT NOT NULL,
+    skill_id TEXT NOT NULL,
+    detected_at TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    path TEXT,
+    details TEXT
+);
+CREATE TABLE pins (
+    scope TEXT NOT NULL,
+    skill_id TEXT NOT NULL,
+    requested_reference TEXT NOT NULL,
+    resolved_revision TEXT NOT NULL,
+    effective_version_hash TEXT,
+    pinned_at TEXT NOT NULL,
+    PRIMARY KEY (scope, skill_id)
+);
+CREATE TABLE rollback_records (
+    id INTEGER PRIMARY KEY,
+    scope TEXT NOT NULL,
+    skill_id TEXT NOT NULL,
+    rolled_back_at TEXT NOT NULL,
+    from_reference TEXT NOT NULL,
+    to_reference TEXT NOT NULL
+);
+CREATE TABLE telemetry_settings (
+    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    consent TEXT NOT NULL,
+    notice_seen_at TEXT,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE history_events (
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL,
+    scope TEXT,
+    skill_id TEXT,
+    target TEXT,
+    occurred_at TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    details_json TEXT
+);
+PRAGMA user_version = 1;
+",
+        )
+        .expect("partial legacy schema setup succeeds");
+
+    connection
+        .execute(
+            "INSERT INTO install_records_v1 (
+                scope, skill_id, source_kind, source_url, source_subpath, resolved_revision,
+                upstream_revision, content_hash, overlay_hash, effective_version_hash,
+                installed_at, updated_at, detached, forked
+            ) VALUES (
+                'workspace', 'release-notes', 'git', 'https://example.com/release-notes.git',
+                '.agents/skills/release-notes', 'aaaaaaaaaaaaaaaa', 'bbbbbbbbbbbbbbbb',
+                'sha256:content', 'sha256:overlay', 'sha256:effective',
+                '2026-03-19T12:00:00Z', '2026-03-19T12:05:00Z', 0, 0
+            )",
+            [],
+        )
+        .expect("legacy install record writes");
+
+    let store =
+        LocalStateStore::open_at_for(&path, &workspace).expect("partial migration recovery works");
+
+    assert_eq!(
+        store.schema_version().expect("schema version is readable"),
+        CURRENT_LOCAL_STATE_VERSION
+    );
+
+    let install = store
+        .install_record(&ManagedSkillRef::new(
+            ManagedScope::Workspace,
+            "release-notes",
+        ))
+        .expect("install record loads")
+        .expect("install record exists");
+    assert_eq!(install.source_url, "https://example.com/release-notes.git");
+
+    let legacy_backup_count: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'install_records_v1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("legacy backup query succeeds");
+    assert_eq!(legacy_backup_count, 0);
+}

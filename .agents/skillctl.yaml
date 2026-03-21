@@ -1,11 +1,11 @@
 version: 1
 
 imports:
-  - id: release-notes
+  - id: skillctl
     type: local-path
-    url: file:///tmp/tmp.TArWpWNOSk/repo/
-    ref: sha256:b5aaf56bf01e8d745101a2a7bebcd6e42c31196cbd622748039f17fe9b369d52
-    path: .agents/skills/release-notes
+    url: file:///tmp/skillctl-demo-source.jPBB6w/
+    ref: sha256:b6441df1c4a5dbace12850905b02e14712352ddf3acd19d4818d5594b9c2058b
+    path: .agents/skills/skillctl
     scope: workspace
     enabled: true
 
