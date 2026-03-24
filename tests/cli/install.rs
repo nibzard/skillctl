@@ -540,6 +540,198 @@ fn install_warns_and_reports_trust_for_unreviewed_script_imports() {
 }
 
 #[test]
+fn install_reports_declared_capabilities_for_imported_skills() {
+    let workspace = TestWorkspace::new();
+    workspace.write_file(
+        "shared-skills/.agents/skills/release-notes/SKILL.md",
+        concat!(
+            "---\n",
+            "name: release-notes\n",
+            "description: Summarize release notes.\n",
+            "capabilities:\n",
+            "  - network\n",
+            "  - shell\n",
+            "---\n",
+            "\n",
+            "# Release Notes\n",
+        ),
+    );
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args([
+            "--json",
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::is_empty());
+
+    let body: Value =
+        serde_json::from_slice(&assert.get_output().stdout).expect("stdout is valid json");
+
+    assert_eq!(
+        body["data"]["candidates"][0]["safety"]["capabilities"],
+        json!(["network", "shell"])
+    );
+    assert_eq!(
+        body["data"]["installed"][0]["safety"]["capabilities"],
+        json!(["network", "shell"])
+    );
+    assert!(
+        body["warnings"]
+            .as_array()
+            .expect("warnings array exists")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .expect("warning exists")
+                .contains("declares capabilities: network, shell")),
+        "unexpected warnings: {body:#?}",
+    );
+}
+
+#[test]
+fn install_warns_when_required_credentials_are_missing() {
+    let workspace = TestWorkspace::new();
+    workspace.write_file(
+        "shared-skills/.agents/skills/release-notes/SKILL.md",
+        concat!(
+            "---\n",
+            "name: release-notes\n",
+            "description: Summarize release notes.\n",
+            "credentials:\n",
+            "  - name: OPENAI_API_KEY\n",
+            "    purpose: Access the OpenAI API\n",
+            "  - name: GITHUB_TOKEN\n",
+            "    optional: true\n",
+            "---\n",
+            "\n",
+            "# Release Notes\n",
+        ),
+    );
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("GITHUB_TOKEN")
+        .args([
+            "--json",
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::is_empty());
+
+    let body: Value =
+        serde_json::from_slice(&assert.get_output().stdout).expect("stdout is valid json");
+
+    assert_eq!(
+        body["data"]["installed"][0]["safety"]["credentials"],
+        json!([
+            {
+                "name": "OPENAI_API_KEY",
+                "purpose": "Access the OpenAI API"
+            },
+            {
+                "name": "GITHUB_TOKEN",
+                "optional": true
+            }
+        ])
+    );
+    assert!(
+        body["warnings"]
+            .as_array()
+            .expect("warnings array exists")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .expect("warning exists")
+                .contains("requires credentials OPENAI_API_KEY that are not set")),
+        "unexpected warnings: {body:#?}",
+    );
+}
+
+#[test]
+fn install_warns_when_required_tools_are_missing() {
+    let workspace = TestWorkspace::new();
+    let empty_bin = workspace.path().join("empty-bin");
+    fs::create_dir_all(&empty_bin).expect("empty bin exists");
+    workspace.write_file(
+        "shared-skills/.agents/skills/release-notes/SKILL.md",
+        concat!(
+            "---\n",
+            "name: release-notes\n",
+            "description: Summarize release notes.\n",
+            "dependencies:\n",
+            "  tools:\n",
+            "    - ffmpeg\n",
+            "    - name: gh\n",
+            "      optional: true\n",
+            "---\n",
+            "\n",
+            "# Release Notes\n",
+        ),
+    );
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("PATH", &empty_bin)
+        .args([
+            "--json",
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::is_empty());
+
+    let body: Value =
+        serde_json::from_slice(&assert.get_output().stdout).expect("stdout is valid json");
+
+    assert_eq!(
+        body["data"]["installed"][0]["safety"]["dependencies"]["tools"],
+        json!([
+            {
+                "name": "ffmpeg"
+            },
+            {
+                "name": "gh",
+                "optional": true
+            }
+        ])
+    );
+    assert!(
+        body["warnings"]
+            .as_array()
+            .expect("warnings array exists")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .expect("warning exists")
+                .contains("requires tools ffmpeg that are not available on PATH")),
+        "unexpected warnings: {body:#?}",
+    );
+}
+
+#[test]
 fn telemetry_status_enable_and_disable_use_the_local_state_store() {
     let workspace = TestWorkspace::new();
 

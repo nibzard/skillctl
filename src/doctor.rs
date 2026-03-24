@@ -23,7 +23,7 @@ use crate::{
     response::AppResponse,
     skill::{
         self, CLAUDE_FRONTMATTER_FIELDS, OPENAI_METADATA_FILE, SKILL_MANIFEST_FILE,
-        SkillDefinition, SkillVendorMetadata,
+        SkillDefinition, SkillSafetySummary, SkillVendorMetadata,
     },
     source::{imports_store_root, stored_import_root},
     state::{LocalStateStore, ManagedScope, ManagedSkillRef},
@@ -75,6 +75,9 @@ pub struct DiagnosticIssue {
     /// Trust decision associated with the issue, when relevant.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trust: Option<SkillTrust>,
+    /// Declarative safety metadata associated with the issue, when relevant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safety: Option<SkillSafetySummary>,
     /// Plain-English explanation.
     pub message: String,
     /// Suggested next action.
@@ -118,6 +121,36 @@ pub struct ExplainReport {
     pub targets: Vec<ExplainTarget>,
     /// Drift and state summary relevant to the active copy.
     pub drift: ExplainDrift,
+    /// Related issues already known for this skill.
+    pub issues: Vec<DiagnosticIssue>,
+}
+
+/// Preflight payload returned through `skillctl inspect`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct InspectReport {
+    /// Requested projected skill name.
+    pub skill: String,
+    /// Scope used for root planning and visibility checks.
+    pub scope: String,
+    /// Overall inspect status.
+    pub status: ExplainStatus,
+    /// Active winner, when one exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<ExplainCandidate>,
+    /// Trust summary for the active winner, when one exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust: Option<SkillTrust>,
+    /// Declarative safety metadata for the active winner, when one exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safety: Option<SkillSafetySummary>,
+    /// Required credentials currently missing from the environment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_credentials: Vec<String>,
+    /// Required tools currently missing from PATH.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_tools: Vec<String>,
+    /// Visibility view per selected target.
+    pub targets: Vec<ExplainTarget>,
     /// Related issues already known for this skill.
     pub issues: Vec<DiagnosticIssue>,
 }
@@ -273,6 +306,41 @@ pub fn build_explain_response(
     Ok(with_warning_messages(response, warnings))
 }
 
+/// Build the response payload for `skillctl inspect`.
+pub fn build_inspect_response(
+    context: &AppContext,
+    skill_name: &str,
+) -> Result<AppResponse, AppError> {
+    let report = if is_bundled_user_skill_request(context, skill_name) {
+        build_bundled_inspect_report(context)?
+    } else {
+        let analysis = analyze_workspace(context)?;
+        build_inspect_report(context, &analysis, skill_name)?
+    };
+    let status = if report
+        .issues
+        .iter()
+        .any(|issue| issue.severity == DiagnosticSeverity::Error)
+    {
+        ExitStatus::ValidationFailure
+    } else {
+        ExitStatus::Success
+    };
+    let summary = inspect_summary(&report);
+    let warnings = report
+        .issues
+        .iter()
+        .filter(|issue| issue.severity == DiagnosticSeverity::Warning)
+        .map(issue_line)
+        .collect::<Vec<_>>();
+
+    let response = AppResponse::success("inspect")
+        .with_summary(summary)
+        .with_data(serde_json::to_value(&report)?)
+        .with_exit_status(status);
+    Ok(with_warning_messages(response, warnings))
+}
+
 /// Build the typed explain report used by the read-only TUI dashboard.
 pub(crate) fn build_explain_report_for_tui(
     context: &AppContext,
@@ -331,6 +399,7 @@ fn bundled_doctor_artifacts(context: &AppContext) -> Result<BundledDoctorArtifac
                 target: Some(record.target),
                 path: Some(record.physical_root.clone()),
                 trust: None,
+                safety: None,
                 message: format!(
                     "target '{}' is projected into '{}' but the bundled plan expects '{}'",
                     record.target.as_str(),
@@ -357,6 +426,7 @@ fn bundled_doctor_artifacts(context: &AppContext) -> Result<BundledDoctorArtifac
                 target: Some(assignment.target),
                 path: Some(path),
                 trust: None,
+                safety: None,
                 message: format!(
                     "target '{}' currently materializes a bundled copy that does not match the active built-in asset",
                     assignment.target.as_str()
@@ -472,6 +542,24 @@ fn build_bundled_explain_report(context: &AppContext) -> Result<ExplainReport, A
     })
 }
 
+fn build_bundled_inspect_report(context: &AppContext) -> Result<InspectReport, AppError> {
+    let explain = build_bundled_explain_report(context)?;
+    let trust = explain.winner.as_ref().map(|_| SkillTrust::local(false));
+
+    Ok(InspectReport {
+        skill: explain.skill,
+        scope: explain.scope,
+        status: explain.status,
+        candidate: explain.winner,
+        trust,
+        safety: None,
+        missing_credentials: Vec::new(),
+        missing_tools: Vec::new(),
+        targets: explain.targets,
+        issues: explain.issues,
+    })
+}
+
 fn bundled_base_issues(context: &AppContext) -> Result<Vec<DiagnosticIssue>, AppError> {
     builtin::diagnostics(context)?
         .into_iter()
@@ -484,6 +572,7 @@ fn bundled_base_issues(context: &AppContext) -> Result<Vec<DiagnosticIssue>, App
                 target: None,
                 path: diagnostic.path,
                 trust: None,
+                safety: None,
                 message: diagnostic.message,
                 fix: diagnostic.fix,
             })
@@ -579,6 +668,7 @@ fn analyze_workspace(context: &AppContext) -> Result<WorkspaceAnalysis, AppError
                     target: None,
                     path: None,
                     trust: None,
+                    safety: None,
                     message: error.to_string(),
                     fix: Some(
                         "fix validation errors in the manifest, lockfile, overlays, or stored imports"
@@ -647,6 +737,7 @@ fn collect_validation_issues(
                         target: None,
                         path: Some(planner::display_path(context, &root)),
                         trust: None,
+                        safety: None,
                         message: format!(
                             "canonical skills root '{}' contains a non-directory entry",
                             planner::display_path(context, &root)
@@ -683,6 +774,7 @@ fn collect_validation_issues(
                 target: None,
                 path: Some(planner::display_path(context, &skills_root)),
                 trust: None,
+                safety: None,
                 message: format!(
                     "canonical skills root '{}' must be a directory",
                     planner::display_path(context, &skills_root)
@@ -729,6 +821,7 @@ fn validate_import(
             target: None,
             path: Some(lockfile.path.display().to_string()),
             trust: None,
+            safety: None,
             message: format!(
                 "enabled import '{}' is missing from the lockfile",
                 import.id
@@ -849,6 +942,7 @@ fn doctor_issues(
                     target: Some(*target),
                     path: None,
                     trust: None,
+                    safety: None,
                     message: if acknowledged {
                         format!(
                             "target '{}' documents unstable symlink behavior; projection.allow_unsafe_targets explicitly enables symlink mode and copy mode is still safer",
@@ -881,6 +975,9 @@ fn doctor_issues(
     issues.extend(graph_shadowing_issues(scope, graph));
     issues.extend(graph_conflict_issues(scope, graph));
     issues.extend(adapter_field_issues(context, &analysis.manifest, graph));
+    issues.extend(missing_required_credential_issues(scope, graph));
+    issues.extend(missing_required_tool_issues(scope, graph));
+    issues.extend(declared_capability_risk_issues(scope, graph));
     issues.extend(script_risk_issues(scope, graph));
 
     if !targets.is_empty() {
@@ -928,6 +1025,7 @@ fn graph_shadowing_issues(
             target: None,
             path: None,
             trust: None,
+            safety: None,
             message: format!(
                 "'{}' resolves to {} and shadows {}",
                 projection.name,
@@ -967,6 +1065,7 @@ fn graph_conflict_issues(scope: ManagedScope, graph: &EffectiveSkillGraph) -> Ve
             target: None,
             path: None,
             trust: None,
+            safety: None,
             message: format!(
                 "same-name conflict remains for '{}' across {}",
                 conflict.name,
@@ -1028,11 +1127,142 @@ fn script_risk_issues(scope: ManagedScope, graph: &EffectiveSkillGraph) -> Vec<D
             target: None,
             path: Some(candidate.skill.root.display().to_string()),
             trust: Some(crate::trust::trust_for_candidate(candidate)),
+            safety: issue_safety(&candidate.skill.safety),
             message: format!(
                 "imported skill '{}' contains files under scripts/ and should be reviewed before use",
                 candidate.skill.name.as_str()
             ),
             fix: Some("review the skill contents or fork it into local ownership".to_string()),
+        });
+    }
+
+    issues
+}
+
+fn issue_safety(summary: &SkillSafetySummary) -> Option<SkillSafetySummary> {
+    if summary.is_empty() {
+        None
+    } else {
+        Some(summary.clone())
+    }
+}
+
+fn missing_required_credential_issues(
+    scope: ManagedScope,
+    graph: &EffectiveSkillGraph,
+) -> Vec<DiagnosticIssue> {
+    let mut issues = Vec::new();
+
+    for winner in graph
+        .projections
+        .iter()
+        .filter_map(|projection| projection.winner())
+    {
+        if winner.scope != skill_scope_from_managed(scope) {
+            continue;
+        }
+
+        let missing_credentials = winner.skill.safety.missing_required_credentials();
+        if missing_credentials.is_empty() {
+            continue;
+        }
+
+        issues.push(DiagnosticIssue {
+            severity: DiagnosticSeverity::Warning,
+            code: "missing-required-credential".to_string(),
+            skill: Some(winner.skill.name.as_str().to_string()),
+            scope: Some(scope.as_str().to_string()),
+            target: None,
+            path: Some(winner.skill.root.display().to_string()),
+            trust: Some(crate::trust::trust_for_candidate(winner)),
+            safety: Some(winner.skill.safety.clone()),
+            message: format!(
+                "skill '{}' requires credentials {} that are not set in the current environment",
+                winner.skill.name.as_str(),
+                missing_credentials.join(", ")
+            ),
+            fix: Some(
+                "export the required credentials before use or mark them optional if they are not always needed"
+                    .to_string(),
+            ),
+        });
+    }
+
+    issues
+}
+
+fn missing_required_tool_issues(
+    scope: ManagedScope,
+    graph: &EffectiveSkillGraph,
+) -> Vec<DiagnosticIssue> {
+    let mut issues = Vec::new();
+
+    for winner in graph
+        .projections
+        .iter()
+        .filter_map(|projection| projection.winner())
+    {
+        if winner.scope != skill_scope_from_managed(scope) {
+            continue;
+        }
+
+        let missing_tools = winner.skill.safety.missing_required_tools();
+        if missing_tools.is_empty() {
+            continue;
+        }
+
+        issues.push(DiagnosticIssue {
+            severity: DiagnosticSeverity::Warning,
+            code: "missing-required-tool".to_string(),
+            skill: Some(winner.skill.name.as_str().to_string()),
+            scope: Some(scope.as_str().to_string()),
+            target: None,
+            path: Some(winner.skill.root.display().to_string()),
+            trust: Some(crate::trust::trust_for_candidate(winner)),
+            safety: Some(winner.skill.safety.clone()),
+            message: format!(
+                "skill '{}' requires tools {} that are not available on PATH",
+                winner.skill.name.as_str(),
+                missing_tools.join(", ")
+            ),
+            fix: Some(
+                "install the required tools or mark them optional if they are not always needed"
+                    .to_string(),
+            ),
+        });
+    }
+
+    issues
+}
+
+fn declared_capability_risk_issues(
+    scope: ManagedScope,
+    graph: &EffectiveSkillGraph,
+) -> Vec<DiagnosticIssue> {
+    let mut issues = Vec::new();
+    for candidate in &graph.candidates {
+        if candidate.scope != skill_scope_from_managed(scope) || candidate.import.is_none() {
+            continue;
+        }
+        if candidate.skill.safety.capabilities.is_empty() {
+            continue;
+        }
+
+        issues.push(DiagnosticIssue {
+            severity: DiagnosticSeverity::Warning,
+            code: "declared-capability-risk".to_string(),
+            skill: Some(candidate.skill.name.as_str().to_string()),
+            scope: Some(scope.as_str().to_string()),
+            target: None,
+            path: Some(candidate.skill.root.display().to_string()),
+            trust: Some(crate::trust::trust_for_candidate(candidate)),
+            safety: Some(candidate.skill.safety.clone()),
+            message: format!(
+                "imported skill '{}' declares capabilities: {}; review whether that access is expected",
+                candidate.skill.name.as_str(),
+                candidate.skill.safety.capabilities.join(", ")
+            ),
+            fix: Some("review the declared capabilities or fork the skill into local ownership".to_string()),
         });
     }
 
@@ -1069,6 +1299,7 @@ fn projection_record_issues(
                 target: Some(record.target),
                 path: Some(record.physical_root.clone()),
                 trust: None,
+                safety: None,
                 message: format!(
                     "target '{}' is projected into '{}' but the manifest now plans '{}'",
                     record.target.as_str(),
@@ -1102,6 +1333,7 @@ fn projection_record_issues(
                     target: Some(assignment.target),
                     path: Some(path),
                     trust: None,
+                    safety: None,
                     message: format!(
                         "target '{}' currently materializes a copy that does not match the active winner",
                         assignment.target.as_str()
@@ -1136,6 +1368,7 @@ fn stale_lockfile_issues(
             target: None,
             path: Some(lockfile.path.display().to_string()),
             trust: None,
+            safety: None,
             message: format!(
                 "lockfile entry '{}' no longer has a matching manifest import",
                 id
@@ -1246,6 +1479,7 @@ fn build_explain_report(
                     target: None,
                     path: None,
                     trust: None,
+                    safety: None,
                     message: format!("same-name conflict remains for '{}'", skill_name),
                     fix: Some(
                         "adjust manifest priorities or remove one of the conflicting skill sources"
@@ -1334,6 +1568,130 @@ fn build_explain_report(
         shadowed,
         targets,
         drift,
+        issues,
+    })
+}
+
+fn build_inspect_report(
+    context: &AppContext,
+    analysis: &WorkspaceAnalysis,
+    skill_name: &str,
+) -> Result<InspectReport, AppError> {
+    let scope = selected_managed_scope(context);
+    let scope_label = scope.as_str().to_string();
+    let related_issues = related_issues_for_skill(&analysis.validation.issues, skill_name);
+    let Some(graph) = &analysis.graph else {
+        return Ok(InspectReport {
+            skill: skill_name.to_string(),
+            scope: scope_label,
+            status: ExplainStatus::Missing,
+            candidate: None,
+            trust: None,
+            safety: None,
+            missing_credentials: Vec::new(),
+            missing_tools: Vec::new(),
+            targets: Vec::new(),
+            issues: related_issues,
+        });
+    };
+
+    let targets = selected_targets(context, &analysis.manifest)?;
+    let target_plan = if targets.is_empty() {
+        None
+    } else {
+        Some(planner::plan_target_roots(
+            &AdapterRegistry::new(),
+            target_scope_from_managed(scope),
+            analysis.manifest.projection.policy,
+            &targets,
+            &analysis.manifest.adapters,
+        )?)
+    };
+
+    let projection = graph.projection_for(skill_name);
+    let (status, candidate, trust, safety, missing_credentials, missing_tools, inspect_issues) =
+        match projection {
+            Some(projection) => match &projection.outcome {
+                ProjectionOutcome::Selected { winner, trace, .. } => {
+                    let safety = issue_safety(&winner.skill.safety);
+                    (
+                        ExplainStatus::Selected,
+                        Some(explain_candidate(
+                            context,
+                            winner,
+                            Some(explain_winner_reason(trace)),
+                        )),
+                        Some(crate::trust::trust_for_candidate(winner)),
+                        safety,
+                        winner.skill.safety.missing_required_credentials(),
+                        winner.skill.safety.missing_required_tools(),
+                        Vec::new(),
+                    )
+                }
+                ProjectionOutcome::Conflict(conflict) => (
+                    ExplainStatus::Conflict,
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    vec![DiagnosticIssue {
+                        severity: DiagnosticSeverity::Error,
+                        code: "projected-name-conflict".to_string(),
+                        skill: Some(skill_name.to_string()),
+                        scope: Some(scope.as_str().to_string()),
+                        target: None,
+                        path: None,
+                        trust: None,
+                        safety: None,
+                        message: format!(
+                            "same-name conflict remains for '{}' across {}",
+                            skill_name,
+                            conflict
+                                .contenders
+                                .iter()
+                                .map(candidate_label)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        fix: Some(
+                            "adjust manifest priorities or remove one of the conflicting skill sources"
+                                .to_string(),
+                        ),
+                    }],
+                ),
+            },
+            None => (
+                ExplainStatus::Missing,
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                missing_skill_issues(analysis, scope, skill_name),
+            ),
+        };
+
+    let targets = explain_targets(
+        context,
+        skill_name,
+        target_plan.as_ref(),
+        status,
+        candidate.as_ref(),
+    )?;
+    let mut issues = related_issues;
+    issues.extend(inspect_issues);
+
+    Ok(InspectReport {
+        skill: skill_name.to_string(),
+        scope: scope_label,
+        status,
+        candidate,
+        trust,
+        safety,
+        missing_credentials,
+        missing_tools,
+        targets,
         issues,
     })
 }
@@ -1457,6 +1815,7 @@ fn missing_skill_issues(
             target: None,
             path: Some(analysis.manifest.path.display().to_string()),
             trust: None,
+            safety: None,
             message: format!("manifest import '{}' exists but is disabled", skill_name),
             fix: Some(format!("run skillctl enable {skill_name}")),
         });
@@ -1471,6 +1830,7 @@ fn missing_skill_issues(
             target: None,
             path: Some(analysis.lockfile.path.display().to_string()),
             trust: None,
+            safety: None,
             message: format!(
                 "lockfile still contains '{}' even though no active candidate resolves for it",
                 skill_name
@@ -1623,6 +1983,7 @@ fn skill_target_compatibility_issues(
                 target: None,
                 path: path.clone(),
                 trust: None,
+                safety: None,
                 message: format!(
                     "skill '{}' includes {} but enabled targets {} may ignore it",
                     skill.name.as_str(),
@@ -1667,6 +2028,7 @@ fn skill_target_compatibility_issues(
                 target: None,
                 path,
                 trust: None,
+                safety: None,
                 message: format!(
                     "skill '{}' uses Claude-specific frontmatter fields {} that enabled targets {} may ignore",
                     skill.name.as_str(),
@@ -1751,6 +2113,7 @@ fn ensure_directory_issue(
             target: None,
             path: Some(planner::display_path(context, path)),
             trust: None,
+            safety: None,
             message: format!(
                 "{} '{}' must be a directory",
                 label,
@@ -1766,6 +2129,7 @@ fn ensure_directory_issue(
             target: None,
             path: Some(planner::display_path(context, path)),
             trust: None,
+            safety: None,
             message: format!(
                 "{} '{}' does not exist",
                 label,
@@ -1781,6 +2145,7 @@ fn ensure_directory_issue(
             target: None,
             path: Some(planner::display_path(context, path)),
             trust: None,
+            safety: None,
             message: format!(
                 "failed to inspect '{}': {}",
                 planner::display_path(context, path),
@@ -1813,6 +2178,7 @@ fn apply_overlay_validation(
                 target: None,
                 path: Some(planner::display_path(context, &overlay_root)),
                 trust: None,
+                safety: None,
                 message: format!(
                     "overlay root '{}' must be a directory",
                     planner::display_path(context, &overlay_root)
@@ -1831,6 +2197,7 @@ fn apply_overlay_validation(
                 target: None,
                 path: Some(planner::display_path(context, &overlay_root)),
                 trust: None,
+                safety: None,
                 message: format!(
                     "overlay root '{}' does not exist",
                     planner::display_path(context, &overlay_root)
@@ -1864,6 +2231,7 @@ fn apply_overlay_validation(
                     target: None,
                     path: Some(planner::display_path(context, &source_path)),
                     trust: None,
+                    safety: None,
                     message: error.to_string(),
                     fix: Some("remove the invalid overlay path or normalize it".to_string()),
                 });
@@ -1880,6 +2248,7 @@ fn apply_overlay_validation(
                 target: None,
                 path: Some(planner::display_path(context, &source_path)),
                 trust: None,
+                safety: None,
                 message: format!(
                     "overlay file '{}' does not map to a file in the imported skill",
                     planner::display_path(context, &source_path)
@@ -2215,6 +2584,7 @@ fn skill_error_issue(
         target: None,
         path: Some(path_for_error(context, &error, root)),
         trust: None,
+        safety: None,
         message: error.to_string(),
         fix: Some("fix the SKILL.md contents or remove the malformed skill".to_string()),
     }
@@ -2258,6 +2628,59 @@ fn issue_line(issue: &DiagnosticIssue) -> String {
             issue.message
         ),
         (None, None) => format!("{}: {}", issue.severity.severity_label(), issue.message),
+    }
+}
+
+fn inspect_summary(report: &InspectReport) -> String {
+    match report.status {
+        ExplainStatus::Selected => {
+            let candidate = report
+                .candidate
+                .as_ref()
+                .expect("selected inspect report includes a candidate");
+            let trust_fragment = report.trust.as_ref().map_or_else(
+                || "trust state unavailable".to_string(),
+                |trust| {
+                    if trust.review_required {
+                        "review required".to_string()
+                    } else {
+                        "trusted locally".to_string()
+                    }
+                },
+            );
+            let safety = report.safety.as_ref();
+            let capability_count = safety.map_or(0, |summary| summary.capabilities.len());
+            let credential_count = safety.map_or(0, |summary| summary.credentials.len());
+            let tool_count = safety.map_or(0, |summary| summary.dependencies.tools.len());
+            let missing_credentials = report.missing_credentials.len();
+            let missing_tools = report.missing_tools.len();
+
+            format!(
+                "Inspected preflight for {} in {} scope: {} ({}, {} capability declaration{}, {} credential declaration{}, {} tool requirement{}, {} missing credential{}, {} missing tool{}).",
+                report.skill,
+                report.scope,
+                candidate.source_class,
+                trust_fragment,
+                capability_count,
+                plural_suffix(capability_count),
+                credential_count,
+                plural_suffix(credential_count),
+                tool_count,
+                plural_suffix(tool_count),
+                missing_credentials,
+                plural_suffix(missing_credentials),
+                missing_tools,
+                plural_suffix(missing_tools),
+            )
+        }
+        ExplainStatus::Conflict => format!(
+            "Cannot inspect '{}' in {} scope because a same-name conflict remains unresolved.",
+            report.skill, report.scope
+        ),
+        ExplainStatus::Missing => format!(
+            "No active skill named '{}' resolved for {} scope preflight inspection.",
+            report.skill, report.scope
+        ),
     }
 }
 

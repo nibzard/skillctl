@@ -1,11 +1,12 @@
 //! Skill inventory, parsing, and inspection domain entry points.
 
 use std::{
-    collections::BTreeMap,
-    fs, io,
+    collections::{BTreeMap, BTreeSet},
+    env, fs, io,
     path::{Component, Path, PathBuf},
 };
 
+use serde::Serialize;
 use serde_json::json;
 use serde_yaml::Value;
 
@@ -48,6 +49,9 @@ const STANDARD_FRONTMATTER_FIELDS: &[&str] = &[
     "license",
     "compatibility",
     "metadata",
+    "capabilities",
+    "credentials",
+    "dependencies",
     "allowed-tools",
 ];
 
@@ -84,6 +88,173 @@ pub struct SkillVendorMetadata {
     pub files: BTreeMap<PathBuf, String>,
 }
 
+/// Typed safety metadata parsed from declarative `SKILL.md` fields.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct SkillSafetySummary {
+    /// Coarse capability classes declared by the skill author.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    /// Structured credential requirements declared by the skill author.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credentials: Vec<SkillCredentialRequirement>,
+    /// Declared external tool requirements.
+    #[serde(default, skip_serializing_if = "SkillDependencySummary::is_empty")]
+    pub dependencies: SkillDependencySummary,
+}
+
+/// One declared credential requirement for a skill.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SkillCredentialRequirement {
+    /// Environment variable or stable credential identifier.
+    pub name: String,
+    /// Whether the credential is optional at runtime.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub optional: bool,
+    /// Human-facing explanation for why the credential is needed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+}
+
+/// Declared dependency requirements for a skill.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct SkillDependencySummary {
+    /// External tools expected on the user's PATH.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<SkillToolRequirement>,
+}
+
+impl SkillDependencySummary {
+    /// Return whether no dependency requirements are present.
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty()
+    }
+}
+
+/// One declared external tool requirement for a skill.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SkillToolRequirement {
+    /// Executable name expected on PATH.
+    pub name: String,
+    /// Whether the tool is optional at runtime.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub optional: bool,
+    /// Human-facing explanation for why the tool is needed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+}
+
+impl SkillSafetySummary {
+    /// Return whether no structured safety metadata is present.
+    pub fn is_empty(&self) -> bool {
+        self.capabilities.is_empty() && self.credentials.is_empty() && self.dependencies.is_empty()
+    }
+
+    /// Return whether any structured safety metadata is present.
+    pub fn has_entries(&self) -> bool {
+        !self.is_empty()
+    }
+
+    /// Return any required credentials missing from the current environment.
+    pub fn missing_required_credentials(&self) -> Vec<String> {
+        self.credentials
+            .iter()
+            .filter(|credential| !credential.optional)
+            .filter(|credential| std::env::var_os(&credential.name).is_none())
+            .map(|credential| credential.name.clone())
+            .collect()
+    }
+
+    /// Return any required tool dependencies missing from the current PATH.
+    pub fn missing_required_tools(&self) -> Vec<String> {
+        self.dependencies
+            .tools
+            .iter()
+            .filter(|tool| !tool.optional)
+            .filter(|tool| !tool_exists_on_path(&tool.name))
+            .map(|tool| tool.name.clone())
+            .collect()
+    }
+
+    /// Build user-visible warnings for imported skills with declared capabilities.
+    pub fn imported_warnings(&self, skill_name: &str) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        if !self.capabilities.is_empty() {
+            warnings.push(format!(
+                "imported skill '{}' declares capabilities: {}",
+                skill_name,
+                self.capabilities.join(", ")
+            ));
+        }
+
+        let missing_credentials = self.missing_required_credentials();
+        if !missing_credentials.is_empty() {
+            warnings.push(format!(
+                "imported skill '{}' requires credentials {} that are not set in the current environment",
+                skill_name,
+                missing_credentials.join(", ")
+            ));
+        }
+
+        let missing_tools = self.missing_required_tools();
+        if !missing_tools.is_empty() {
+            warnings.push(format!(
+                "imported skill '{}' requires tools {} that are not available on PATH",
+                skill_name,
+                missing_tools.join(", ")
+            ));
+        }
+
+        warnings
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn tool_exists_on_path(name: &str) -> bool {
+    let Some(path) = env::var_os("PATH") else {
+        return false;
+    };
+
+    let candidate_names = executable_candidates(name);
+    env::split_paths(&path).any(|directory| {
+        candidate_names.iter().any(|candidate| {
+            fs::metadata(directory.join(candidate)).is_ok_and(|metadata| metadata.is_file())
+        })
+    })
+}
+
+fn executable_candidates(name: &str) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let has_extension = Path::new(name).extension().is_some();
+        if has_extension {
+            return vec![name.to_string()];
+        }
+
+        let pathext = env::var_os("PATHEXT")
+            .map(|value| {
+                env::split_paths(&value)
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![".EXE".to_string(), ".BAT".to_string(), ".CMD".to_string()]);
+
+        let mut candidates = vec![name.to_string()];
+        for extension in pathext {
+            candidates.push(format!("{name}{extension}"));
+        }
+        candidates
+    }
+
+    #[cfg(not(windows))]
+    {
+        vec![name.to_string()]
+    }
+}
+
 /// Parsed skill directory definition.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SkillDefinition {
@@ -99,6 +270,8 @@ pub struct SkillDefinition {
     pub body: String,
     /// Parsed frontmatter, including vendor-specific passthrough fields.
     pub frontmatter: SkillFrontmatter,
+    /// Typed safety metadata derived from declarative frontmatter fields.
+    pub safety: SkillSafetySummary,
     /// Supported vendor-specific metadata files preserved alongside the skill.
     pub vendor_metadata: SkillVendorMetadata,
 }
@@ -132,6 +305,7 @@ impl SkillDefinition {
         let fields = parse_frontmatter(&frontmatter_source, &manifest_path)?;
 
         validate_optional_standard_fields(&fields, &manifest_path)?;
+        let safety = parse_safety_summary(&fields, &manifest_path)?;
 
         let name = SkillName::parse(
             require_string_field(&fields, "name", &manifest_path)?,
@@ -151,6 +325,7 @@ impl SkillDefinition {
                 vendor_fields: extract_vendor_frontmatter(&fields),
                 fields,
             },
+            safety,
             vendor_metadata,
         })
     }
@@ -226,6 +401,22 @@ pub struct ExplainRequest {
 
 impl ExplainRequest {
     /// Create an explain request from parsed CLI arguments.
+    pub fn new(skill: String) -> Self {
+        Self {
+            skill: SkillName(skill),
+        }
+    }
+}
+
+/// Typed request for `skillctl inspect`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InspectRequest {
+    /// Managed skill name.
+    pub skill: SkillName,
+}
+
+impl InspectRequest {
+    /// Create an inspect request from parsed CLI arguments.
     pub fn new(skill: String) -> Self {
         Self {
             skill: SkillName(skill),
@@ -496,6 +687,14 @@ pub fn handle_explain(
     request: ExplainRequest,
 ) -> Result<AppResponse, AppError> {
     doctor::build_explain_response(context, request.skill.as_str())
+}
+
+/// Handle `skillctl inspect`.
+pub fn handle_inspect(
+    context: &AppContext,
+    request: InspectRequest,
+) -> Result<AppResponse, AppError> {
+    doctor::build_inspect_response(context, request.skill.as_str())
 }
 
 /// Handle `skillctl enable`.
@@ -1100,7 +1299,312 @@ fn validate_optional_standard_fields(
         }
     }
 
+    if let Some(value) = fields.get("capabilities") {
+        let sequence = value.as_sequence().ok_or_else(|| {
+            skill_validation(
+                skill_path,
+                "SKILL.md field 'capabilities' must be a YAML sequence of strings when present",
+            )
+        })?;
+
+        for capability in sequence {
+            let Some(capability) = capability.as_str() else {
+                return Err(skill_validation(
+                    skill_path,
+                    "SKILL.md field 'capabilities' must contain only strings",
+                ));
+            };
+
+            if capability.trim().is_empty() {
+                return Err(skill_validation(
+                    skill_path,
+                    "SKILL.md field 'capabilities' must not contain empty strings",
+                ));
+            }
+        }
+    }
+
+    if let Some(value) = fields.get("credentials") {
+        let sequence = value.as_sequence().ok_or_else(|| {
+            skill_validation(
+                skill_path,
+                "SKILL.md field 'credentials' must be a YAML sequence of mappings when present",
+            )
+        })?;
+
+        for credential in sequence {
+            let Some(mapping) = credential.as_mapping() else {
+                return Err(skill_validation(
+                    skill_path,
+                    "SKILL.md field 'credentials' must contain only mappings",
+                ));
+            };
+
+            let mut name_present = false;
+            for (key, value) in mapping {
+                let Some(key) = key.as_str() else {
+                    return Err(skill_validation(
+                        skill_path,
+                        "SKILL.md field 'credentials' must use string keys",
+                    ));
+                };
+
+                match key {
+                    "name" => {
+                        let Some(name) = value.as_str() else {
+                            return Err(skill_validation(
+                                skill_path,
+                                "SKILL.md credential field 'name' must be a string",
+                            ));
+                        };
+                        if name.trim().is_empty() {
+                            return Err(skill_validation(
+                                skill_path,
+                                "SKILL.md credential field 'name' must not be empty",
+                            ));
+                        }
+                        name_present = true;
+                    }
+                    "optional" => {
+                        if !value.is_bool() {
+                            return Err(skill_validation(
+                                skill_path,
+                                "SKILL.md credential field 'optional' must be a boolean when present",
+                            ));
+                        }
+                    }
+                    "purpose" => {
+                        let Some(purpose) = value.as_str() else {
+                            return Err(skill_validation(
+                                skill_path,
+                                "SKILL.md credential field 'purpose' must be a string when present",
+                            ));
+                        };
+                        if purpose.trim().is_empty() {
+                            return Err(skill_validation(
+                                skill_path,
+                                "SKILL.md credential field 'purpose' must not be empty when present",
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if !name_present {
+                return Err(skill_validation(
+                    skill_path,
+                    "SKILL.md credential entries must define a 'name'",
+                ));
+            }
+        }
+    }
+
+    if let Some(value) = fields.get("dependencies") {
+        let mapping = value.as_mapping().ok_or_else(|| {
+            skill_validation(
+                skill_path,
+                "SKILL.md field 'dependencies' must be a YAML mapping when present",
+            )
+        })?;
+
+        for (key, value) in mapping {
+            let Some(key) = key.as_str() else {
+                return Err(skill_validation(
+                    skill_path,
+                    "SKILL.md field 'dependencies' must use string keys",
+                ));
+            };
+
+            if key != "tools" {
+                continue;
+            }
+
+            let sequence = value.as_sequence().ok_or_else(|| {
+                skill_validation(
+                    skill_path,
+                    "SKILL.md field 'dependencies.tools' must be a YAML sequence when present",
+                )
+            })?;
+
+            for tool in sequence {
+                match tool {
+                    Value::String(name) => {
+                        if name.trim().is_empty() {
+                            return Err(skill_validation(
+                                skill_path,
+                                "SKILL.md dependency tool entries must not be empty strings",
+                            ));
+                        }
+                    }
+                    Value::Mapping(tool_mapping) => {
+                        let mut name_present = false;
+                        for (tool_key, tool_value) in tool_mapping {
+                            let Some(tool_key) = tool_key.as_str() else {
+                                return Err(skill_validation(
+                                    skill_path,
+                                    "SKILL.md dependency tool entries must use string keys",
+                                ));
+                            };
+
+                            match tool_key {
+                                "name" => {
+                                    let Some(name) = tool_value.as_str() else {
+                                        return Err(skill_validation(
+                                            skill_path,
+                                            "SKILL.md dependency tool field 'name' must be a string",
+                                        ));
+                                    };
+                                    if name.trim().is_empty() {
+                                        return Err(skill_validation(
+                                            skill_path,
+                                            "SKILL.md dependency tool field 'name' must not be empty",
+                                        ));
+                                    }
+                                    name_present = true;
+                                }
+                                "optional" => {
+                                    if !tool_value.is_bool() {
+                                        return Err(skill_validation(
+                                            skill_path,
+                                            "SKILL.md dependency tool field 'optional' must be a boolean when present",
+                                        ));
+                                    }
+                                }
+                                "purpose" => {
+                                    let Some(purpose) = tool_value.as_str() else {
+                                        return Err(skill_validation(
+                                            skill_path,
+                                            "SKILL.md dependency tool field 'purpose' must be a string when present",
+                                        ));
+                                    };
+                                    if purpose.trim().is_empty() {
+                                        return Err(skill_validation(
+                                            skill_path,
+                                            "SKILL.md dependency tool field 'purpose' must not be empty when present",
+                                        ));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        if !name_present {
+                            return Err(skill_validation(
+                                skill_path,
+                                "SKILL.md dependency tool entries must define a 'name'",
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err(skill_validation(
+                            skill_path,
+                            "SKILL.md field 'dependencies.tools' must contain only strings or mappings",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
+}
+
+fn parse_safety_summary(
+    fields: &BTreeMap<String, Value>,
+    _skill_path: &Path,
+) -> Result<SkillSafetySummary, AppError> {
+    let mut summary = SkillSafetySummary::default();
+    let mut seen_capabilities = BTreeSet::new();
+    let mut seen_credentials = BTreeSet::new();
+    let mut seen_tools = BTreeSet::new();
+
+    if let Some(sequence) = fields.get("capabilities").and_then(Value::as_sequence) {
+        for capability in sequence {
+            let capability = capability
+                .as_str()
+                .expect("capabilities were validated as strings")
+                .trim()
+                .to_string();
+            if seen_capabilities.insert(capability.clone()) {
+                summary.capabilities.push(capability);
+            }
+        }
+    }
+
+    if let Some(sequence) = fields.get("credentials").and_then(Value::as_sequence) {
+        for credential in sequence {
+            let mapping = credential
+                .as_mapping()
+                .expect("credentials were validated as mappings");
+            let name = mapping
+                .get(Value::String("name".to_string()))
+                .and_then(Value::as_str)
+                .expect("credentials were validated to include string names")
+                .trim()
+                .to_string();
+            if !seen_credentials.insert(name.clone()) {
+                continue;
+            }
+
+            let optional = mapping
+                .get(Value::String("optional".to_string()))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let purpose = mapping
+                .get(Value::String("purpose".to_string()))
+                .and_then(Value::as_str)
+                .map(|purpose| purpose.trim().to_string());
+
+            summary.credentials.push(SkillCredentialRequirement {
+                name,
+                optional,
+                purpose,
+            });
+        }
+    }
+
+    if let Some(mapping) = fields.get("dependencies").and_then(Value::as_mapping)
+        && let Some(sequence) = mapping
+            .get(Value::String("tools".to_string()))
+            .and_then(Value::as_sequence)
+    {
+        for tool in sequence {
+            let (name, optional, purpose) = match tool {
+                Value::String(name) => (name.trim().to_string(), false, None),
+                Value::Mapping(tool_mapping) => {
+                    let name = tool_mapping
+                        .get(Value::String("name".to_string()))
+                        .and_then(Value::as_str)
+                        .expect("dependency tools were validated to include string names")
+                        .trim()
+                        .to_string();
+                    let optional = tool_mapping
+                        .get(Value::String("optional".to_string()))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let purpose = tool_mapping
+                        .get(Value::String("purpose".to_string()))
+                        .and_then(Value::as_str)
+                        .map(|purpose| purpose.trim().to_string());
+                    (name, optional, purpose)
+                }
+                _ => unreachable!("dependency tools were validated"),
+            };
+
+            if !seen_tools.insert(name.clone()) {
+                continue;
+            }
+
+            summary.dependencies.tools.push(SkillToolRequirement {
+                name,
+                optional,
+                purpose,
+            });
+        }
+    }
+
+    Ok(summary)
 }
 
 fn extract_vendor_frontmatter(fields: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {

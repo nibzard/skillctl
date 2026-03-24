@@ -136,6 +136,9 @@ fn dispatch(command: &Command, context: &AppContext) -> Result<AppResponse, AppE
         Command::Explain(args) => {
             skill::handle_explain(context, skill::ExplainRequest::new(args.skill.clone()))
         }
+        Command::Inspect(args) => {
+            skill::handle_inspect(context, skill::InspectRequest::new(args.skill.clone()))
+        }
         Command::Override(args) => {
             overlay::handle_override(context, overlay::OverrideRequest::new(args.skill.clone()))
         }

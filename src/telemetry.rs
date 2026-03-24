@@ -749,6 +749,7 @@ mod tests {
             content_hash: "sha256:content".to_string(),
             overlay_hash: "sha256:none".to_string(),
             effective_version_hash: "sha256:effective".to_string(),
+            safety: crate::skill::SkillSafetySummary::default(),
             trust: crate::trust::SkillTrust::local(false),
         };
 

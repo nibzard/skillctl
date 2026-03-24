@@ -644,6 +644,307 @@ fn doctor_reports_trust_details_for_unreviewed_script_imports() {
 }
 
 #[test]
+fn doctor_reports_declared_capabilities_for_imported_skills() {
+    let workspace = TestWorkspace::new();
+    workspace.write_file(
+        "shared-skills/.agents/skills/release-notes/SKILL.md",
+        concat!(
+            "---\n",
+            "name: release-notes\n",
+            "description: Summarize release notes.\n",
+            "capabilities:\n",
+            "  - network\n",
+            "  - shell\n",
+            "---\n",
+            "\n",
+            "# Release Notes\n",
+        ),
+    );
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::is_empty());
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--json", "doctor"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::is_empty());
+
+    let body: Value =
+        serde_json::from_slice(&assert.get_output().stdout).expect("stdout is valid json");
+    let issue = body["data"]["issues"]
+        .as_array()
+        .expect("issues array exists")
+        .iter()
+        .find(|issue| {
+            issue["code"] == "declared-capability-risk" && issue["skill"] == "release-notes"
+        })
+        .expect("declared capability issue exists");
+
+    assert_eq!(issue["safety"]["capabilities"], json!(["network", "shell"]));
+}
+
+#[test]
+fn doctor_reports_missing_required_credentials_for_active_skills() {
+    let workspace = TestWorkspace::new();
+    workspace.write_file(
+        "shared-skills/.agents/skills/release-notes/SKILL.md",
+        concat!(
+            "---\n",
+            "name: release-notes\n",
+            "description: Summarize release notes.\n",
+            "credentials:\n",
+            "  - name: OPENAI_API_KEY\n",
+            "    purpose: Access the OpenAI API\n",
+            "  - name: GITHUB_TOKEN\n",
+            "    optional: true\n",
+            "---\n",
+            "\n",
+            "# Release Notes\n",
+        ),
+    );
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("GITHUB_TOKEN")
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::is_empty());
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("GITHUB_TOKEN")
+        .args(["--json", "doctor"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::is_empty());
+
+    let body: Value =
+        serde_json::from_slice(&assert.get_output().stdout).expect("stdout is valid json");
+    let issue = body["data"]["issues"]
+        .as_array()
+        .expect("issues array exists")
+        .iter()
+        .find(|issue| {
+            issue["code"] == "missing-required-credential" && issue["skill"] == "release-notes"
+        })
+        .expect("missing-required-credential issue exists");
+
+    assert_eq!(
+        issue["safety"]["credentials"],
+        json!([
+            {
+                "name": "OPENAI_API_KEY",
+                "purpose": "Access the OpenAI API"
+            },
+            {
+                "name": "GITHUB_TOKEN",
+                "optional": true
+            }
+        ])
+    );
+}
+
+#[test]
+fn doctor_reports_missing_required_tools_for_active_skills() {
+    let workspace = TestWorkspace::new();
+    let empty_bin = workspace.path().join("empty-bin");
+    fs::create_dir_all(&empty_bin).expect("empty bin exists");
+    workspace.write_file(
+        "shared-skills/.agents/skills/release-notes/SKILL.md",
+        concat!(
+            "---\n",
+            "name: release-notes\n",
+            "description: Summarize release notes.\n",
+            "dependencies:\n",
+            "  tools:\n",
+            "    - ffmpeg\n",
+            "    - name: gh\n",
+            "      optional: true\n",
+            "---\n",
+            "\n",
+            "# Release Notes\n",
+        ),
+    );
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("PATH", &empty_bin)
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::is_empty());
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("PATH", &empty_bin)
+        .args(["--json", "doctor"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::is_empty());
+
+    let body: Value =
+        serde_json::from_slice(&assert.get_output().stdout).expect("stdout is valid json");
+    let issue = body["data"]["issues"]
+        .as_array()
+        .expect("issues array exists")
+        .iter()
+        .find(|issue| issue["code"] == "missing-required-tool" && issue["skill"] == "release-notes")
+        .expect("missing-required-tool issue exists");
+
+    assert_eq!(
+        issue["safety"]["dependencies"]["tools"],
+        json!([
+            {
+                "name": "ffmpeg"
+            },
+            {
+                "name": "gh",
+                "optional": true
+            }
+        ])
+    );
+}
+
+#[test]
+fn inspect_reports_preflight_summary_for_active_skills() {
+    let workspace = TestWorkspace::new();
+    let empty_bin = workspace.path().join("empty-bin");
+    fs::create_dir_all(&empty_bin).expect("empty bin exists");
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_file(
+        "shared-skills/.agents/skills/release-notes/SKILL.md",
+        concat!(
+            "---\n",
+            "name: release-notes\n",
+            "description: Summarize release notes.\n",
+            "capabilities:\n",
+            "  - network\n",
+            "credentials:\n",
+            "  - name: OPENAI_API_KEY\n",
+            "dependencies:\n",
+            "  tools:\n",
+            "    - ffmpeg\n",
+            "---\n",
+            "\n",
+            "# Release Notes\n",
+        ),
+    );
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("PATH", &empty_bin)
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::is_empty());
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("PATH", &empty_bin)
+        .env_remove("OPENAI_API_KEY")
+        .args(["--json", "inspect", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let body: Value =
+        serde_json::from_slice(&assert.get_output().stdout).expect("stdout is valid json");
+
+    assert_eq!(body["command"], "inspect");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["data"]["skill"], "release-notes");
+    assert_eq!(body["data"]["status"], "selected");
+    assert_eq!(body["data"]["candidate"]["source_class"], "imported");
+    assert_eq!(body["data"]["trust"]["review_required"], true);
+    assert_eq!(body["data"]["safety"]["capabilities"], json!(["network"]));
+    assert_eq!(
+        body["data"]["missing_credentials"],
+        json!(["OPENAI_API_KEY"])
+    );
+    assert_eq!(body["data"]["missing_tools"], json!(["ffmpeg"]));
+    assert_eq!(body["data"]["targets"][0]["target"], "claude-code");
+    assert_eq!(body["data"]["targets"][0]["visible"], true);
+}
+
+#[test]
+fn inspect_reports_missing_status_for_unknown_skills() {
+    let workspace = TestWorkspace::new();
+
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--json", "inspect", "missing-skill"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let body: Value =
+        serde_json::from_slice(&assert.get_output().stdout).expect("stdout is valid json");
+
+    assert_eq!(body["command"], "inspect");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["data"]["skill"], "missing-skill");
+    assert_eq!(body["data"]["status"], "missing");
+    assert_eq!(body["data"]["issues"], json!([]));
+}
+
+#[test]
 fn explain_reports_winner_shadowed_candidates_visibility_and_drift() {
     let workspace = TestWorkspace::new();
     workspace.write_manifest(concat!(

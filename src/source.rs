@@ -35,7 +35,9 @@ use crate::{
     materialize::{self, MaterializationReport},
     overlay::{self, DEFAULT_OVERLAYS_DIR},
     response::AppResponse,
-    skill::{DEFAULT_SKILLS_DIR, SKILL_MANIFEST_FILE, SkillDefinition},
+    skill::{
+        DEFAULT_SKILLS_DIR, SKILL_MANIFEST_FILE, SkillDefinition, SkillSafetySummary,
+    },
     state::{
         InstallRecord, LocalStateStore, ManagedScope, ManagedSkillRef, PinRecord,
         workspace_key_for_path,
@@ -153,6 +155,9 @@ pub struct InstallCandidate {
     pub compatible_targets: Vec<TargetRuntime>,
     /// Human-readable hints about the detected layout.
     pub compatibility_hints: Vec<String>,
+    /// Parsed declarative safety metadata.
+    #[serde(default, skip_serializing_if = "SkillSafetySummary::is_empty")]
+    pub safety: SkillSafetySummary,
     /// Trust decision for installing this candidate.
     pub trust: SkillTrust,
 }
@@ -247,6 +252,9 @@ pub struct InstalledSkill {
     pub overlay_hash: String,
     /// Effective version hash derived from the pinned inputs.
     pub effective_version_hash: String,
+    /// Parsed declarative safety metadata.
+    #[serde(default, skip_serializing_if = "SkillSafetySummary::is_empty")]
+    pub safety: SkillSafetySummary,
     /// Trust decision for the installed effective skill.
     pub trust: SkillTrust,
 }
@@ -382,6 +390,9 @@ pub fn handle_install(
         }
         let mut warnings = BTreeSet::new();
         for skill in &installed {
+            for warning in skill.safety.imported_warnings(&skill.name) {
+                warnings.insert(warning);
+            }
             for warning in &skill.trust.warnings {
                 warnings.insert(warning.clone());
             }
@@ -821,6 +832,7 @@ fn build_install_operation(
             content_hash: content_hash.clone(),
             overlay_hash: overlay_hash.clone(),
             effective_version_hash: effective_version_hash.clone(),
+            safety: candidate.safety.clone(),
             trust: candidate.trust.clone(),
         },
         import: ImportDefinition {
@@ -1532,6 +1544,7 @@ fn detect_install_candidates(
                 selected_subpath,
                 compatible_targets: detection_root.compatible_targets.to_vec(),
                 compatibility_hints: build_compatibility_hints(detection_root),
+                safety: skill.safety.clone(),
                 trust: crate::trust::SkillTrust::imported_unreviewed(
                     skill.name.as_str(),
                     contains_scripts,
@@ -2009,6 +2022,116 @@ mod tests {
     }
 
     #[test]
+    fn local_directory_sources_capture_declared_capabilities() {
+        let fixture = TestSourceFixture::new();
+        fixture.write_skill(
+            ".agents/skills/release-notes",
+            concat!(
+                "---\n",
+                "name: release-notes\n",
+                "description: Summarize release notes.\n",
+                "capabilities:\n",
+                "  - network\n",
+                "  - shell\n",
+                "---\n",
+                "\n",
+                "# Release Notes\n",
+            ),
+        );
+
+        let inspection =
+            inspect_install_source(fixture.path(), &InstallRequest::new(".".to_string()))
+                .expect("local path source inspects successfully");
+
+        assert_eq!(
+            inspection.candidates[0].safety.capabilities,
+            vec!["network".to_string(), "shell".to_string()]
+        );
+    }
+
+    #[test]
+    fn local_directory_sources_capture_declared_credentials() {
+        let fixture = TestSourceFixture::new();
+        fixture.write_skill(
+            ".agents/skills/release-notes",
+            concat!(
+                "---\n",
+                "name: release-notes\n",
+                "description: Summarize release notes.\n",
+                "credentials:\n",
+                "  - name: OPENAI_API_KEY\n",
+                "    purpose: Access the OpenAI API\n",
+                "  - name: GITHUB_TOKEN\n",
+                "    optional: true\n",
+                "---\n",
+                "\n",
+                "# Release Notes\n",
+            ),
+        );
+
+        let inspection =
+            inspect_install_source(fixture.path(), &InstallRequest::new(".".to_string()))
+                .expect("local path source inspects successfully");
+
+        assert_eq!(
+            inspection.candidates[0].safety.credentials,
+            vec![
+                crate::skill::SkillCredentialRequirement {
+                    name: "OPENAI_API_KEY".to_string(),
+                    optional: false,
+                    purpose: Some("Access the OpenAI API".to_string()),
+                },
+                crate::skill::SkillCredentialRequirement {
+                    name: "GITHUB_TOKEN".to_string(),
+                    optional: true,
+                    purpose: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn local_directory_sources_capture_declared_tool_dependencies() {
+        let fixture = TestSourceFixture::new();
+        fixture.write_skill(
+            ".agents/skills/release-notes",
+            concat!(
+                "---\n",
+                "name: release-notes\n",
+                "description: Summarize release notes.\n",
+                "dependencies:\n",
+                "  tools:\n",
+                "    - ffmpeg\n",
+                "    - name: gh\n",
+                "      optional: true\n",
+                "---\n",
+                "\n",
+                "# Release Notes\n",
+            ),
+        );
+
+        let inspection =
+            inspect_install_source(fixture.path(), &InstallRequest::new(".".to_string()))
+                .expect("local path source inspects successfully");
+
+        assert_eq!(
+            inspection.candidates[0].safety.dependencies.tools,
+            vec![
+                crate::skill::SkillToolRequirement {
+                    name: "ffmpeg".to_string(),
+                    optional: false,
+                    purpose: None,
+                },
+                crate::skill::SkillToolRequirement {
+                    name: "gh".to_string(),
+                    optional: true,
+                    purpose: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn git_sources_clone_and_capture_the_exact_commit() {
         let fixture = TestSourceFixture::new();
         let repo = fixture.path().join("repo");
@@ -2065,6 +2188,7 @@ mod tests {
                     "opencode-native workspace skill root".to_string(),
                     "documented for opencode".to_string(),
                 ],
+                safety: crate::skill::SkillSafetySummary::default(),
                 trust: SkillTrust::imported_unreviewed("ai-sdk", false),
             }]
         );

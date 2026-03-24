@@ -90,7 +90,7 @@ fn install_help_includes_examples_and_non_interactive_guidance() {
 }
 
 #[test]
-fn update_doctor_and_explain_help_include_recovery_guidance() {
+fn update_doctor_explain_and_inspect_help_include_recovery_guidance() {
     Command::cargo_bin("skillctl")
         .expect("binary exists")
         .args(["update", "--help"])
@@ -119,6 +119,17 @@ fn update_doctor_and_explain_help_include_recovery_guidance() {
             "skillctl explain ai-sdk --target codex",
         ))
         .stdout(predicate::str::contains("skillctl path <skill>"));
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .args(["inspect", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("preflight requirements"))
+        .stdout(predicate::str::contains(
+            "skillctl inspect ai-sdk --target codex",
+        ))
+        .stdout(predicate::str::contains("skillctl explain <skill>"));
 }
 
 #[test]

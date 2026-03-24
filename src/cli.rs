@@ -193,6 +193,19 @@ Examples:
 
 Follow up with 'skillctl path <skill>' for concrete filesystem locations.";
 
+const INSPECT_LONG_ABOUT: &str = "\
+Inspect the active skill's preflight requirements: trust state, declared capabilities, required credentials, required tools, and target visibility.
+
+Use inspect when you want one focused readiness view before invoking or promoting a skill, instead of piecing the state together from install warnings and doctor issues.";
+
+const INSPECT_AFTER_LONG_HELP: &str = "\
+Examples:
+  skillctl inspect ai-sdk
+  skillctl inspect ai-sdk --target codex
+  skillctl inspect ai-sdk --scope workspace --json
+
+Follow up with 'skillctl explain <skill>' when you need full winner-selection detail.";
+
 const OVERRIDE_LONG_ABOUT: &str = "\
 Create or reuse an overlay directory for a managed imported skill.
 
@@ -467,6 +480,9 @@ pub enum Command {
         after_long_help = EXPLAIN_AFTER_LONG_HELP
     )]
     Explain(SkillArg),
+    /// Inspect a skill's preflight trust and requirements.
+    #[command(long_about = INSPECT_LONG_ABOUT, after_long_help = INSPECT_AFTER_LONG_HELP)]
+    Inspect(SkillArg),
     /// Create an overlay for a managed skill.
     #[command(long_about = OVERRIDE_LONG_ABOUT, after_long_help = OVERRIDE_AFTER_LONG_HELP)]
     Override(SkillArg),
@@ -526,6 +542,7 @@ impl Command {
             Self::History(_) => "history",
             Self::Doctor => "doctor",
             Self::Explain(_) => "explain",
+            Self::Inspect(_) => "inspect",
             Self::Override(_) => "override",
             Self::Fork(_) => "fork",
             Self::Enable(_) => "enable",

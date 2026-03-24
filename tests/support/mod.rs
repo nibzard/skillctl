@@ -2,8 +2,11 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+static TEST_WORKSPACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub const MINIMAL_LOCKFILE: &str = concat!(
     "version: 1\n",
@@ -23,8 +26,11 @@ impl TestWorkspace {
             .duration_since(UNIX_EPOCH)
             .expect("time moved backwards")
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("skillctl-test-{}-{unique}", std::process::id()));
+        let counter = TEST_WORKSPACE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "skillctl-test-{}-{unique}-{counter}",
+            std::process::id()
+        ));
         fs::create_dir_all(&path).expect("workspace exists");
         Self { path }
     }
