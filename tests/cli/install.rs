@@ -203,6 +203,72 @@ fn install_updates_manifest_lockfile_store_state_and_projection_records() {
 }
 
 #[test]
+fn install_accepts_a_direct_skill_directory_source() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_skill_source_at(
+        "shared-skills",
+        "release-notes",
+        "release-notes",
+        "Summarize release notes.",
+    );
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills/release-notes",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty())
+        .stdout(predicate::str::contains("Installed 1 skill"));
+
+    let manifest = fs::read_to_string(workspace.path().join(".agents/skillctl.yaml"))
+        .expect("manifest exists");
+    assert!(
+        manifest.contains("id: release-notes"),
+        "manifest was {manifest}"
+    );
+    assert!(
+        manifest.contains("path: skills/release-notes"),
+        "manifest should store the packaged single-skill subpath: {manifest}",
+    );
+
+    let lockfile = fs::read_to_string(workspace.path().join(".agents/skillctl.lock"))
+        .expect("lockfile exists");
+    assert!(
+        lockfile.contains("subpath: skills/release-notes"),
+        "lockfile should store the packaged single-skill subpath: {lockfile}",
+    );
+
+    assert!(
+        workspace
+            .workspace_import_root("release-notes")
+            .join("skills/release-notes/SKILL.md")
+            .is_file(),
+        "stored import checkout should contain the repackaged direct skill",
+    );
+    assert!(
+        workspace
+            .path()
+            .join(".claude/skills/release-notes/.skillctl-projection.json")
+            .is_file(),
+        "generated projection metadata should exist",
+    );
+}
+
+#[test]
 fn install_rolls_back_when_the_transaction_fails_after_state_write() {
     let workspace = TestWorkspace::new();
     workspace.write_manifest(concat!(

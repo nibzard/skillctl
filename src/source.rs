@@ -35,7 +35,7 @@ use crate::{
     materialize::{self, MaterializationReport},
     overlay::{self, DEFAULT_OVERLAYS_DIR},
     response::AppResponse,
-    skill::{DEFAULT_SKILLS_DIR, SkillDefinition},
+    skill::{DEFAULT_SKILLS_DIR, SKILL_MANIFEST_FILE, SkillDefinition},
     state::{
         InstallRecord, LocalStateStore, ManagedScope, ManagedSkillRef, PinRecord,
         workspace_key_for_path,
@@ -77,6 +77,7 @@ const SUPPORTED_ARCHIVE_EXTENSIONS: &[&str] = &[
 ];
 const USER_IMPORTS_NAMESPACE: &str = "user";
 const WORKSPACE_IMPORTS_NAMESPACE: &str = "workspace";
+const DIRECT_SKILL_PACKAGING_ROOT: &str = "skills";
 
 /// Supported install source categories.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1334,6 +1335,19 @@ fn prepare_local_path(source: &ResolvedInstallSource) -> Result<PreparedSource, 
         ));
     };
 
+    let direct_skill_manifest_path = path.join(SKILL_MANIFEST_FILE);
+    match fs::metadata(&direct_skill_manifest_path) {
+        Ok(_) => return stage_direct_skill_source(source, path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(AppError::FilesystemOperation {
+                action: "inspect direct skill manifest",
+                path: direct_skill_manifest_path,
+                source,
+            });
+        }
+    }
+
     Ok(PreparedSource {
         source: source.normalized.clone(),
         revision: SourceRevision {
@@ -1342,6 +1356,40 @@ fn prepare_local_path(source: &ResolvedInstallSource) -> Result<PreparedSource, 
         },
         root: path.clone(),
         _staging_dir: None,
+    })
+}
+
+fn stage_direct_skill_source(
+    source: &ResolvedInstallSource,
+    path: &Path,
+) -> Result<PreparedSource, AppError> {
+    let skill = SkillDefinition::load_from_dir(path)?;
+    let staging_dir = TempDir::new().map_err(|source| AppError::FilesystemOperation {
+        action: "create direct skill staging directory",
+        path: std::env::temp_dir(),
+        source,
+    })?;
+    let staged_root = staging_dir.path().join("source");
+    let staged_skill_root = staged_root
+        .join(DIRECT_SKILL_PACKAGING_ROOT)
+        .join(skill.name.as_str());
+    if let Some(parent) = staged_skill_root.parent() {
+        fs::create_dir_all(parent).map_err(|source| AppError::FilesystemOperation {
+            action: "create direct skill packaging root",
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    copy_source_tree(path, &staged_skill_root)?;
+
+    Ok(PreparedSource {
+        source: source.normalized.clone(),
+        revision: SourceRevision {
+            resolved: hash_directory_contents(path)?,
+            upstream: None,
+        },
+        root: staged_root,
+        _staging_dir: Some(staging_dir),
     })
 }
 
@@ -2054,6 +2102,34 @@ mod tests {
                 .map(|candidate| candidate.source_path.clone())
                 .collect::<Vec<_>>(),
             vec![".agents/skills/release-notes".to_string()]
+        );
+    }
+
+    #[test]
+    fn direct_skill_directory_sources_are_repackaged_as_single_skill_sources() {
+        let fixture = TestSourceFixture::new();
+        fixture.write_skill("release-notes", RELEASE_NOTES_SKILL);
+
+        let inspection = inspect_install_source(
+            fixture.path(),
+            &InstallRequest::new(fixture.path().join("release-notes").display().to_string()),
+        )
+        .expect("direct skill directory inspects successfully");
+
+        assert_eq!(inspection.source.kind, SourceKind::LocalPath);
+        assert!(inspection.source.url.starts_with("file://"));
+        assert!(inspection.revision.resolved.starts_with("sha256:"));
+        assert_eq!(
+            inspection.candidates,
+            vec![InstallCandidate {
+                name: "release-notes".to_string(),
+                display_name: "release-notes".to_string(),
+                source_path: "skills/release-notes".to_string(),
+                selected_subpath: "skills/release-notes".to_string(),
+                compatible_targets: Vec::new(),
+                compatibility_hints: vec!["repo-root source packaging layout".to_string()],
+                trust: SkillTrust::imported_unreviewed("release-notes", false),
+            }]
         );
     }
 

@@ -418,7 +418,7 @@ pub enum Command {
     List,
     /// Install a skill from a Git URL, local path, or archive.
     #[command(
-        alias = "i",
+        visible_alias = "i",
         long_about = INSTALL_LONG_ABOUT,
         after_long_help = INSTALL_AFTER_LONG_HELP
     )]
@@ -427,10 +427,18 @@ pub enum Command {
     #[command(long_about = REMOVE_LONG_ABOUT, after_long_help = REMOVE_AFTER_LONG_HELP)]
     Remove(SkillArg),
     /// Recompute and materialize projections.
-    #[command(long_about = SYNC_LONG_ABOUT, after_long_help = SYNC_AFTER_LONG_HELP)]
+    #[command(
+        visible_alias = "s",
+        long_about = SYNC_LONG_ABOUT,
+        after_long_help = SYNC_AFTER_LONG_HELP
+    )]
     Sync,
     /// Check for skill updates and recommend next actions.
-    #[command(long_about = UPDATE_LONG_ABOUT, after_long_help = UPDATE_AFTER_LONG_HELP)]
+    #[command(
+        visible_alias = "u",
+        long_about = UPDATE_LONG_ABOUT,
+        after_long_help = UPDATE_AFTER_LONG_HELP
+    )]
     Update(OptionalSkillArg),
     /// Pin a skill to a specific revision.
     #[command(long_about = PIN_LONG_ABOUT, after_long_help = PIN_AFTER_LONG_HELP)]
@@ -439,13 +447,25 @@ pub enum Command {
     #[command(long_about = ROLLBACK_LONG_ABOUT, after_long_help = ROLLBACK_AFTER_LONG_HELP)]
     Rollback(RollbackArgs),
     /// Show version and modification history.
-    #[command(long_about = HISTORY_LONG_ABOUT, after_long_help = HISTORY_AFTER_LONG_HELP)]
+    #[command(
+        visible_alias = "hist",
+        long_about = HISTORY_LONG_ABOUT,
+        after_long_help = HISTORY_AFTER_LONG_HELP
+    )]
     History(OptionalSkillArg),
     /// Diagnose missing, stale, shadowed, or conflicting skills.
-    #[command(long_about = DOCTOR_LONG_ABOUT, after_long_help = DOCTOR_AFTER_LONG_HELP)]
+    #[command(
+        visible_alias = "dr",
+        long_about = DOCTOR_LONG_ABOUT,
+        after_long_help = DOCTOR_AFTER_LONG_HELP
+    )]
     Doctor,
     /// Explain a skill's winner, target visibility, and drift.
-    #[command(long_about = EXPLAIN_LONG_ABOUT, after_long_help = EXPLAIN_AFTER_LONG_HELP)]
+    #[command(
+        visible_alias = "x",
+        long_about = EXPLAIN_LONG_ABOUT,
+        after_long_help = EXPLAIN_AFTER_LONG_HELP
+    )]
     Explain(SkillArg),
     /// Create an overlay for a managed skill.
     #[command(long_about = OVERRIDE_LONG_ABOUT, after_long_help = OVERRIDE_AFTER_LONG_HELP)]
@@ -460,7 +480,11 @@ pub enum Command {
     #[command(long_about = DISABLE_LONG_ABOUT, after_long_help = DISABLE_AFTER_LONG_HELP)]
     Disable(SkillArg),
     /// Show filesystem paths for a managed skill.
-    #[command(long_about = PATH_LONG_ABOUT, after_long_help = PATH_AFTER_LONG_HELP)]
+    #[command(
+        visible_alias = "pt",
+        long_about = PATH_LONG_ABOUT,
+        after_long_help = PATH_AFTER_LONG_HELP
+    )]
     Path(SkillArg),
     /// Validate manifests, skills, and projections.
     #[command(long_about = VALIDATE_LONG_ABOUT, after_long_help = VALIDATE_AFTER_LONG_HELP)]

@@ -14,6 +14,24 @@ fn root_help_lists_core_commands() {
 }
 
 #[test]
+fn root_help_lists_visible_aliases_for_frequent_commands() {
+    let mut cmd = Command::cargo_bin("skillctl").expect("binary exists");
+
+    cmd.arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("install").and(predicate::str::contains("[aliases: i]")))
+        .stdout(predicate::str::contains("sync").and(predicate::str::contains("[aliases: s]")))
+        .stdout(predicate::str::contains("update").and(predicate::str::contains("[aliases: u]")))
+        .stdout(predicate::str::contains("doctor").and(predicate::str::contains("[aliases: dr]")))
+        .stdout(predicate::str::contains("explain").and(predicate::str::contains("[aliases: x]")))
+        .stdout(predicate::str::contains("path").and(predicate::str::contains("[aliases: pt]")))
+        .stdout(
+            predicate::str::contains("history").and(predicate::str::contains("[aliases: hist]")),
+        );
+}
+
+#[test]
 fn init_help_is_available() {
     let mut cmd = Command::cargo_bin("skillctl").expect("binary exists");
 
@@ -590,5 +608,58 @@ fn install_alias_help_is_available() {
         .success()
         .stdout(predicate::str::contains(
             "Usage: skillctl install [OPTIONS] <SOURCE>",
+        ));
+}
+
+#[test]
+fn frequent_command_alias_help_is_available() {
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .args(["s", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Usage: skillctl sync [OPTIONS]"));
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .args(["u", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Usage: skillctl update [OPTIONS] [SKILL]",
+        ));
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .args(["dr", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Usage: skillctl doctor [OPTIONS]"));
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .args(["x", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Usage: skillctl explain [OPTIONS] <SKILL>",
+        ));
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .args(["pt", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Usage: skillctl path [OPTIONS] <SKILL>",
+        ));
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .args(["hist", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Usage: skillctl history [OPTIONS] [SKILL]",
         ));
 }
