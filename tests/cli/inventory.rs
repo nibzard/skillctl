@@ -1,6 +1,139 @@
 use super::*;
 
 #[test]
+fn list_respects_explicit_scope_selection() {
+    let workspace = TestWorkspace::new();
+    let home_path = workspace.home_path();
+    workspace.write_manifest(concat!("version: 1\n", "\n", "targets:\n", "  - codex\n",));
+    workspace.write_skill_source("shared-skills", "release-notes");
+
+    initialize_runtime_state(&workspace);
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", &home_path)
+        .args([
+            "--json",
+            "--no-input",
+            "--name",
+            "release-notes",
+            "--scope",
+            "workspace",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let workspace_list = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", &home_path)
+        .args(["--json", "--scope", "workspace", "list"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+    let workspace_body: Value =
+        serde_json::from_slice(&workspace_list.get_output().stdout).expect("stdout is json");
+
+    assert_eq!(
+        workspace_body["data"]["skills"]
+            .as_array()
+            .expect("skills array exists")
+            .len(),
+        1,
+        "workspace list should exclude user-scoped installs: {workspace_body:#?}",
+    );
+    assert_eq!(
+        workspace_body["data"]["skills"][0]["skill"],
+        "release-notes"
+    );
+    assert_eq!(workspace_body["data"]["skills"][0]["scope"], "workspace");
+
+    let user_list = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", &home_path)
+        .args(["--json", "--scope", "user", "list"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+    let user_body: Value =
+        serde_json::from_slice(&user_list.get_output().stdout).expect("stdout is json");
+
+    assert_eq!(
+        user_body["data"]["skills"]
+            .as_array()
+            .expect("skills array exists")
+            .len(),
+        1,
+        "user list should exclude workspace installs: {user_body:#?}",
+    );
+    assert_eq!(user_body["data"]["skills"][0]["skill"], "skillctl");
+    assert_eq!(user_body["data"]["skills"][0]["scope"], "user");
+}
+
+#[test]
+fn validate_ignores_generated_projection_roots_in_canonical_counts() {
+    let workspace = TestWorkspace::new();
+    let home_path = workspace.home_path();
+    workspace.write_manifest(concat!("version: 1\n", "\n", "targets:\n", "  - codex\n",));
+    workspace.write_skill_source("shared-skills", "release-notes");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", &home_path)
+        .args([
+            "--json",
+            "--no-input",
+            "--name",
+            "release-notes",
+            "--scope",
+            "workspace",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let validate = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", &home_path)
+        .args(["--json", "validate"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+    let validate_body: Value =
+        serde_json::from_slice(&validate.get_output().stdout).expect("stdout is json");
+
+    assert_eq!(
+        validate_body["data"]["summary"]["checked_skill_count"], 1,
+        "validate should only count the managed import, not its generated codex projection: {validate_body:#?}",
+    );
+
+    let doctor = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", &home_path)
+        .args(["--json", "--scope", "user", "doctor"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+    let doctor_body: Value =
+        serde_json::from_slice(&doctor.get_output().stdout).expect("stdout is json");
+
+    assert_eq!(
+        doctor_body["data"]["summary"]["checked_skill_count"], 2,
+        "doctor should count one workspace import plus the bundled user skill: {doctor_body:#?}",
+    );
+}
+
+#[test]
 fn rollback_reactivates_a_prior_effective_version_from_recorded_history() {
     let workspace = TestWorkspace::new();
     workspace.write_manifest(concat!(

@@ -746,6 +746,9 @@ fn collect_validation_issues(
                     });
                     continue;
                 }
+                if resolver::is_generated_projection_root(&root)? {
+                    continue;
+                }
 
                 checked_skill_count += 1;
                 match SkillDefinition::load_from_dir(&root) {

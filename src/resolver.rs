@@ -420,7 +420,7 @@ fn discover_local_candidates(
     Ok(candidates)
 }
 
-fn is_generated_projection_root(root: &Path) -> Result<bool, AppError> {
+pub(crate) fn is_generated_projection_root(root: &Path) -> Result<bool, AppError> {
     let metadata_path = root.join(PROJECTION_METADATA_FILE);
     let contents = match fs::read_to_string(&metadata_path) {
         Ok(contents) => contents,

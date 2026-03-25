@@ -475,7 +475,15 @@ impl PathRequest {
 /// Handle `skillctl list`.
 pub fn handle_list(context: &AppContext, _request: ListRequest) -> Result<AppResponse, AppError> {
     let store = LocalStateStore::open_default_for(&context.working_directory)?;
-    let installs = store.list_install_records()?;
+    let installs = store
+        .list_install_records()?
+        .into_iter()
+        .filter(|install| match context.selector.scope {
+            Some(Scope::Workspace) => install.skill.scope == ManagedScope::Workspace,
+            Some(Scope::User) => install.skill.scope == ManagedScope::User,
+            None => true,
+        })
+        .collect::<Vec<_>>();
     if installs.is_empty() {
         return Ok(AppResponse::success("list")
             .with_summary("No managed skills are installed.")
