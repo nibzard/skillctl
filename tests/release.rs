@@ -106,11 +106,7 @@ fn install_script_installs_from_a_versioned_release_layout() {
     let target = host_target();
     let workspace = TestWorkspace::new();
     let binary_path = cargo_bin("skillctl");
-    let archive_path = package_release(
-        &binary_path,
-        &workspace.path().join("dist"),
-        &target,
-    );
+    let archive_path = package_release(&binary_path, &workspace.path().join("dist"), &target);
     let release_root = workspace.path().join("release-root");
     let download_root = release_root.join("download").join(RELEASE_VERSION);
     let install_dir = workspace.path().join("bin");
