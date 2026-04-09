@@ -91,14 +91,13 @@ fn host_target() -> String {
     } else {
         "unknown"
     };
-    let os = if cfg!(target_os = "linux") {
+    if cfg!(target_os = "linux") {
         format!("{arch}-unknown-linux-gnu")
     } else if cfg!(target_os = "macos") {
         format!("{arch}-apple-darwin")
     } else {
         format!("{arch}-unknown")
-    };
-    os
+    }
 }
 
 #[test]
