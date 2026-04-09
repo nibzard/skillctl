@@ -35,9 +35,7 @@ use crate::{
     materialize::{self, MaterializationReport},
     overlay::{self, DEFAULT_OVERLAYS_DIR},
     response::AppResponse,
-    skill::{
-        DEFAULT_SKILLS_DIR, SKILL_MANIFEST_FILE, SkillDefinition, SkillSafetySummary,
-    },
+    skill::{DEFAULT_SKILLS_DIR, SKILL_MANIFEST_FILE, SkillDefinition, SkillSafetySummary},
     state::{
         InstallRecord, LocalStateStore, ManagedScope, ManagedSkillRef, PinRecord,
         workspace_key_for_path,
@@ -2252,6 +2250,7 @@ mod tests {
                 selected_subpath: "skills/release-notes".to_string(),
                 compatible_targets: Vec::new(),
                 compatibility_hints: vec!["repo-root source packaging layout".to_string()],
+                safety: SkillSafetySummary::default(),
                 trust: SkillTrust::imported_unreviewed("release-notes", false),
             }]
         );
