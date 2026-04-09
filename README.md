@@ -2,7 +2,7 @@
 
 [![CI](https://img.shields.io/github/actions/workflow/status/nibzard/skillctl/ci.yml?branch=main&label=ci)](https://github.com/nibzard/skillctl/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/nibzard/skillctl?label=release)](https://github.com/nibzard/skillctl/releases/latest)
-[![License](https://img.shields.io/github/license/nibzard/skillctl)](./LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 
 `skillctl` is a local-first skill manager for the open `SKILL.md` ecosystem.
 

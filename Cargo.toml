@@ -2,7 +2,7 @@
 name = "skillctl"
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "Apache-2.0"
 description = "Local-first cross-agent skill manager for the open SKILL.md ecosystem"
 repository = "https://github.com/nibzard/skillctl"
 
