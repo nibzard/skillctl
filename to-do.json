@@ -1103,6 +1103,176 @@
       ],
       "created_at": "2026-03-19T18:49:05Z",
       "updated_at": "2026-03-19T19:01:00Z"
+    },
+    {
+      "id": "T043",
+      "title": "Add read-only well-known discovery support for the Agent Skills Discovery RFC",
+      "status": "todo",
+      "priority": 2,
+      "details": "Implement a discovery domain for the current Agent Skills Discovery RFC draft so `skillctl` can fetch `/.well-known/agent-skills/index.json`, validate the declared schema version and entry shape, resolve relative artifact URLs against the index URL, and expose the result through a new `discover` command without mutating local install state.",
+      "steps": [
+        "Add a `discovery` module with typed index and entry models for the RFC's `skill-md` and `archive` artifact types.",
+        "Add `skillctl discover <origin-or-index-url>` to the CLI and runtime dispatch with JSON-first output.",
+        "Write unit and CLI tests for origin normalization, direct index URLs, relative URL resolution, schema recognition, invalid digests, and invalid skill names."
+      ],
+      "tags": [
+        "rfc",
+        "discovery",
+        "http"
+      ],
+      "files": [
+        "Cargo.toml",
+        "src/cli.rs",
+        "src/discovery.rs",
+        "src/error.rs",
+        "src/lib.rs",
+        "src/runtime.rs",
+        "tests/cli/discover.rs",
+        "to-do.json"
+      ],
+      "depends_on": [
+        "T001",
+        "T005",
+        "T007"
+      ],
+      "created_at": "2026-03-25T10:19:22Z",
+      "updated_at": "2026-03-25T10:19:22Z",
+      "blockers": []
+    },
+    {
+      "id": "T044",
+      "title": "Implement verified remote artifact fetch and safe staging for discovered skills",
+      "status": "todo",
+      "priority": 2,
+      "details": "Support RFC artifact acquisition by downloading remote `skill-md` and `archive` artifacts, verifying the advertised SHA-256 digest before use, and staging them into a temporary install root that matches the existing install pipeline. Replace shell-based extraction for remote archives with a safer Rust path that rejects traversal, unsafe links, and unreasonable unpack sizes.",
+      "steps": [
+        "Add digest verification and typed fetched-artifact models for `skill-md` and `archive` entries.",
+        "Stage verified `skill-md` artifacts into a synthetic skill directory and stage archives into a normalized extracted root.",
+        "Add safety tests for digest mismatch, empty archives, path traversal, symlink entries, and archive size limits."
+      ],
+      "tags": [
+        "rfc",
+        "security",
+        "staging"
+      ],
+      "files": [
+        "Cargo.toml",
+        "src/discovery.rs",
+        "src/error.rs",
+        "src/source.rs",
+        "tests/fixtures",
+        "to-do.json"
+      ],
+      "depends_on": [
+        "T043"
+      ],
+      "created_at": "2026-03-25T10:19:22Z",
+      "updated_at": "2026-03-25T10:19:22Z",
+      "blockers": []
+    },
+    {
+      "id": "T045",
+      "title": "Add managed install support for well-known discovered skills",
+      "status": "todo",
+      "priority": 2,
+      "details": "Teach the install lifecycle to accept a well-known index URL plus skill selector, fetch and stage the selected artifact, and persist it as a normal managed import while preserving the existing manifest, lockfile, resolver, history, and projection model. Introduce a dedicated source kind instead of pretending discovered HTTP artifacts are Git or local archive sources.",
+      "steps": [
+        "Extend source and manifest typing with a `well-known` import/source kind and the minimum additional lockfile metadata needed to remember the selected index entry.",
+        "Wire `skillctl install <origin-or-index-url> --name <skill>` through the existing install transaction after discovery-based staging.",
+        "Add integration tests for installing both `skill-md` and `archive` entries and for exact-name selection when an index contains multiple skills."
+      ],
+      "tags": [
+        "rfc",
+        "install",
+        "lockfile"
+      ],
+      "files": [
+        "src/lockfile.rs",
+        "src/manifest.rs",
+        "src/resolver.rs",
+        "src/source.rs",
+        "src/state.rs",
+        "src/state/schema.rs",
+        "tests/cli/install.rs",
+        "to-do.json"
+      ],
+      "depends_on": [
+        "T004",
+        "T008",
+        "T009",
+        "T010",
+        "T044"
+      ],
+      "created_at": "2026-03-25T10:19:22Z",
+      "updated_at": "2026-03-25T10:19:22Z",
+      "blockers": []
+    },
+    {
+      "id": "T046",
+      "title": "Extend update, trust, and telemetry flows for well-known imports",
+      "status": "todo",
+      "priority": 3,
+      "details": "Add lifecycle semantics for well-known imports by re-fetching the discovery index, comparing artifact digests to detect updates, and extending trust and telemetry decisions to cover public HTTPS origins. Keep `pin` and `rollback` Git-only until a stronger revision model exists for well-known sources.",
+      "steps": [
+        "Teach the update planner to re-read the selected index entry and treat digest changes as update availability for `well-known` installs.",
+        "Add an origin-trust policy for remote discovery sources and block or warn on unapproved origins.",
+        "Extend telemetry visibility classification so public well-known origins are handled deliberately instead of being misclassified as local or Git."
+      ],
+      "tags": [
+        "rfc",
+        "update",
+        "trust",
+        "telemetry"
+      ],
+      "files": [
+        "src/history.rs",
+        "src/manifest.rs",
+        "src/planner.rs",
+        "src/telemetry.rs",
+        "src/trust.rs",
+        "tests/cli/update.rs",
+        "to-do.json"
+      ],
+      "depends_on": [
+        "T035",
+        "T042",
+        "T045"
+      ],
+      "created_at": "2026-03-25T10:19:22Z",
+      "updated_at": "2026-03-25T10:19:22Z",
+      "blockers": []
+    },
+    {
+      "id": "T047",
+      "title": "Expose well-known discovery through MCP and evaluate optional publishing support",
+      "status": "todo",
+      "priority": 4,
+      "details": "After the CLI discovery and install path is stable, expose read-only discovery through the MCP server and decide whether `skillctl` should also help users publish RFC-compliant indexes. Keep publishing explicitly separate from local lifecycle management so the draft RFC remains an interoperability layer rather than the project's storage model.",
+      "steps": [
+        "Add an MCP `skills_discover` tool with JSON parity to the CLI `discover` command.",
+        "Document the product boundary between local `.agents/skills` management and remote well-known discovery.",
+        "If adoption justifies it, add a later publishing task to generate compliant `index.json` output without coupling it to runtime projection."
+      ],
+      "tags": [
+        "rfc",
+        "mcp",
+        "publishing"
+      ],
+      "files": [
+        "README.md",
+        "docs/user-guide.md",
+        "src/mcp.rs",
+        "tests/mcp.rs",
+        "to-do.json"
+      ],
+      "depends_on": [
+        "T043",
+        "T045",
+        "T046"
+      ],
+      "created_at": "2026-03-25T10:19:22Z",
+      "updated_at": "2026-03-25T10:19:22Z",
+      "blockers": []
     }
   ]
 }
