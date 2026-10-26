@@ -1714,11 +1714,7 @@ fn normalized_extraction_root(extract_root: &Path) -> Result<PathBuf, AppError> 
             "archive did not contain any files",
         ));
     }
-    if entries.len() == 1
-        && fs::metadata(&entries[0])
-            .map(|metadata| metadata.is_dir())
-            .unwrap_or(false)
-    {
+    if entries.len() == 1 && fs::metadata(&entries[0]).is_ok_and(|metadata| metadata.is_dir()) {
         Ok(entries.remove(0))
     } else {
         Ok(extract_root.to_path_buf())
