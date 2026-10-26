@@ -117,9 +117,7 @@ fn snapshot_path(path: &Path, backup_root: &Path, index: usize) -> Result<Snapsh
             path: path.to_path_buf(),
             source,
         })?;
-        let is_dir = fs::metadata(path)
-            .map(|metadata| metadata.is_dir())
-            .unwrap_or(false);
+        let is_dir = fs::metadata(path).is_ok_and(|metadata| metadata.is_dir());
         return Ok(SnapshotState::Symlink { target, is_dir });
     }
 
@@ -252,9 +250,7 @@ fn copy_tree(source: &Path, destination: &Path, action: &'static str) -> Result<
                 source: source_error,
             })?;
         }
-        let is_dir = fs::metadata(source)
-            .map(|metadata| metadata.is_dir())
-            .unwrap_or(false);
+        let is_dir = fs::metadata(source).is_ok_and(|metadata| metadata.is_dir());
         return create_symlink(&target, destination, is_dir);
     }
 
