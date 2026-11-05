@@ -81,6 +81,64 @@ fn sync_materializes_generated_copies_without_touching_canonical_skills() {
 }
 
 #[test]
+fn sync_blocks_materialization_when_stored_import_content_is_tampered() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!("version: 1\n", "\n", "targets:\n", "  - codex\n",));
+    workspace.write_skill_source("shared-skills", "release-notes");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Installed 1 skill"));
+
+    let stored_manifest = find_stored_import_manifest(&workspace.home_path().join(".skillctl"))
+        .expect("stored import manifest exists under HOME/.skillctl");
+    let original =
+        fs::read_to_string(&stored_manifest).expect("stored import manifest is readable");
+    fs::write(
+        &stored_manifest,
+        format!("{original}\ninjected by a tamper test\n"),
+    )
+    .expect("stored import manifest is writable");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .arg("sync")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "stored import 'release-notes' content hash mismatch",
+        ));
+}
+
+fn find_stored_import_manifest(root: &Path) -> Option<PathBuf> {
+    let entries = fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_stored_import_manifest(&path) {
+                return Some(found);
+            }
+        } else if path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
+            return Some(path);
+        }
+    }
+    None
+}
+
+#[test]
 fn sync_symlink_mode_requires_explicit_override_for_unstable_targets() {
     let workspace = TestWorkspace::new();
     workspace.write_manifest(concat!(

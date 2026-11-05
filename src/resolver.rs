@@ -12,7 +12,7 @@ use crate::{
     manifest::{ImportDefinition, ManifestPath, ManifestScope, WorkspaceManifest},
     materialize::PROJECTION_METADATA_FILE,
     skill::{OPENAI_METADATA_FILE, SKILL_MANIFEST_FILE, SkillDefinition, SkillVendorMetadata},
-    source::stored_import_root,
+    source::{hash_directory_contents, stored_import_root},
 };
 
 /// Typed scope for canonical and imported skills during effective resolution.
@@ -487,6 +487,19 @@ fn load_import_candidate(
 
     let skill_root = stored_source_root.join(locked_import.source.subpath.as_str());
     ensure_directory(&skill_root, "inspect stored imported skill", "directory")?;
+
+    let recomputed_content_hash = hash_directory_contents(&skill_root)?;
+    if recomputed_content_hash != locked_import.hashes.content {
+        return Err(AppError::ResolutionValidation {
+            message: format!(
+                "stored import '{}' content hash mismatch: lockfile pins {} but stored \
+                 content hashes to {}; the import store changed after install. Run \
+                 'skillctl update {}' to re-pin after you verify the change is expected, or \
+                 reinstall the skill",
+                import.id, locked_import.hashes.content, recomputed_content_hash, import.id
+            ),
+        });
+    }
 
     let base_files = collect_file_map(&skill_root, "imported skill")?;
     let (files, overlay) = match request.manifest.overrides.get(&import.id) {
@@ -1462,6 +1475,14 @@ mod tests {
                     fs::remove_dir_all(&stored_root).expect("stale stored import root removed");
                 }
                 copy_directory_tree(&fixture_root, &stored_root);
+
+                if let Some(locked) = lockfile.imports.get_mut(&import.id) {
+                    let skill_root = stored_root.join(locked.source.subpath.as_str());
+                    if skill_root.is_dir() {
+                        locked.hashes.content = hash_directory_contents(&skill_root)
+                            .expect("fixture import content hashes");
+                    }
+                }
             }
 
             ResolveWorkspaceRequest::new(self.root.path(), self.path("imports"), manifest, lockfile)
