@@ -1,20 +1,63 @@
-use std::{
-    collections::BTreeMap,
-    env, fs, io,
-    path::{Path, PathBuf},
-};
+//! Coordinated, journaled lifecycle transactions.
+//!
+//! A lifecycle transaction is the single writer boundary for the shared local
+//! state database and the workspace files a command rewrites. While it runs it
+//! holds the state coordination lock, records a durable operation journal, and
+//! stages a backup of every path it is about to change.
+//!
+//! Recovery is defined at every journal boundary:
+//!
+//! * an operation that returns an error restores the recorded pre-state, and
+//! * a process that terminates mid-operation leaves an active journal that the
+//!   next coordinated operation or `doctor --repair-state` restores.
+//!
+//! The shared database is never restored by copying a file over it. Rows are
+//! restored through SQLite inside one transaction.
 
-use tempfile::TempDir;
+use std::{
+    env,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use crate::{error::AppError, state};
 
+/// Environment variable that terminates the process at one journal boundary.
+///
+/// The value has the `operation:label` form used by `SKILLCTL_FAILPOINT`.
+const TERMINATE_AT_ENV: &str = "SKILLCTL_TERMINATE_AT";
+/// Environment variable holding a transaction until one file exists.
+///
+/// Integration tests use it to prove a second process cannot mutate shared
+/// state while the coordination lock is held.
+const HOLD_UNTIL_ENV: &str = "SKILLCTL_LIFECYCLE_HOLD";
+/// Environment variable naming the boundary a hold waits at.
+///
+/// The value has the `operation:label` form. Without it the transaction holds
+/// at the first boundary it reaches.
+const HOLD_AT_ENV: &str = "SKILLCTL_LIFECYCLE_HOLD_AT";
+/// Environment variable bounding how long a held transaction waits.
+const HOLD_TIMEOUT_ENV: &str = "SKILLCTL_LIFECYCLE_HOLD_TIMEOUT_MS";
+/// Default wait for a held transaction.
+const DEFAULT_HOLD_TIMEOUT: Duration = Duration::from_secs(60);
+/// Pause between checks of the hold sentinel file.
+const HOLD_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Run `work` inside one coordinated, journaled lifecycle transaction.
+///
+/// When `work` succeeds the journal is marked complete and removed. When it
+/// returns an error the recorded pre-state is restored. When the process dies
+/// the journal stays on disk as an explicit recoverable operation.
 pub(crate) fn run_transaction<T>(
     operation: &'static str,
     work: impl FnOnce(&mut LifecycleTransaction) -> Result<T, AppError>,
 ) -> Result<T, AppError> {
     let mut transaction = LifecycleTransaction::new(operation)?;
     match work(&mut transaction) {
-        Ok(result) => Ok(result),
+        Ok(result) => {
+            transaction.commit()?;
+            Ok(result)
+        }
         Err(error) => match transaction.rollback() {
             Ok(()) => Err(error),
             Err(rollback_error) => Err(rollback_error),
@@ -24,297 +67,136 @@ pub(crate) fn run_transaction<T>(
 
 pub(crate) struct LifecycleTransaction {
     operation: &'static str,
-    backup_root: TempDir,
-    tracked_paths: BTreeMap<PathBuf, SnapshotState>,
+    journal: state::OperationJournal,
+    _guard: state::CoordinationGuard,
 }
 
 impl LifecycleTransaction {
     fn new(operation: &'static str) -> Result<Self, AppError> {
-        let backup_root = TempDir::new().map_err(|source| AppError::FilesystemOperation {
-            action: "create lifecycle backup root",
-            path: env::temp_dir(),
-            source,
-        })?;
+        let state_database = state::default_state_database_path().ok();
+        let guard = state::acquire_coordination_lock(
+            state_database.as_deref(),
+            "run lifecycle transaction",
+        )?;
+
+        // A process that died mid-operation leaves its journal behind. Restore
+        // it before this operation records changes of its own. Journals from
+        // this process belong to enclosing transactions and stay untouched.
+        state::recover_interrupted_operations(&state::default_journal_root())?;
+
+        let working_directory =
+            env::current_dir().map_err(|source| AppError::CurrentWorkingDirectory { source })?;
+        let workspace_key = state::workspace_key_for_path(&working_directory)?;
+        let mut journal = state::OperationJournal::create(
+            &state::default_journal_root(),
+            &workspace_key,
+            &working_directory,
+            operation,
+        )?;
+        journal.record_step("opened")?;
+        terminate_at_boundary(operation, "opened");
+        hold_at_boundary(operation, "opened")?;
 
         Ok(Self {
             operation,
-            backup_root,
-            tracked_paths: BTreeMap::new(),
+            journal,
+            _guard: guard,
         })
     }
 
+    /// Stage a backup of one path before the operation changes it.
     pub(crate) fn track_path(&mut self, path: impl Into<PathBuf>) -> Result<(), AppError> {
-        let path = path.into();
-        if self.tracked_paths.contains_key(&path) {
-            return Ok(());
-        }
-
-        let snapshot = snapshot_path(&path, self.backup_root.path(), self.tracked_paths.len())?;
-        self.tracked_paths.insert(path, snapshot);
-        Ok(())
+        self.journal.track_path(&path.into())
     }
 
+    /// Stage a logical snapshot of the shared state database.
     pub(crate) fn track_state_database(&mut self) -> Result<(), AppError> {
-        self.track_path(state::default_state_database_path()?)
+        self.journal
+            .track_state_database(&state::default_state_database_path()?)
     }
 
-    pub(crate) fn checkpoint(&self, label: &'static str) -> Result<(), AppError> {
+    /// Record one journal boundary.
+    ///
+    /// The boundary is a journal step, a termination point for interruption
+    /// tests, and a failpoint for returned-error rollback tests.
+    pub(crate) fn checkpoint(&mut self, label: &'static str) -> Result<(), AppError> {
+        self.journal.record_step(label)?;
+        terminate_at_boundary(self.operation, label);
+        hold_at_boundary(self.operation, label)?;
+
         let expected = format!("{}:{label}", self.operation);
         if env::var("SKILLCTL_FAILPOINT").ok().as_deref() == Some(expected.as_str()) {
             return Err(AppError::FilesystemOperation {
                 action: "execute lifecycle failpoint",
                 path: PathBuf::from(expected),
-                source: io::Error::other("injected lifecycle failure"),
+                source: std::io::Error::other("injected lifecycle failure"),
             });
         }
 
         Ok(())
     }
 
-    fn rollback(&self) -> Result<(), AppError> {
-        let mut paths = self.tracked_paths.keys().cloned().collect::<Vec<_>>();
-        paths.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    /// Mark the operation complete and release the coordination lock.
+    fn commit(&mut self) -> Result<(), AppError> {
+        self.journal.record_step("committing")?;
+        terminate_at_boundary(self.operation, "committing");
+        self.journal.finish(state::JournalState::Completed)
+    }
 
-        for path in paths {
-            let snapshot = self
-                .tracked_paths
-                .get(&path)
-                .expect("tracked snapshot exists");
-            restore_path(&path, snapshot)?;
+    /// Restore the recorded pre-state and release the coordination lock.
+    fn rollback(&mut self) -> Result<(), AppError> {
+        match self.journal.restore() {
+            Ok(()) => self.journal.finish(state::JournalState::RolledBack),
+            Err(error) => {
+                let _ = self.journal.mark_needs_review(&error.to_string());
+                Err(error)
+            }
         }
-
-        Ok(())
     }
 }
 
-#[derive(Debug)]
-enum SnapshotState {
-    Missing,
-    File(PathBuf),
-    Directory(PathBuf),
-    Symlink { target: PathBuf, is_dir: bool },
-}
-
-fn snapshot_path(path: &Path, backup_root: &Path, index: usize) -> Result<SnapshotState, AppError> {
-    let backup_path = backup_root.join(format!("{index:04}"));
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            return Ok(SnapshotState::Missing);
-        }
-        Err(source) => {
-            return Err(AppError::FilesystemOperation {
-                action: "inspect lifecycle path",
-                path: path.to_path_buf(),
-                source,
-            });
-        }
+fn terminate_at_boundary(operation: &str, label: &str) {
+    let Some(expected) = env::var(TERMINATE_AT_ENV).ok() else {
+        return;
     };
-
-    if metadata.file_type().is_symlink() {
-        let target = fs::read_link(path).map_err(|source| AppError::FilesystemOperation {
-            action: "read lifecycle symlink",
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let is_dir = fs::metadata(path).is_ok_and(|metadata| metadata.is_dir());
-        return Ok(SnapshotState::Symlink { target, is_dir });
-    }
-
-    if metadata.is_dir() {
-        copy_tree(path, &backup_path, "snapshot lifecycle directory")?;
-        return Ok(SnapshotState::Directory(backup_path));
-    }
-
-    if let Some(parent) = backup_path.parent() {
-        fs::create_dir_all(parent).map_err(|source| AppError::FilesystemOperation {
-            action: "create lifecycle file backup parent",
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    fs::copy(path, &backup_path).map_err(|source| AppError::FilesystemOperation {
-        action: "snapshot lifecycle file",
-        path: path.to_path_buf(),
-        source,
-    })?;
-    Ok(SnapshotState::File(backup_path))
-}
-
-fn restore_path(path: &Path, snapshot: &SnapshotState) -> Result<(), AppError> {
-    remove_existing_path(path)?;
-
-    match snapshot {
-        SnapshotState::Missing => prune_empty_parents(path),
-        SnapshotState::File(backup_path) => {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|source| AppError::FilesystemOperation {
-                    action: "create lifecycle restore parent",
-                    path: parent.to_path_buf(),
-                    source,
-                })?;
-            }
-            fs::copy(backup_path, path).map_err(|source| AppError::FilesystemOperation {
-                action: "restore lifecycle file",
-                path: path.to_path_buf(),
-                source,
-            })?;
-            Ok(())
-        }
-        SnapshotState::Directory(backup_path) => {
-            copy_tree(backup_path, path, "restore lifecycle directory")
-        }
-        SnapshotState::Symlink { target, is_dir } => {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|source| AppError::FilesystemOperation {
-                    action: "create lifecycle symlink parent",
-                    path: parent.to_path_buf(),
-                    source,
-                })?;
-            }
-            create_symlink(target, path, *is_dir)
-        }
+    if expected.trim() == format!("{operation}:{label}") {
+        // Exit without unwinding so destructors cannot clean the journal up,
+        // which matches what a terminated process leaves behind.
+        std::process::exit(70);
     }
 }
 
-fn prune_empty_parents(path: &Path) -> Result<(), AppError> {
-    let mut current = path.parent();
-    while let Some(parent) = current {
-        match fs::remove_dir(parent) {
-            Ok(()) => current = parent.parent(),
-            Err(source) if source.kind() == io::ErrorKind::NotFound => break,
-            Err(source) if source.kind() == io::ErrorKind::DirectoryNotEmpty => break,
-            Err(source) if source.kind() == io::ErrorKind::PermissionDenied => break,
-            Err(source) => {
-                return Err(AppError::FilesystemOperation {
-                    action: "prune empty lifecycle parent directory",
-                    path: parent.to_path_buf(),
-                    source,
-                });
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn remove_existing_path(path: &Path) -> Result<(), AppError> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(source) => {
-            return Err(AppError::FilesystemOperation {
-                action: "inspect lifecycle restore path",
-                path: path.to_path_buf(),
-                source,
-            });
-        }
+/// Hold a transaction at one boundary until the sentinel file appears.
+///
+/// `SKILLCTL_LIFECYCLE_HOLD_AT` names the boundary in `operation:label` form.
+/// Without it the first boundary holds.
+fn hold_at_boundary(operation: &str, label: &str) -> Result<(), AppError> {
+    let Ok(sentinel) = env::var(HOLD_UNTIL_ENV) else {
+        return Ok(());
     };
-
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
-        fs::remove_dir_all(path).map_err(|source| AppError::FilesystemOperation {
-            action: "remove lifecycle directory before restore",
-            path: path.to_path_buf(),
-            source,
-        })?;
-    } else {
-        fs::remove_file(path).map_err(|source| AppError::FilesystemOperation {
-            action: "remove lifecycle file before restore",
-            path: path.to_path_buf(),
-            source,
-        })?;
-    }
-
-    Ok(())
-}
-
-fn copy_tree(source: &Path, destination: &Path, action: &'static str) -> Result<(), AppError> {
-    let metadata =
-        fs::symlink_metadata(source).map_err(|source_error| AppError::FilesystemOperation {
-            action,
-            path: source.to_path_buf(),
-            source: source_error,
-        })?;
-
-    if metadata.file_type().is_symlink() {
-        let target =
-            fs::read_link(source).map_err(|source_error| AppError::FilesystemOperation {
-                action: "read lifecycle symlink during copy",
-                path: source.to_path_buf(),
-                source: source_error,
-            })?;
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent).map_err(|source_error| AppError::FilesystemOperation {
-                action: "create lifecycle symlink copy parent",
-                path: parent.to_path_buf(),
-                source: source_error,
-            })?;
-        }
-        let is_dir = fs::metadata(source).is_ok_and(|metadata| metadata.is_dir());
-        return create_symlink(&target, destination, is_dir);
-    }
-
-    if metadata.is_dir() {
-        fs::create_dir_all(destination).map_err(|source_error| AppError::FilesystemOperation {
-            action,
-            path: destination.to_path_buf(),
-            source: source_error,
-        })?;
-        let mut entries = fs::read_dir(source)
-            .map_err(|source_error| AppError::FilesystemOperation {
-                action,
-                path: source.to_path_buf(),
-                source: source_error,
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|source_error| AppError::FilesystemOperation {
-                action,
-                path: source.to_path_buf(),
-                source: source_error,
-            })?;
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            copy_tree(&entry.path(), &destination.join(entry.file_name()), action)?;
-        }
+    if env::var(HOLD_AT_ENV).is_ok_and(|expected| expected.trim() != format!("{operation}:{label}"))
+    {
         return Ok(());
     }
 
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent).map_err(|source_error| AppError::FilesystemOperation {
-            action: "create lifecycle file copy parent",
-            path: parent.to_path_buf(),
-            source: source_error,
-        })?;
+    let deadline = Instant::now() + env_timeout(HOLD_TIMEOUT_ENV).unwrap_or(DEFAULT_HOLD_TIMEOUT);
+    while !Path::new(&sentinel).exists() {
+        if Instant::now() >= deadline {
+            return Err(AppError::FilesystemOperation {
+                action: "wait for lifecycle hold sentinel",
+                path: PathBuf::from(sentinel),
+                source: std::io::Error::other("lifecycle hold timed out"),
+            });
+        }
+        std::thread::sleep(HOLD_POLL_INTERVAL);
     }
-    fs::copy(source, destination).map_err(|source_error| AppError::FilesystemOperation {
-        action,
-        path: destination.to_path_buf(),
-        source: source_error,
-    })?;
+
     Ok(())
 }
 
-#[cfg(unix)]
-fn create_symlink(target: &Path, destination: &Path, _is_dir: bool) -> Result<(), AppError> {
-    std::os::unix::fs::symlink(target, destination).map_err(|source| {
-        AppError::FilesystemOperation {
-            action: "restore lifecycle symlink",
-            path: destination.to_path_buf(),
-            source,
-        }
-    })
-}
-
-#[cfg(windows)]
-fn create_symlink(target: &Path, destination: &Path, is_dir: bool) -> Result<(), AppError> {
-    let create = if is_dir {
-        std::os::windows::fs::symlink_dir
-    } else {
-        std::os::windows::fs::symlink_file
-    };
-    create(target, destination).map_err(|source| AppError::FilesystemOperation {
-        action: "restore lifecycle symlink",
-        path: destination.to_path_buf(),
-        source,
-    })
+fn env_timeout(name: &str) -> Option<Duration> {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
 }

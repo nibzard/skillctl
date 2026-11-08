@@ -21,6 +21,13 @@ pub struct AppResponse {
     /// Optional human-readable summary for non-JSON output.
     #[serde(skip)]
     pub summary: Option<String>,
+    /// Human-readable detail lines printed after the summary.
+    ///
+    /// Inventory commands use these lines to list the rows they found. The
+    /// lines are rendered from the same payload `data` carries, so the human
+    /// view and the JSON contract report the same facts.
+    #[serde(skip)]
+    pub detail: Vec<String>,
     /// Optional explicit process status override for diagnostics-heavy commands.
     #[serde(skip)]
     pub status_override: Option<ExitStatus>,
@@ -36,6 +43,7 @@ impl AppResponse {
             errors: Vec::new(),
             data: Value::Object(Map::new()),
             summary: None,
+            detail: Vec::new(),
             status_override: None,
         }
     }
@@ -49,6 +57,7 @@ impl AppResponse {
             errors: vec![error.into()],
             data: Value::Object(Map::new()),
             summary: None,
+            detail: Vec::new(),
             status_override: None,
         }
     }
@@ -56,6 +65,12 @@ impl AppResponse {
     /// Attach a human-readable summary used by the terminal presenter.
     pub fn with_summary(mut self, summary: impl Into<String>) -> Self {
         self.summary = Some(summary.into());
+        self
+    }
+
+    /// Attach human-readable detail lines printed after the summary.
+    pub fn with_detail_lines(mut self, lines: impl IntoIterator<Item = String>) -> Self {
+        self.detail.extend(lines);
         self
     }
 

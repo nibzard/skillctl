@@ -42,6 +42,7 @@ type UpdateCheckRow = (
     i64,
     i64,
     Option<String>,
+    Option<String>,
 );
 
 type LocalModificationRow = (
@@ -63,6 +64,18 @@ type PinRow = (
     String,
     Option<String>,
     String,
+);
+
+type TrustReviewRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    Option<String>,
 );
 
 type RollbackRow = (i64, String, String, String, String, String, String);
@@ -140,7 +153,19 @@ pub(super) fn decode_update_check_record(
             "update_checks.local_modification_detected",
             row.9,
         )?,
-        notes: row.10,
+        apply_blocked_by: row
+            .10
+            .as_deref()
+            .map(|reason| {
+                UpdateCheckBlockReason::parse(reason).ok_or_else(|| {
+                    local_state_validation(
+                        path,
+                        format!("update_checks.apply_blocked_by has unsupported value '{reason}'",),
+                    )
+                })
+            })
+            .transpose()?,
+        notes: row.11,
     })
 }
 
@@ -169,6 +194,23 @@ pub(super) fn decode_pin_record(path: &Path, row: PinRow) -> Result<PinRecord, A
         resolved_revision: row.4,
         effective_version_hash: row.5,
         pinned_at: row.6,
+    })
+}
+
+pub(super) fn decode_trust_review_record(
+    path: &Path,
+    row: TrustReviewRow,
+) -> Result<TrustReviewRecord, AppError> {
+    let scope = parse_scope(path, "skill_reviews.scope", &row.1)?;
+    validate_workspace_key(path, "skill_reviews.workspace_key", scope, &row.0)?;
+    Ok(TrustReviewRecord {
+        skill: ManagedSkillRef::new(scope, row.2),
+        decision: parse_review_decision(path, "skill_reviews.decision", &row.3)?,
+        resolved_revision: row.4,
+        effective_version_hash: row.5,
+        contains_scripts: int_to_bool(path, "skill_reviews.contains_scripts", row.6)?,
+        reviewed_at: row.7,
+        note: row.8,
     })
 }
 
@@ -300,18 +342,12 @@ fn parse_update_check_outcome(
     field: &str,
     value: &str,
 ) -> Result<UpdateCheckOutcome, AppError> {
-    match value {
-        "up-to-date" => Ok(UpdateCheckOutcome::UpToDate),
-        "update-available" => Ok(UpdateCheckOutcome::UpdateAvailable),
-        "blocked" => Ok(UpdateCheckOutcome::Blocked),
-        "detached" => Ok(UpdateCheckOutcome::Detached),
-        "local-source" => Ok(UpdateCheckOutcome::LocalSource),
-        "failed" => Ok(UpdateCheckOutcome::Failed),
-        _ => Err(local_state_validation(
+    UpdateCheckOutcome::parse(value).ok_or_else(|| {
+        local_state_validation(
             path,
             format!("{field} has unsupported update outcome '{value}'"),
-        )),
-    }
+        )
+    })
 }
 
 fn parse_local_modification_kind(
@@ -346,11 +382,27 @@ fn parse_telemetry_consent(
     }
 }
 
+fn parse_review_decision(
+    path: &Path,
+    field: &str,
+    value: &str,
+) -> Result<ReviewDecision, AppError> {
+    match value {
+        "approved" => Ok(ReviewDecision::Approved),
+        "revoked" => Ok(ReviewDecision::Revoked),
+        _ => Err(local_state_validation(
+            path,
+            format!("{field} has unsupported review decision '{value}'"),
+        )),
+    }
+}
+
 fn parse_source_kind(path: &Path, field: &str, value: &str) -> Result<SourceKind, AppError> {
     match value {
         "git" => Ok(SourceKind::Git),
         "local-path" => Ok(SourceKind::LocalPath),
         "archive" => Ok(SourceKind::Archive),
+        "well-known" => Ok(SourceKind::WellKnown),
         _ => Err(local_state_validation(
             path,
             format!("{field} has unsupported source kind '{value}'"),
@@ -378,6 +430,7 @@ pub(super) fn source_kind_as_str(kind: SourceKind) -> &'static str {
         SourceKind::Git => "git",
         SourceKind::LocalPath => "local-path",
         SourceKind::Archive => "archive",
+        SourceKind::WellKnown => "well-known",
     }
 }
 
@@ -503,6 +556,24 @@ pub(super) fn validate_pin_record(path: &Path, record: &PinRecord) -> Result<(),
         validate_token(path, "pin.effective_version_hash", hash)?;
     }
     validate_timestamp(path, "pin.pinned_at", &record.pinned_at)?;
+    Ok(())
+}
+
+pub(super) fn validate_trust_review_record(
+    path: &Path,
+    record: &TrustReviewRecord,
+) -> Result<(), AppError> {
+    validate_skill_ref(path, &record.skill)?;
+    validate_token(path, "review.resolved_revision", &record.resolved_revision)?;
+    validate_token(
+        path,
+        "review.effective_version_hash",
+        &record.effective_version_hash,
+    )?;
+    validate_timestamp(path, "review.reviewed_at", &record.reviewed_at)?;
+    if let Some(note) = &record.note {
+        validate_non_empty_trimmed(path, "review.note", note)?;
+    }
     Ok(())
 }
 

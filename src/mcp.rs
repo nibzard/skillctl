@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 use crate::{
     app::{AppContext, InteractionMode, OutputMode, Verbosity},
     cli::{
-        Command, InstallArgs, McpCommand, OptionalSkillArg, RollbackArgs, Scope, SkillArg,
-        TelemetryCommand,
+        Command, DiscoverArgs, DoctorArgs, InstallArgs, McpCommand, OptionalSkillArg, RestoreArgs,
+        RollbackArgs, Scope, SkillArg, TelemetryCommand, UpdateArgs,
     },
     error::AppError,
     response::AppResponse,
@@ -387,6 +387,16 @@ struct InstallToolArgs {
     scope: Option<Scope>,
 }
 
+/// Arguments for `skills_discover`.
+///
+/// The URL names the remote origin or index to read. Discovery stays
+/// read-only, so no selector or scope applies.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiscoverToolArgs {
+    url: String,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScopedSkillArgs {
@@ -406,11 +416,35 @@ struct ScopedOptionalSkillArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct UpdateApplyToolArgs {
+    #[serde(default)]
+    skill: Option<String>,
+    #[serde(default)]
+    scope: Option<Scope>,
+    #[serde(default)]
+    strategy: Option<crate::cli::UpdateStrategy>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RollbackToolArgs {
     skill: String,
     version_or_commit: String,
     #[serde(default)]
     scope: Option<Scope>,
+}
+
+/// Arguments for `skills_restore`.
+///
+/// `frozen` is required on purpose: a restore that may rewrite the lockfile is
+/// a mutation of committed portable state, so the caller states the mode
+/// instead of inheriting a default.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreToolArgs {
+    frozen: bool,
+    #[serde(default)]
+    offline: bool,
 }
 
 #[derive(Deserialize)]
@@ -438,6 +472,13 @@ fn parse_tool_invocation(name: &str, arguments: Value) -> Result<ToolInvocation,
             let _: EmptyParams = parse_arguments(arguments)?;
             Ok(command_invocation(Command::List, ToolSelectors::default()))
         }
+        "skills_discover" => {
+            let args: DiscoverToolArgs = parse_arguments(arguments)?;
+            Ok(command_invocation(
+                Command::Discover(DiscoverArgs { url: args.url }),
+                ToolSelectors::default(),
+            ))
+        }
         "skills_install" => {
             let args: InstallToolArgs = parse_arguments(arguments)?;
             Ok(command_invocation(
@@ -464,7 +505,7 @@ fn parse_tool_invocation(name: &str, arguments: Value) -> Result<ToolInvocation,
         "skills_sync" => {
             let args: SelectorArgs = parse_arguments(arguments)?;
             Ok(command_invocation(
-                Command::Sync,
+                Command::Sync(crate::cli::SyncArgs::default()),
                 ToolSelectors {
                     scope: args.scope,
                     targets: args.targets,
@@ -472,10 +513,46 @@ fn parse_tool_invocation(name: &str, arguments: Value) -> Result<ToolInvocation,
                 },
             ))
         }
+        "skills_restore" => {
+            let args: RestoreToolArgs = parse_arguments(arguments)?;
+            Ok(command_invocation(
+                Command::Restore(RestoreArgs {
+                    frozen: args.frozen,
+                    offline: args.offline,
+                }),
+                ToolSelectors::default(),
+            ))
+        }
+        "skills_verify" => {
+            let _: EmptyParams = parse_arguments(arguments)?;
+            Ok(command_invocation(
+                Command::Verify,
+                ToolSelectors::default(),
+            ))
+        }
         "skills_update" => {
             let args: ScopedOptionalSkillArgs = parse_arguments(arguments)?;
             Ok(command_invocation(
-                Command::Update(OptionalSkillArg { skill: args.skill }),
+                Command::Update(UpdateArgs {
+                    skill: args.skill,
+                    ..UpdateArgs::default()
+                }),
+                ToolSelectors {
+                    scope: args.scope,
+                    ..ToolSelectors::default()
+                },
+            ))
+        }
+        "skills_update_apply" => {
+            let args: UpdateApplyToolArgs = parse_arguments(arguments)?;
+            Ok(command_invocation(
+                Command::Update(UpdateArgs {
+                    skill: args.skill,
+                    apply: true,
+                    strategy: args.strategy,
+                    plan: None,
+                    plan_file: None,
+                }),
                 ToolSelectors {
                     scope: args.scope,
                     ..ToolSelectors::default()
@@ -540,7 +617,7 @@ fn parse_tool_invocation(name: &str, arguments: Value) -> Result<ToolInvocation,
         "skills_doctor" => {
             let args: SelectorArgs = parse_arguments(arguments)?;
             Ok(command_invocation(
-                Command::Doctor,
+                Command::Doctor(DoctorArgs::default()),
                 ToolSelectors {
                     scope: args.scope,
                     targets: args.targets,
@@ -660,8 +737,25 @@ fn tool_definitions(version: McpProtocolVersion) -> Vec<Value> {
         ),
         tool_definition(
             version,
+            "skills_discover",
+            "Read the well-known discovery index an origin publishes, read-only. \
+             Reports the declared schema, every entry with its resolved artifact URL and digest, \
+             and the origin-trust decision. Installs nothing and changes no local state.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "url": {
+                        "type": "string"
+                    }
+                },
+                "required": ["url"]
+            }),
+        ),
+        tool_definition(
+            version,
             "skills_install",
-            "Install one skill from a Git URL, local directory, or archive.",
+            "Install one skill from a Git URL, local directory, archive, or well-known discovery index.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -691,9 +785,60 @@ fn tool_definitions(version: McpProtocolVersion) -> Vec<Value> {
         ),
         tool_definition(
             version,
+            "skills_restore",
+            "Reconstruct every enabled import from the lockfile and verify it against the pinned \
+             digests. The frozen flag is required: true never changes the lockfile, false may \
+             upgrade a legacy one.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "frozen": {
+                        "type": "boolean"
+                    },
+                    "offline": {
+                        "type": "boolean"
+                    }
+                },
+                "required": ["frozen"]
+            }),
+        ),
+        tool_definition(
+            version,
+            "skills_verify",
+            "Verify pinned dependency state without changing anything.",
+            empty_schema(),
+        ),
+        tool_definition(
+            version,
             "skills_update",
             "Check managed imported skills for updates.",
             optional_skill_schema(),
+        ),
+        tool_definition(
+            version,
+            "skills_update_apply",
+            "Apply a planned update through the guarded apply engine.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "skill": {
+                        "type": "string"
+                    },
+                    "scope": scope_schema(),
+                    "strategy": {
+                        "type": "string",
+                        "enum": [
+                            "clean",
+                            "overlay",
+                            "discard",
+                            "fork",
+                            "skip"
+                        ]
+                    }
+                }
+            }),
         ),
         tool_definition(
             version,

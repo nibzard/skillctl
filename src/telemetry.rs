@@ -1,4 +1,8 @@
 //! Telemetry domain entry points.
+//!
+//! Telemetry is a local classification layer today. Install and update events
+//! are classified on this machine, and nothing is transmitted because no
+//! emission backend exists.
 
 use std::{fs, io, path::Path};
 
@@ -21,10 +25,20 @@ use crate::{
 };
 
 const FIRST_RUN_NOTICE: &str = concat!(
-    "Telemetry is enabled for public-source install and update events. ",
-    "It never includes private repo identifiers or skill contents. ",
+    "Telemetry is enabled by default. ",
+    "Install and update events are classified locally, and nothing is ",
+    "transmitted today because no emission backend exists. ",
+    "Private repository identifiers and skill contents are never included. ",
     "Run `skillctl telemetry disable` to opt out."
 );
+const LOCAL_CLASSIFICATION_NOTE: &str = concat!(
+    "Install and update events are classified locally, and nothing is ",
+    "transmitted today because no emission backend exists."
+);
+/// Where events are classified. Classification never leaves the machine.
+const EVENT_CLASSIFICATION_LOCAL: &str = "local";
+/// The emission backend that would transmit classified events. None exists.
+const EMISSION_BACKEND_NONE: &str = "none";
 const VERIFIED_PUBLIC_GIT_REPOSITORIES: &[(&str, &str)] = &[
     ("github.com", "nibzard/skillctl"),
     ("github.com", "vercel/ai"),
@@ -61,15 +75,42 @@ pub enum SourceVisibility {
     SuppressedPrivate,
 }
 
-/// Classify one normalized install source for public-only telemetry emission.
+/// Classify one normalized install source for public-only telemetry eligibility.
+///
+/// Classification runs locally. Its result only marks which events a future
+/// emission backend could send; it never transmits anything by itself.
 pub fn classify_source_visibility(source: &NormalizedInstallSource) -> SourceVisibility {
     match source.kind {
         SourceKind::LocalPath | SourceKind::Archive => SourceVisibility::SuppressedLocal,
         SourceKind::Git => classify_git_source_visibility(source),
+        SourceKind::WellKnown => classify_well_known_source_visibility(source),
     }
 }
 
-/// Return whether a remote telemetry event is allowed for this source and settings.
+/// Classify one discovery origin for public-only telemetry eligibility.
+///
+/// The origin-trust policy in [`crate::trust`] names which publishers are
+/// public, the same way the verified Git repository list does, so a well-known
+/// origin is never guessed at: a loopback index is local, a verified publisher
+/// is public, and every other remote origin stays suppressed.
+fn classify_well_known_source_visibility(source: &NormalizedInstallSource) -> SourceVisibility {
+    match crate::trust::discovery_origin_trust(&source.url) {
+        // A loopback origin serves a local index, which is local-only content.
+        crate::trust::DiscoveryOriginTrust::Loopback => SourceVisibility::SuppressedLocal,
+        crate::trust::DiscoveryOriginTrust::VerifiedPublicHttps => SourceVisibility::Public,
+        // An unverified or refused remote origin may publish privately, so its
+        // events stay suppressed until the policy verifies the publisher.
+        crate::trust::DiscoveryOriginTrust::UnverifiedRemote
+        | crate::trust::DiscoveryOriginTrust::InsecureTransport => {
+            SourceVisibility::SuppressedPrivate
+        }
+    }
+}
+
+/// Return whether this source is eligible for remote emission under the given settings.
+///
+/// Eligibility is a local classification only. No emission backend exists, so
+/// an eligible event is still not transmitted anywhere.
 pub fn allows_remote_emission(
     settings: TelemetrySettings,
     source: &NormalizedInstallSource,
@@ -149,6 +190,10 @@ struct TelemetryStatusView {
     workspace_mode: TelemetryMode,
     effective_enabled: bool,
     effective_mode: TelemetryMode,
+    /// Where events are classified. Always `local`.
+    classification: &'static str,
+    /// The backend that would transmit classified events. Always `none` today.
+    emission_backend: &'static str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -161,6 +206,8 @@ struct TelemetryNotice {
 struct RemoteTelemetryEvent {
     kind: &'static str,
     skill: String,
+    /// Whether the event is eligible for remote emission once a backend exists.
+    /// No backend exists today, so no event is transmitted.
     emitted: bool,
     source_visibility: SourceVisibility,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -181,6 +228,10 @@ struct RemoteTelemetryEvent {
     local_modification_detected: Option<bool>,
 }
 
+/// Build the local telemetry report for one install run.
+///
+/// The report classifies events locally; it never transmits them because no
+/// emission backend exists.
 pub(crate) fn prepare_install_report(
     context: &AppContext,
     source: &NormalizedInstallSource,
@@ -205,6 +256,10 @@ pub(crate) fn prepare_install_report(
     ))
 }
 
+/// Build the local telemetry report for one update check run.
+///
+/// The report classifies events locally; it never transmits them because no
+/// emission backend exists.
 pub(crate) fn prepare_update_report(
     context: &AppContext,
     plans: &[SkillUpdatePlan],
@@ -385,43 +440,43 @@ fn status_view(
         workspace_mode: telemetry_mode_from_manifest(workspace.mode),
         effective_enabled: effective.enabled,
         effective_mode: effective.mode,
+        classification: EVENT_CLASSIFICATION_LOCAL,
+        emission_backend: EMISSION_BACKEND_NONE,
     }
 }
 
 fn status_summary(report: &TelemetryReport) -> String {
-    if !report.status.notice_seen {
-        return "Telemetry will activate for public-source events after the first-run notice."
-            .to_string();
-    }
-
-    if report.status.effective_enabled {
-        return "Telemetry is enabled for public-source install and update events.".to_string();
-    }
-
-    if !report.status.workspace_enabled
+    let state = if !report.status.notice_seen {
+        "Telemetry consent defaults to enabled after the first-run notice."
+    } else if report.status.effective_enabled {
+        "Telemetry is enabled."
+    } else if !report.status.workspace_enabled
         || matches!(report.status.workspace_mode, TelemetryMode::Off)
     {
-        return "Telemetry is disabled by the current workspace configuration.".to_string();
-    }
+        "Telemetry is disabled by the current workspace configuration."
+    } else {
+        "Telemetry is disabled by local consent."
+    };
 
-    "Telemetry is disabled by local consent.".to_string()
+    format!("{state} {LOCAL_CLASSIFICATION_NOTE}")
 }
 
 fn consent_summary(command: &str, report: &TelemetryReport, changed: bool) -> String {
     match command {
         "telemetry-enable" if !changed => {
-            "Telemetry consent is already enabled for public-source events.".to_string()
+            format!("Telemetry consent is already enabled. {LOCAL_CLASSIFICATION_NOTE}")
         }
         "telemetry-enable" if report.status.effective_enabled => {
-            "Telemetry consent enabled for public-source install and update events.".to_string()
+            format!("Telemetry consent enabled. {LOCAL_CLASSIFICATION_NOTE}")
         }
         "telemetry-enable" => {
-            "Telemetry consent enabled, but the current workspace still suppresses remote telemetry."
+            "Telemetry consent enabled, but the workspace configuration still disables telemetry."
                 .to_string()
         }
         "telemetry-disable" if !changed => "Telemetry consent is already disabled.".to_string(),
-        "telemetry-disable" => "Telemetry consent disabled. Local history remains available."
-            .to_string(),
+        "telemetry-disable" => {
+            "Telemetry consent disabled. Local history remains available.".to_string()
+        }
         _ => status_summary(report),
     }
 }
@@ -535,7 +590,7 @@ fn classify_git_source_visibility(source: &NormalizedInstallSource) -> SourceVis
 }
 
 fn is_local_host(host: &str) -> bool {
-    matches!(host, "localhost" | "127.0.0.1" | "::1")
+    crate::trust::is_loopback_host(host)
 }
 
 fn is_verified_public_git_repository(host: &str, path: &str) -> bool {
@@ -697,6 +752,58 @@ mod tests {
     }
 
     #[test]
+    fn well_known_sources_classify_through_the_origin_trust_policy() {
+        let settings = TelemetrySettings {
+            enabled: true,
+            mode: TelemetryMode::PublicOnly,
+        };
+        let loopback = source(
+            SourceKind::WellKnown,
+            "http://127.0.0.1:8799",
+            "http://127.0.0.1:8799/.well-known/agent-skills/index.json",
+        );
+        let verified = source(
+            SourceKind::WellKnown,
+            "https://www.russ.cloud",
+            "https://www.russ.cloud/.well-known/agent-skills/index.json",
+        );
+        let unverified = source(
+            SourceKind::WellKnown,
+            "https://skills.internal.example",
+            "https://skills.internal.example/.well-known/agent-skills/index.json",
+        );
+        let insecure = source(
+            SourceKind::WellKnown,
+            "http://skills.example.com",
+            "http://skills.example.com/.well-known/agent-skills/index.json",
+        );
+
+        // A loopback index is local-only content, not a private remote one.
+        assert_eq!(
+            classify_source_visibility(&loopback),
+            SourceVisibility::SuppressedLocal
+        );
+        // Only a publisher the policy verified is public enough to emit.
+        assert_eq!(
+            classify_source_visibility(&verified),
+            SourceVisibility::Public
+        );
+        assert!(allows_remote_emission(settings, &verified));
+        // Every other remote origin may publish privately, so it stays
+        // suppressed instead of being guessed at.
+        assert_eq!(
+            classify_source_visibility(&unverified),
+            SourceVisibility::SuppressedPrivate
+        );
+        assert_eq!(
+            classify_source_visibility(&insecure),
+            SourceVisibility::SuppressedPrivate
+        );
+        assert!(!allows_remote_emission(settings, &unverified));
+        assert!(!allows_remote_emission(settings, &insecure));
+    }
+
+    #[test]
     fn disabled_or_off_settings_suppress_even_public_sources() {
         let public_source = source(
             SourceKind::Git,
@@ -794,12 +901,15 @@ mod tests {
             latest_revision: Some("1111111111111111".to_string()),
             outcome: crate::state::UpdateCheckOutcome::UpdateAvailable,
             overlay_detected: false,
+            overlay_changed_since_recorded_state: false,
             local_modification_detected: false,
             recommended_action: UpdateAction::Apply,
             available_actions: vec![UpdateAction::Apply],
             modifications: Vec::new(),
+            missing_projections: Vec::new(),
             trust: Some(crate::trust::SkillTrust::local(false)),
             notes: Vec::new(),
+            store_diverged: false,
         };
 
         let event = update_event(&workspace, &persisted, effective, &update);

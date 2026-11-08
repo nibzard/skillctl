@@ -7,11 +7,16 @@
 
 pub mod adapter;
 pub mod app;
+pub mod apply;
+pub mod artifact;
 mod builtin;
+pub mod bundle;
 pub mod cli;
+pub mod discovery;
 pub mod doctor;
 pub mod error;
 pub mod history;
+mod human;
 mod lifecycle;
 pub mod lockfile;
 pub mod manifest;
@@ -21,6 +26,8 @@ pub mod overlay;
 pub mod planner;
 pub mod resolver;
 pub mod response;
+pub mod restore;
+pub mod review;
 pub mod runtime;
 pub mod skill;
 pub mod source;

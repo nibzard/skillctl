@@ -129,6 +129,25 @@ impl TestWorkspace {
         );
     }
 
+    /// Current `HEAD` commit of one repository below the workspace.
+    pub fn git_head(&self, relative_path: &str) -> String {
+        let repo_path = self.path.join(relative_path);
+        let output = ProcessCommand::new("git")
+            .current_dir(&repo_path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("git command launches");
+        assert!(
+            output.status.success(),
+            "git rev-parse HEAD failed in {}",
+            repo_path.display()
+        );
+        String::from_utf8(output.stdout)
+            .expect("git stdout is valid utf-8")
+            .trim()
+            .to_string()
+    }
+
     fn run_git(&self, repo_path: &Path, args: &[&str]) {
         let status = ProcessCommand::new("git")
             .current_dir(repo_path)

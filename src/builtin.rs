@@ -340,9 +340,11 @@ pub(crate) fn planned_root_views(context: &AppContext) -> Result<Vec<Value>, App
         .collect()
 }
 
-pub(crate) fn diagnostics(context: &AppContext) -> Result<Vec<BundledSkillDiagnostic>, AppError> {
-    let store = LocalStateStore::open_default_for(&context.working_directory)?;
-    if store.install_record(&bundled_skill_ref())?.is_none() && is_explicitly_removed(&store)? {
+pub(crate) fn diagnostics(
+    context: &AppContext,
+    store: &LocalStateStore,
+) -> Result<Vec<BundledSkillDiagnostic>, AppError> {
+    if store.install_record(&bundled_skill_ref())?.is_none() && is_explicitly_removed(store)? {
         return Ok(vec![BundledSkillDiagnostic {
             code: "bundled-skill-removed".to_string(),
             path: None,
@@ -442,6 +444,14 @@ fn inspect_projection_root(path: &Path) -> Result<RootStatus, AppError> {
         Ok(_) => match builtin_projection_state(path)? {
             BundledProjectionState::ManagedCurrent => Ok(RootStatus::Current),
             BundledProjectionState::ManagedStale => Ok(RootStatus::NeedsWrite),
+            BundledProjectionState::Edited => Ok(RootStatus::Conflict {
+                message: format!(
+                    "the projected bundled skill at '{}' holds edits skillctl did not record \
+                     and was left untouched; move the edits into a canonical skill or remove the \
+                     directory to let skillctl regenerate it",
+                    path.display()
+                ),
+            }),
             BundledProjectionState::Conflict => Ok(RootStatus::Conflict {
                 message: format!(
                     "the bundled skillctl skill is blocked by a hand-authored or user-managed \
@@ -462,6 +472,8 @@ skill directory at '{}'",
 enum BundledProjectionState {
     ManagedCurrent,
     ManagedStale,
+    /// The projected copy holds edits skillctl did not record.
+    Edited,
     Conflict,
 }
 
@@ -497,6 +509,19 @@ fn builtin_projection_state(path: &Path) -> Result<BundledProjectionState, AppEr
             == Some(BUNDLED_SKILL_ID);
     if !is_bundled {
         return Ok(BundledProjectionState::Conflict);
+    }
+
+    // Generated status proves ownership, not permission to discard edits the
+    // user made inside the projected copy.
+    let desired = crate::apply::desired_projection_digest_for_files(
+        BUNDLED_FILES
+            .iter()
+            .map(|file| (file.relative_path, file.contents.as_bytes())),
+    )?;
+    if let crate::apply::ProjectionState::Drift(_) =
+        crate::apply::inspect_projection(path, Some(desired.as_str()))?
+    {
+        return Ok(BundledProjectionState::Edited);
     }
 
     if parsed
@@ -640,11 +665,15 @@ fn write_projection(
         })?;
     }
 
+    // The digest covers exactly the files written above, so a later run can
+    // tell a skillctl-owned copy from one that holds unrecorded local edits.
+    let content_digest = crate::apply::hash_projection_directory(target_dir)?;
     let metadata = json!({
         "tool": "skillctl",
         "version": env!("CARGO_PKG_VERSION"),
         "generated_at": generated_at,
         "generation_mode": "copy",
+        "content_digest": content_digest,
         "physical_root": root_display,
         "skill_name": BUNDLED_SKILL_ID,
         "source": {
@@ -797,7 +826,8 @@ fn owned_projection_paths(context: &AppContext) -> Result<Vec<PathBuf>, AppError
             Ok(BundledProjectionState::ManagedCurrent | BundledProjectionState::ManagedStale) => {
                 owned.push(target_dir);
             }
-            Ok(BundledProjectionState::Conflict) => {}
+            // An edited copy holds user content and is not skillctl's to remove.
+            Ok(BundledProjectionState::Edited | BundledProjectionState::Conflict) => {}
             Err(AppError::FilesystemOperation {
                 action: "read bundled projection metadata",
                 path: _,

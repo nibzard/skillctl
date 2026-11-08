@@ -146,6 +146,10 @@ pub struct AdapterMetadata {
     pub extra_metadata_files: &'static [&'static str],
     /// Notable compatibility or loading notes surfaced by diagnostics.
     pub compatibility_notes: &'static [&'static str],
+    /// Date the recorded facts were last verified against vendor documentation.
+    pub verified_on: &'static str,
+    /// Vendor documentation pages that back the recorded discovery roots.
+    pub documentation_sources: &'static [&'static str],
 }
 
 impl AdapterMetadata {
@@ -193,6 +197,18 @@ impl AdapterRegistry {
 
 const BOTH_SCOPES: &[TargetScope] = &[TargetScope::Workspace, TargetScope::User];
 const NO_EXTRA_METADATA: &[&str] = &[];
+
+/// Date the adapter facts were last verified against the listed sources.
+const VERIFIED_ON: &str = "2026-11-05";
+const CODEX_SOURCES: &[&str] = &["https://developers.openai.com/codex/skills"];
+const CLAUDE_CODE_SOURCES: &[&str] = &["https://code.claude.com/docs/en/skills"];
+const GITHUB_COPILOT_SOURCES: &[&str] = &[
+    "https://docs.github.com/en/copilot/concepts/agents/about-agent-skills",
+    "https://docs.github.com/en/copilot/how-tos/use-copilot-agents/coding-agent/create-skills",
+];
+const GEMINI_CLI_SOURCES: &[&str] = &["https://geminicli.com/docs/cli/skills/"];
+const AMP_SOURCES: &[&str] = &["https://ampcode.com/docs/customize/skills"];
+const OPENCODE_SOURCES: &[&str] = &["https://opencode.ai/docs/skills"];
 
 const CODEX_ROOTS: &[DiscoveryRoot] = &[
     DiscoveryRoot::new(
@@ -242,6 +258,13 @@ const GITHUB_COPILOT_ROOTS: &[DiscoveryRoot] = &[
         1,
     ),
     DiscoveryRoot::new(
+        TargetScope::Workspace,
+        ".agents/skills",
+        DiscoveryRootKind::Neutral,
+        2,
+        2,
+    ),
+    DiscoveryRoot::new(
         TargetScope::User,
         "~/.copilot/skills",
         DiscoveryRootKind::Native,
@@ -250,10 +273,10 @@ const GITHUB_COPILOT_ROOTS: &[DiscoveryRoot] = &[
     ),
     DiscoveryRoot::new(
         TargetScope::User,
-        "~/.claude/skills",
-        DiscoveryRootKind::Compatible,
-        1,
-        1,
+        "~/.agents/skills",
+        DiscoveryRootKind::Neutral,
+        2,
+        2,
     ),
 ];
 const GEMINI_CLI_ROOTS: &[DiscoveryRoot] = &[
@@ -295,6 +318,13 @@ const AMP_ROOTS: &[DiscoveryRoot] = &[
         0,
     ),
     DiscoveryRoot::new(
+        TargetScope::Workspace,
+        ".claude/skills",
+        DiscoveryRootKind::Compatible,
+        1,
+        1,
+    ),
+    DiscoveryRoot::new(
         TargetScope::User,
         "~/.config/agents/skills",
         DiscoveryRootKind::Neutral,
@@ -307,6 +337,20 @@ const AMP_ROOTS: &[DiscoveryRoot] = &[
         DiscoveryRootKind::Native,
         1,
         1,
+    ),
+    DiscoveryRoot::new(
+        TargetScope::User,
+        "~/.agents/skills",
+        DiscoveryRootKind::Neutral,
+        2,
+        2,
+    ),
+    DiscoveryRoot::new(
+        TargetScope::User,
+        "~/.claude/skills",
+        DiscoveryRootKind::Compatible,
+        3,
+        3,
     ),
 ];
 const OPENCODE_ROOTS: &[DiscoveryRoot] = &[
@@ -366,6 +410,8 @@ const CODEX_ADAPTER: AdapterMetadata = AdapterMetadata {
         "scans workspace skills from the current directory up to the repo root",
         "duplicate names may both appear during discovery",
     ],
+    verified_on: VERIFIED_ON,
+    documentation_sources: CODEX_SOURCES,
 };
 const CLAUDE_CODE_ADAPTER: AdapterMetadata = AdapterMetadata {
     target: TargetRuntime::ClaudeCode,
@@ -379,16 +425,23 @@ const CLAUDE_CODE_ADAPTER: AdapterMetadata = AdapterMetadata {
         "nested .claude/skills discovery is supported",
         "plugin skills participate in runtime loading",
     ],
+    verified_on: VERIFIED_ON,
+    documentation_sources: CLAUDE_CODE_SOURCES,
 };
 const GITHUB_COPILOT_ADAPTER: AdapterMetadata = AdapterMetadata {
     target: TargetRuntime::GithubCopilot,
     supported_scopes: BOTH_SCOPES,
     discovery_roots: GITHUB_COPILOT_ROOTS,
     precedence: PrecedenceBehavior::ProjectAndPersonal,
-    supports_neutral_roots: false,
+    supports_neutral_roots: true,
     install_mode_risk: InstallModeRisk::SymlinkUnstable,
     extra_metadata_files: NO_EXTRA_METADATA,
-    compatibility_notes: &[".claude/skills is a documented shared-root compatibility path"],
+    compatibility_notes: &[
+        ".claude/skills and .agents/skills are documented shared-root compatibility paths",
+        "personal scope no longer lists ~/.claude/skills on the pages verified 2026-11-05",
+    ],
+    verified_on: VERIFIED_ON,
+    documentation_sources: GITHUB_COPILOT_SOURCES,
 };
 const GEMINI_CLI_ADAPTER: AdapterMetadata = AdapterMetadata {
     target: TargetRuntime::GeminiCli,
@@ -399,6 +452,8 @@ const GEMINI_CLI_ADAPTER: AdapterMetadata = AdapterMetadata {
     install_mode_risk: InstallModeRisk::SymlinkUnstable,
     extra_metadata_files: NO_EXTRA_METADATA,
     compatibility_notes: &["workspace roots win before user and extension-provided skills"],
+    verified_on: VERIFIED_ON,
+    documentation_sources: GEMINI_CLI_SOURCES,
 };
 const AMP_ADAPTER: AdapterMetadata = AdapterMetadata {
     target: TargetRuntime::Amp,
@@ -408,7 +463,13 @@ const AMP_ADAPTER: AdapterMetadata = AdapterMetadata {
     supports_neutral_roots: true,
     install_mode_risk: InstallModeRisk::SymlinkUnstable,
     extra_metadata_files: NO_EXTRA_METADATA,
-    compatibility_notes: &["user scope includes both neutral and amp-specific documented roots"],
+    compatibility_notes: &[
+        "user scope includes both neutral and amp-specific documented roots",
+        "project scope documents .claude/skills alongside .agents/skills",
+        "the first skill with a given name wins across the documented root order",
+    ],
+    verified_on: VERIFIED_ON,
+    documentation_sources: AMP_SOURCES,
 };
 const OPENCODE_ADAPTER: AdapterMetadata = AdapterMetadata {
     target: TargetRuntime::Opencode,
@@ -422,6 +483,8 @@ const OPENCODE_ADAPTER: AdapterMetadata = AdapterMetadata {
         "native skill management is available through the runtime",
         ".claude/skills and .agents/skills are documented compatibility roots",
     ],
+    verified_on: VERIFIED_ON,
+    documentation_sources: OPENCODE_SOURCES,
 };
 const ALL_ADAPTERS: &[AdapterMetadata] = &[
     CODEX_ADAPTER,
@@ -498,5 +561,101 @@ mod tests {
                 (".agents/skills", DiscoveryRootKind::Neutral, 0, 1),
             ]
         );
+    }
+
+    #[test]
+    fn copilot_metadata_includes_documented_neutral_roots() {
+        let registry = AdapterRegistry::new();
+        let copilot = registry.get(TargetRuntime::GithubCopilot);
+
+        let workspace_roots: Vec<_> = copilot
+            .roots_for_scope(TargetScope::Workspace)
+            .iter()
+            .map(|root| (root.path, root.kind))
+            .collect();
+        let user_roots: Vec<_> = copilot
+            .roots_for_scope(TargetScope::User)
+            .iter()
+            .map(|root| (root.path, root.kind))
+            .collect();
+
+        assert_eq!(
+            workspace_roots,
+            vec![
+                (".github/skills", DiscoveryRootKind::Native),
+                (".claude/skills", DiscoveryRootKind::Compatible),
+                (".agents/skills", DiscoveryRootKind::Neutral),
+            ]
+        );
+        assert_eq!(
+            user_roots,
+            vec![
+                ("~/.copilot/skills", DiscoveryRootKind::Native),
+                ("~/.agents/skills", DiscoveryRootKind::Neutral),
+            ],
+            "~/.claude/skills is no longer documented for personal scope",
+        );
+        assert!(copilot.supports_neutral_roots);
+    }
+
+    #[test]
+    fn amp_metadata_includes_documented_claude_compatible_roots() {
+        let registry = AdapterRegistry::new();
+        let amp = registry.get(TargetRuntime::Amp);
+
+        let workspace_roots: Vec<_> = amp
+            .roots_for_scope(TargetScope::Workspace)
+            .iter()
+            .map(|root| (root.path, root.kind))
+            .collect();
+        let user_roots: Vec<_> = amp
+            .roots_for_scope(TargetScope::User)
+            .iter()
+            .map(|root| (root.path, root.kind))
+            .collect();
+
+        assert_eq!(
+            workspace_roots,
+            vec![
+                (".agents/skills", DiscoveryRootKind::Neutral),
+                (".claude/skills", DiscoveryRootKind::Compatible),
+            ]
+        );
+        assert_eq!(
+            user_roots,
+            vec![
+                ("~/.config/agents/skills", DiscoveryRootKind::Neutral),
+                ("~/.config/amp/skills", DiscoveryRootKind::Native),
+                ("~/.agents/skills", DiscoveryRootKind::Neutral),
+                ("~/.claude/skills", DiscoveryRootKind::Compatible),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_adapter_records_verification_metadata() {
+        let registry = AdapterRegistry::new();
+
+        for adapter in registry.all() {
+            assert_eq!(
+                adapter.verified_on.len(),
+                10,
+                "{} must record an ISO verification date",
+                adapter.target.as_str()
+            );
+            assert!(
+                adapter.verified_on.starts_with("20"),
+                "{} must record a plausible verification date",
+                adapter.target.as_str()
+            );
+            assert!(
+                adapter
+                    .documentation_sources
+                    .iter()
+                    .all(|source| source.starts_with("https://")),
+                "{} must cite vendor documentation",
+                adapter.target.as_str()
+            );
+        }
     }
 }

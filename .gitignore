@@ -16,3 +16,13 @@ Thumbs.db
 tmp/
 temp/
 dist/
+
+# Python bytecode from scripts/
+__pycache__/
+*.pyc
+
+# Local skillctl state created when the tool runs with this repository as HOME
+/.skillctl/
+
+# Scratch resources a task runner keeps under its resource prefix
+/looper_*/

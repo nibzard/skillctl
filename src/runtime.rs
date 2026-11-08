@@ -8,11 +8,11 @@ use crate::{
     app::{AppContext, OutputMode, Verbosity},
     builtin,
     cli::{Cli, Command, McpCommand},
-    doctor,
+    discovery, doctor,
     error::{AppError, ExitStatus},
     history, manifest, materialize, mcp, overlay, planner,
     response::{AppResponse, RenderedOutput},
-    skill, source, telemetry, tui,
+    restore, review, skill, source, telemetry, tui,
 };
 
 /// Fully rendered command result ready for the process boundary.
@@ -97,30 +97,77 @@ fn run_command(command: Command, context: &AppContext) -> Result<RunResult, AppE
 
 /// Execute one parsed command through the shared lifecycle layer.
 pub fn execute_command(command: &Command, context: &AppContext) -> Result<AppResponse, AppError> {
-    if should_bootstrap_bundled_skill(command) {
-        builtin::ensure_bundled_skill(context, false)?;
+    if should_bootstrap_bundled_skill(command)
+        && let Err(error) = builtin::ensure_bundled_skill(context, false)
+        // Plain `doctor` reports an unreadable state database as an issue
+        // instead of failing, so the bundled bootstrap must not fail the
+        // report before it renders. Every other command, including
+        // `doctor --repair-state`, keeps the actionable failure.
+        && !(is_plain_doctor(command)
+            && matches!(error, AppError::LocalStateDatabaseUnreadable { .. }))
+    {
+        return Err(error);
     }
     dispatch(command, context)
 }
 
+/// Whether the command is `doctor` without `--repair-state`.
+fn is_plain_doctor(command: &Command) -> bool {
+    matches!(command, Command::Doctor(args) if !args.repair_state)
+}
+
 fn should_bootstrap_bundled_skill(command: &Command) -> bool {
     !matches!(command, Command::Tui)
+        && !matches!(
+            command,
+            Command::Doctor(args) if args.repair_state
+        )
+        // `verify` writes nothing by contract, `discover` only reads a remote
+        // index, and `restore` reconstructs the pinned dependency set rather
+        // than adding new managed skills.
+        && !matches!(
+            command,
+            Command::Restore(_) | Command::Verify | Command::Discover(_)
+        )
 }
 
 fn dispatch(command: &Command, context: &AppContext) -> Result<AppResponse, AppError> {
     match command {
         Command::Init => manifest::handle_init(context, manifest::InitRequest),
         Command::List => skill::handle_list(context, skill::ListRequest),
+        Command::Discover(args) => {
+            discovery::handle_discover(context, discovery::DiscoverRequest::new(args.url.clone()))
+        }
         Command::Install(args) => {
             source::handle_install(context, source::InstallRequest::new(args.source.clone()))
         }
         Command::Remove(args) => {
             skill::handle_remove(context, skill::RemoveRequest::new(args.skill.clone()))
         }
-        Command::Sync => materialize::handle_sync(context, materialize::SyncRequest),
-        Command::Update(args) => {
-            planner::handle_update(context, planner::UpdateRequest::new(args.skill.clone()))
-        }
+        Command::Sync(args) => materialize::handle_sync(
+            context,
+            materialize::SyncRequest {
+                discard: args.discard,
+            },
+        ),
+        Command::Restore(args) => restore::handle_restore(
+            context,
+            restore::RestoreRequest {
+                frozen: args.frozen,
+                offline: args.offline,
+            },
+        ),
+        Command::Verify => restore::handle_verify(context, restore::VerifyRequest),
+        Command::Update(args) => planner::handle_update(
+            context,
+            planner::UpdateRequest {
+                skill: args.skill.clone(),
+                apply: args.apply,
+                strategy: args.strategy.map(crate::cli::UpdateStrategy::engine),
+                plan: args.plan.clone(),
+                plan_file: args.plan_file.clone(),
+            },
+        ),
         Command::Pin(args) => history::handle_pin(
             context,
             history::PinRequest::new(args.skill.clone(), args.ref_spec.clone()),
@@ -132,7 +179,16 @@ fn dispatch(command: &Command, context: &AppContext) -> Result<AppResponse, AppE
         Command::History(args) => {
             history::handle_history(context, history::HistoryRequest::new(args.skill.clone()))
         }
-        Command::Doctor => doctor::handle_doctor(context, doctor::DoctorRequest),
+        Command::Doctor(args) => {
+            if args.repair_state {
+                doctor::handle_repair_state(
+                    context,
+                    doctor::RepairStateRequest { apply: args.apply },
+                )
+            } else {
+                doctor::handle_doctor(context, doctor::DoctorRequest)
+            }
+        }
         Command::Explain(args) => {
             skill::handle_explain(context, skill::ExplainRequest::new(args.skill.clone()))
         }
@@ -145,6 +201,18 @@ fn dispatch(command: &Command, context: &AppContext) -> Result<AppResponse, AppE
         Command::Fork(args) => {
             overlay::handle_fork(context, overlay::ForkRequest::new(args.skill.clone()))
         }
+        Command::Review(args) => review::handle_review(
+            context,
+            if args.approve {
+                review::ReviewRequest::new(args.skill.clone())
+                    .with_decision(crate::state::ReviewDecision::Approved, args.note.clone())
+            } else if args.revoke {
+                review::ReviewRequest::new(args.skill.clone())
+                    .with_decision(crate::state::ReviewDecision::Revoked, None)
+            } else {
+                review::ReviewRequest::new(args.skill.clone())
+            },
+        ),
         Command::Enable(args) => {
             skill::handle_enable(context, skill::EnableRequest::new(args.skill.clone()))
         }
@@ -205,6 +273,9 @@ fn render_human_response(verbosity: Verbosity, response: AppResponse) -> Rendere
                 let _ = writeln!(stdout, "{summary}");
             } else {
                 let _ = writeln!(stdout, "{} completed successfully", response.command);
+            }
+            for line in &response.detail {
+                let _ = writeln!(stdout, "{line}");
             }
         }
 
@@ -343,9 +414,12 @@ fn parse_error_command(args: &[OsString]) -> &'static str {
         return match token.as_ref() {
             "init" => "init",
             "list" => "list",
+            "discover" => "discover",
             "install" | "i" => "install",
             "remove" => "remove",
             "sync" => "sync",
+            "restore" => "restore",
+            "verify" => "verify",
             "update" => "update",
             "pin" => "pin",
             "rollback" => "rollback",
@@ -354,6 +428,7 @@ fn parse_error_command(args: &[OsString]) -> &'static str {
             "explain" => "explain",
             "override" => "override",
             "fork" => "fork",
+            "review" => "review",
             "enable" => "enable",
             "disable" => "disable",
             "path" => "path",

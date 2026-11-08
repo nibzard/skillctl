@@ -273,7 +273,8 @@ V1 will not:
 - guarantee identical behavior across all runtimes,
 - auto-execute bundled scripts,
 - upload private repositories or private skill contents for telemetry,
-- require a hosted account to use core lifecycle features.
+- require a hosted account to use core lifecycle features,
+- publish, host, or mirror an Agent Skills Discovery index; well-known indexes are read-only acquisition inputs, not the local storage model.
 
 ## 6. Core principles
 
@@ -653,7 +654,18 @@ source revision + source content hash + overlay hash
 - telemetry consent,
 - update checks,
 - history events,
-- pins and rollbacks.
+- pins and rollbacks,
+- review decisions.
+
+A database SQLite cannot read is a recoverable condition, not a dead end. Every
+state-backed command reports the recovery step instead of the raw SQLite error:
+move the corrupt file aside or run `skillctl doctor --repair-state --apply`,
+which keeps the corrupt file and rebuilds an empty database. Plain `doctor`
+keeps answering: it renders a partial report with a `state-database-unreadable`
+error issue instead of failing, and it skips the checks that read local state.
+The manifest and the lockfile stay the source of truth for dependency state, so
+`skillctl restore --frozen` rebuilds the import records. History, review
+decisions, pins, and update checks recorded only in the old database are lost.
 
 ### 12.6 Storage recommendation
 
@@ -775,7 +787,10 @@ Every installed skill must record the exact commit hash or immutable digest used
 3. detect local overlays and direct local modifications,
 4. propose an update plan instead of blindly overwriting,
 5. record the result in local history,
-6. emit a public-only telemetry event if telemetry is enabled.
+6. emit a public-only telemetry event if telemetry is enabled,
+7. name every planned projection destination that is absent and recommend
+   `skillctl sync`, reading the same manifest plan assignments `explain` and
+   `doctor` read.
 
 ### 14.7 Local modification handling
 
@@ -847,22 +862,32 @@ V1 must support:
 
 ### 15.3 Default shared-root planner
 
+The roots below were verified against vendor documentation on 2026-11-05. The
+authoritative records are the adapter registry in `src/adapter.rs` (with
+`verified_on` and `documentation_sources`) and the verification log in
+[docs/development.md](./docs/development.md). Update those records and these
+tables together.
+
 #### Workspace scope
 
 - `codex` + `gemini-cli` + `opencode` + `amp` -> prefer `.agents/skills`
 - `codex` + `gemini-cli` -> prefer `.agents/skills`
+- `codex` + `github-copilot` -> prefer `.agents/skills`; `github-copilot` documents the neutral root
 - `opencode` alone -> prefer `.agents/skills` under `prefer-neutral`, `.opencode/skills` under `prefer-native`
 - `amp` alone -> prefer `.agents/skills`
 - `claude-code` + `github-copilot` -> prefer `.claude/skills`
+- `claude-code` + `amp` -> prefer `.claude/skills`; `amp` documents the compatibility root
 - `github-copilot` alone -> prefer `.github/skills`
 - `claude-code` alone -> prefer `.claude/skills`
 
 #### User scope
 
 - `codex` + `gemini-cli` + `opencode` -> prefer `~/.agents/skills`
+- `codex` + `github-copilot` -> prefer `~/.agents/skills`; `github-copilot` documents the neutral root
+- multi-target plans that include `amp` -> share `~/.agents/skills` instead of creating `~/.config/agents/skills`
 - `opencode` alone -> prefer `~/.agents/skills` under `prefer-neutral`, `~/.config/opencode/skills` under `prefer-native`
 - `amp` alone -> prefer `~/.config/agents/skills`
-- `claude-code` + `github-copilot` -> prefer `~/.claude/skills`
+- `claude-code` + `github-copilot` -> plan two roots, `~/.claude/skills` for `claude-code` and `~/.copilot/skills` for `github-copilot`; `github-copilot` personal scope no longer lists `~/.claude/skills`
 - `github-copilot` alone -> prefer `~/.copilot/skills`
 - `claude-code` alone -> prefer `~/.claude/skills`
 
@@ -931,7 +956,8 @@ For a given physical root:
 11. write provenance metadata,
 12. write local history events,
 13. emit optional telemetry,
-14. print a summary.
+14. warn about overlays that no longer hash to the digest the lockfile pins,
+15. print a summary.
 
 ### 17.2 Projection metadata
 
@@ -1065,7 +1091,16 @@ V1 trust states:
 
 - local canonical skills are trusted by default,
 - imported skills start as `imported-unreviewed`,
-- if a skill contains `scripts/`, `doctor` should show elevated-risk messaging until reviewed.
+- if a skill contains `scripts/`, `doctor` should show elevated-risk messaging until reviewed,
+- an update apply that would leave an unreviewed import holding `scripts/` is refused with the trust-gate exit code, whether the scripts are already installed or arrive with the incoming revision,
+- a `pin` or a `rollback` that moves an unreviewed script-bearing import to a different revision is refused through the same gate predicate the apply engine consults and with the same exit code, because both commands install the tree an update apply installs,
+- a gated pin or rollback names its repair, which is the review that licenses the move (`skillctl review <skill> --approve`) or the standalone `skillctl fork <skill>`, so a gated rollback keeps a recovery path instead of leaving the workspace on the applied revision,
+- the update check records why it held an apply back, so repair advice from `doctor`, `sync`, `explain`, and `clean` never names an update strategy the gate refuses, also for a script-free import whose waiting revision introduces `scripts/`,
+- `skillctl review <skill> --approve` records a local review of the effective content and moves the import to `imported-reviewed`,
+- a review covers one effective version, so an applied update, pin, or rollback returns the import to `imported-unreviewed`,
+- `skillctl review <skill> --revoke` withdraws a recorded review.
+
+The review decision is local state. It is recorded in the local history ledger and is not written to `.agents/skillctl.lock`, so it does not travel with the repository.
 
 ### 20.4 Local history requirements
 
@@ -1078,7 +1113,8 @@ The local history ledger must record at least:
 - overlay creation,
 - direct-modification detection,
 - detach or fork,
-- cleanup or prune.
+- cleanup or prune,
+- review decision.
 
 ### 20.5 Telemetry consent model
 
@@ -1168,6 +1204,7 @@ skillctl doctor
 skillctl explain <skill>
 skillctl override <skill>
 skillctl fork <skill>
+skillctl review <skill> [--approve|--revoke]
 skillctl enable <skill>
 skillctl disable <skill>
 skillctl path <skill>
@@ -1201,21 +1238,33 @@ skillctl install https://github.com/vercel/ai.git --name ai-sdk --scope workspac
 skillctl i ../shared-skills --interactive
 ```
 
+#### `skillctl list`
+
+Show the managed installs from the local state store. The default human output lists one block per skill with its scope, source, revision, projected targets, and notable state.
+
 #### `skillctl update [skill]`
 
 Check for updates, show local modifications, propose the next action, and apply or defer explicitly.
 
 #### `skillctl rollback <skill> <version-or-commit>`
 
-Re-activate a previously installed effective version or pinned commit and record the rollback in local history.
+Re-activate a previously recorded commit or effective version and record the rollback in local history. The current overlay is kept, so the effective version is recomputed for the re-activated revision.
 
 #### `skillctl history [skill]`
 
-Show local version and modification history for one skill or all managed skills.
+Show local version and modification history for one skill or all managed skills. The default human output lists one line per event with its time, kind, skill, recorded revision, and summary.
+
+#### `skillctl path <skill>`
+
+Show the canonical, stored, overlay, planned-root, and projected paths of one managed skill. The default human output lists each of those paths.
 
 #### `skillctl override <skill>`
 
 Create `.agents/overlays/<skill>/` populated minimally for editing.
+
+#### `skillctl review <skill>`
+
+Report the recorded review decision, the trust state it produces, and whether it covers the current effective version. With `--approve`, record that the effective content was reviewed; with `--revoke`, withdraw the recorded decision. See section 20.3.
 
 #### `skillctl doctor`
 
@@ -1286,10 +1335,14 @@ Agents should manage skills through a safe, explicit surface instead of editing 
 ### 22.2 MCP tools in v1
 
 - `skills_list`
+- `skills_discover`
 - `skills_install`
 - `skills_remove`
 - `skills_sync`
+- `skills_restore`
+- `skills_verify`
 - `skills_update`
+- `skills_update_apply`
 - `skills_rollback`
 - `skills_history`
 - `skills_explain`
@@ -1528,37 +1581,51 @@ This simplicity is a product requirement, not a nice-to-have.
 
 ## Appendix A - compatibility matrix used by this spec
 
+Verified against vendor documentation on 2026-11-05. The authoritative records
+are the adapter registry in `src/adapter.rs` (with `verified_on` and
+`documentation_sources` per runtime) and the verification log in
+[docs/development.md](./docs/development.md). Update those records and this
+matrix together.
+
 | Runtime | Workspace roots to support | User roots to support | Notable behavior |
 |---|---|---|---|
 | Codex | `.agents/skills` | `~/.agents/skills` | scans from CWD up to repo root; duplicate names may both appear; supports `agents/openai.yaml` |
 | Claude Code | `.claude/skills` | `~/.claude/skills` | explicit precedence enterprise > personal > project; nested discovery; plugin skills supported |
-| GitHub Copilot | `.github/skills` or `.claude/skills` | `~/.copilot/skills` or `~/.claude/skills` | project and personal skills; strong shared-root case with Claude |
+| GitHub Copilot | `.github/skills`, `.claude/skills`, or `.agents/skills` | `~/.copilot/skills` or `~/.agents/skills` | project and personal skills; `.claude/skills` and `.agents/skills` are documented workspace shared roots; personal scope no longer lists `~/.claude/skills` |
 | Gemini CLI | `.gemini/skills` or `.agents/skills` | `~/.gemini/skills` or `~/.agents/skills` | `.agents/skills` alias documented; precedence workspace > user > extension |
-| Amp | `.agents/skills` | `~/.config/agents/skills` or `~/.config/amp/skills` | project skills in `.agents/skills`; user-wide precedence includes both neutral and Amp-specific roots |
+| Amp | `.agents/skills` or `.claude/skills` | `~/.config/agents/skills`, `~/.config/amp/skills`, `~/.agents/skills`, or `~/.claude/skills` | project skills prefer `.agents/skills`; user scope includes neutral and Amp-specific roots; first skill with a given name wins across the root order |
 | OpenCode | `.opencode/skills`, `.claude/skills`, or `.agents/skills` | `~/.config/opencode/skills`, `~/.claude/skills`, or `~/.agents/skills` | native `skill` tool; neutral and Claude-compatible roots both supported |
+
+Changes recorded by the 2026-11-05 verification:
+
+- GitHub Copilot added the neutral roots `.agents/skills` (workspace) and
+  `~/.agents/skills` (user), and removed `~/.claude/skills` from personal
+  scope.
+- Amp added `.claude/skills` (workspace) plus `~/.agents/skills` and
+  `~/.claude/skills` (user).
 
 ## Appendix B - research basis
 
-This revision uses the following ecosystem facts as of 2026-03-19:
+This revision uses the following ecosystem facts as of 2026-11-05:
 
 1. Agent Skills standardizes the skill directory structure and `SKILL.md` frontmatter, but not a universal lifecycle manager.  
    https://agentskills.io/specification
 
 2. Codex reads from repo, user, admin, and system skill locations; scans `.agents/skills` from the current directory to repo root; supports `agents/openai.yaml`; and documents symlink support.  
-   https://developers.openai.com/codex/skills
+   https://developers.openai.com/codex/skills (redirects to https://learn.chatgpt.com/docs/build-skills)
 
 3. Claude Code uses `.claude/skills`, supports personal, project, and plugin scopes, defines precedence, and discovers nested `.claude/skills` directories.  
    https://code.claude.com/docs/en/skills
 
-4. GitHub Copilot supports project skills in `.github/skills` or `.claude/skills`, and personal skills in `~/.copilot/skills` or `~/.claude/skills`.  
+4. GitHub Copilot supports project skills in `.github/skills`, `.claude/skills`, and `.agents/skills`, and personal skills in `~/.copilot/skills` or `~/.agents/skills`. The personal scope no longer lists `~/.claude/skills`.  
    https://docs.github.com/en/copilot/concepts/agents/about-agent-skills  
    https://docs.github.com/en/copilot/how-tos/use-copilot-agents/coding-agent/create-skills
 
 5. Gemini CLI documents `.agents/skills` as an alias for workspace and user skill roots and provides first-class skill management commands.  
    https://geminicli.com/docs/cli/skills/
 
-6. Amp documents project skills in `.agents/skills`, user-wide skills in `~/.config/agents/skills` and `~/.config/amp/skills`, and a built-in `amp skill` management flow.  
-   https://ampcode.com/manual
+6. Amp documents project skills in `.agents/skills` and `.claude/skills`, user-wide skills in `~/.config/agents/skills`, `~/.config/amp/skills`, `~/.agents/skills`, and `~/.claude/skills`, and a built-in `amp skill` management flow.  
+   https://ampcode.com/docs/customize/skills
 
 7. OpenCode documents skills in `.opencode/skills`, `.claude/skills`, and `.agents/skills`, with corresponding global roots and a native `skill` tool.  
    https://opencode.ai/docs/skills

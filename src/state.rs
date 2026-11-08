@@ -5,13 +5,14 @@
 //! telemetry consent, and the append-only history ledger.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -20,18 +21,28 @@ use crate::{
 };
 
 mod codec;
+mod journal;
+mod lock;
 mod schema;
 #[cfg(test)]
 mod tests;
 
 use self::{codec::*, schema::*};
 
+pub use self::journal::{
+    RecoveryOutcome, journal_root, migration_backup_root, migration_backups, pending_operations,
+    recover_pending_operations, write_file_atomically,
+};
+
+pub(crate) use self::journal::{JournalState, OperationJournal, recover_interrupted_operations};
+pub(crate) use self::lock::CoordinationGuard;
+
 /// Current schema version for `.agents/skillctl.yaml`.
 pub const CURRENT_MANIFEST_VERSION: u32 = 1;
 /// Current schema version for `.agents/skillctl.lock`.
-pub const CURRENT_LOCKFILE_VERSION: u32 = 1;
+pub const CURRENT_LOCKFILE_VERSION: u32 = 2;
 /// Current schema version for `~/.skillctl/state.db`.
-pub const CURRENT_LOCAL_STATE_VERSION: u32 = 2;
+pub const CURRENT_LOCAL_STATE_VERSION: u32 = 6;
 
 /// Default directory created under the home directory for local state.
 pub const DEFAULT_LOCAL_STATE_DIR: &str = ".skillctl";
@@ -42,13 +53,30 @@ pub const DEFAULT_LOCAL_STATE_DATABASE_FILE: &str = "state.db";
 pub const MANIFEST_SCHEMA_POLICY: SchemaVersionPolicy =
     SchemaVersionPolicy::new(CURRENT_MANIFEST_VERSION, CURRENT_MANIFEST_VERSION);
 /// Version policy for workspace lockfiles.
+///
+/// Lockfiles written as version 1 remain loadable through the compatibility
+/// loader in `src/lockfile.rs`. They are upgraded in memory and written back as
+/// the current version by the next command that persists the lockfile.
 pub const LOCKFILE_SCHEMA_POLICY: SchemaVersionPolicy =
-    SchemaVersionPolicy::new(CURRENT_LOCKFILE_VERSION, CURRENT_LOCKFILE_VERSION);
+    SchemaVersionPolicy::new(CURRENT_LOCKFILE_VERSION, 1);
 /// Version policy for the local state store.
 pub const LOCAL_STATE_SCHEMA_POLICY: SchemaVersionPolicy =
     SchemaVersionPolicy::new(CURRENT_LOCAL_STATE_VERSION, 1);
 
 const GLOBAL_WORKSPACE_KEY: &str = "__global__";
+
+/// Environment variable that overrides the SQLite busy timeout of state
+/// connections.
+const STATE_BUSY_TIMEOUT_ENV: &str = "SKILLCTL_STATE_BUSY_TIMEOUT_MS";
+/// Default time one state connection waits for a competing SQLite lock.
+///
+/// Read commands such as `list` and `history` open the store without the
+/// coordination lock, so they depend on this wait while another process
+/// commits. `rusqlite` sets five seconds by default, and a starved writer under
+/// CPU saturation held its commit longer than that, so the read failed with
+/// `database is locked`. Sixty seconds covers the worst observed commit under
+/// load with headroom. See notes/state-lock-test-timing.md.
+const DEFAULT_STATE_BUSY_TIMEOUT: Duration = Duration::from_secs(60);
 
 const REQUIRED_TABLES: &[&str] = &[
     "history_events",
@@ -57,8 +85,241 @@ const REQUIRED_TABLES: &[&str] = &[
     "pins",
     "projection_records",
     "rollback_records",
+    "skill_reviews",
     "telemetry_settings",
     "update_checks",
+];
+
+/// Mapping between one schema-v1 table and its current counterpart.
+pub(crate) struct LegacyTableMigration {
+    /// Name of the schema-v1 table after the rename step.
+    pub legacy: &'static str,
+    /// Name of the current table.
+    pub current: &'static str,
+    /// Current-table columns the legacy projection produces, in order.
+    pub current_columns: &'static [&'static str],
+    /// One expression per current column, evaluated over the legacy table.
+    ///
+    /// Most expressions repeat the column name. The `workspace_key` column
+    /// derives its value from the legacy scope, so its expression is a `CASE`
+    /// bound to the `?1` workspace key and the `?2` global key.
+    pub legacy_expressions: &'static [&'static str],
+    /// Columns that identify one row of the current table.
+    pub identity_columns: &'static [&'static str],
+}
+
+/// Expression that derives a workspace key from the legacy scope column.
+const WORKSPACE_KEY_EXPRESSION: &str = "CASE WHEN scope = 'workspace' THEN ?1 ELSE ?2 END";
+
+/// Row mappings used by the schema-v1 to schema-v2 migration.
+pub(crate) const LEGACY_TABLE_MIGRATIONS: &[LegacyTableMigration] = &[
+    LegacyTableMigration {
+        legacy: "install_records_v1",
+        current: "install_records",
+        current_columns: &[
+            "scope",
+            "workspace_key",
+            "skill_id",
+            "source_kind",
+            "source_url",
+            "source_subpath",
+            "resolved_revision",
+            "upstream_revision",
+            "content_hash",
+            "overlay_hash",
+            "effective_version_hash",
+            "installed_at",
+            "updated_at",
+            "detached",
+            "forked",
+        ],
+        legacy_expressions: &[
+            "scope",
+            WORKSPACE_KEY_EXPRESSION,
+            "skill_id",
+            "source_kind",
+            "source_url",
+            "source_subpath",
+            "resolved_revision",
+            "upstream_revision",
+            "content_hash",
+            "overlay_hash",
+            "effective_version_hash",
+            "installed_at",
+            "updated_at",
+            "detached",
+            "forked",
+        ],
+        identity_columns: &["scope", "workspace_key", "skill_id"],
+    },
+    LegacyTableMigration {
+        legacy: "projection_records_v1",
+        current: "projection_records",
+        current_columns: &[
+            "scope",
+            "workspace_key",
+            "skill_id",
+            "target",
+            "generation_mode",
+            "physical_root",
+            "projected_path",
+            "effective_version_hash",
+            "generated_at",
+        ],
+        legacy_expressions: &[
+            "scope",
+            WORKSPACE_KEY_EXPRESSION,
+            "skill_id",
+            "target",
+            "generation_mode",
+            "physical_root",
+            "projected_path",
+            "effective_version_hash",
+            "generated_at",
+        ],
+        identity_columns: &[
+            "scope",
+            "workspace_key",
+            "skill_id",
+            "target",
+            "physical_root",
+        ],
+    },
+    LegacyTableMigration {
+        legacy: "update_checks_v1",
+        current: "update_checks",
+        current_columns: &[
+            "scope",
+            "workspace_key",
+            "skill_id",
+            "checked_at",
+            "pinned_revision",
+            "latest_revision",
+            "outcome",
+            "overlay_detected",
+            "local_modification_detected",
+            "notes",
+        ],
+        legacy_expressions: &[
+            "scope",
+            WORKSPACE_KEY_EXPRESSION,
+            "skill_id",
+            "checked_at",
+            "pinned_revision",
+            "latest_revision",
+            "outcome",
+            "overlay_detected",
+            "local_modification_detected",
+            "notes",
+        ],
+        identity_columns: &["scope", "workspace_key", "skill_id", "checked_at"],
+    },
+    LegacyTableMigration {
+        legacy: "local_modifications_v1",
+        current: "local_modifications",
+        current_columns: &[
+            "scope",
+            "workspace_key",
+            "skill_id",
+            "detected_at",
+            "kind",
+            "path",
+            "details",
+        ],
+        legacy_expressions: &[
+            "scope",
+            WORKSPACE_KEY_EXPRESSION,
+            "skill_id",
+            "detected_at",
+            "kind",
+            "path",
+            "details",
+        ],
+        identity_columns: &[
+            "scope",
+            "workspace_key",
+            "skill_id",
+            "detected_at",
+            "kind",
+            "path",
+        ],
+    },
+    LegacyTableMigration {
+        legacy: "pins_v1",
+        current: "pins",
+        current_columns: &[
+            "scope",
+            "workspace_key",
+            "skill_id",
+            "requested_reference",
+            "resolved_revision",
+            "effective_version_hash",
+            "pinned_at",
+        ],
+        legacy_expressions: &[
+            "scope",
+            WORKSPACE_KEY_EXPRESSION,
+            "skill_id",
+            "requested_reference",
+            "resolved_revision",
+            "effective_version_hash",
+            "pinned_at",
+        ],
+        identity_columns: &["scope", "workspace_key", "skill_id"],
+    },
+    LegacyTableMigration {
+        legacy: "rollback_records_v1",
+        current: "rollback_records",
+        current_columns: &[
+            "scope",
+            "workspace_key",
+            "skill_id",
+            "rolled_back_at",
+            "from_reference",
+            "to_reference",
+        ],
+        legacy_expressions: &[
+            "scope",
+            WORKSPACE_KEY_EXPRESSION,
+            "skill_id",
+            "rolled_back_at",
+            "from_reference",
+            "to_reference",
+        ],
+        identity_columns: &[
+            "scope",
+            "workspace_key",
+            "skill_id",
+            "rolled_back_at",
+            "from_reference",
+            "to_reference",
+        ],
+    },
+    LegacyTableMigration {
+        legacy: "history_events_v1",
+        current: "history_events",
+        current_columns: &[
+            "workspace_key",
+            "kind",
+            "scope",
+            "skill_id",
+            "target",
+            "occurred_at",
+            "summary",
+            "details_json",
+        ],
+        legacy_expressions: &[
+            WORKSPACE_KEY_EXPRESSION,
+            "kind",
+            "scope",
+            "skill_id",
+            "target",
+            "occurred_at",
+            "summary",
+            "details_json",
+        ],
+        identity_columns: &["workspace_key", "kind", "scope", "skill_id", "occurred_at"],
+    },
 ];
 
 /// Declarative schema version policy for a state-bearing document.
@@ -130,7 +391,7 @@ pub enum VersionDisposition {
 }
 
 /// Managed skill scope recorded in local state.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ManagedScope {
     /// Workspace-local ownership.
@@ -183,6 +444,9 @@ pub enum UpdateCheckOutcome {
     Detached,
     /// The source is local-only and does not support upstream checks.
     LocalSource,
+    /// The import is pinned to an immutable commit, which names no upstream
+    /// ref an update check could observe.
+    CommitPinned,
     /// An upstream check failed.
     Failed,
 }
@@ -196,7 +460,53 @@ impl UpdateCheckOutcome {
             Self::Blocked => "blocked",
             Self::Detached => "detached",
             Self::LocalSource => "local-source",
+            Self::CommitPinned => "commit-pinned",
             Self::Failed => "failed",
+        }
+    }
+
+    /// Parse the stable persisted identifier.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "up-to-date" => Some(Self::UpToDate),
+            "update-available" => Some(Self::UpdateAvailable),
+            "blocked" => Some(Self::Blocked),
+            "detached" => Some(Self::Detached),
+            "local-source" => Some(Self::LocalSource),
+            "commit-pinned" => Some(Self::CommitPinned),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// Why one update check held back the apply of the update it observed.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UpdateCheckBlockReason {
+    /// The installed import holds a top-level `scripts/` tree no recorded
+    /// review covers.
+    InstalledScripts,
+    /// The revision waiting upstream adds a top-level `scripts/` tree no
+    /// recorded review covers.
+    IncomingScripts,
+}
+
+impl UpdateCheckBlockReason {
+    /// Return the stable persisted identifier.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InstalledScripts => "installed-scripts",
+            Self::IncomingScripts => "incoming-scripts",
+        }
+    }
+
+    /// Parse the stable persisted identifier.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "installed-scripts" => Some(Self::InstalledScripts),
+            "incoming-scripts" => Some(Self::IncomingScripts),
+            _ => None,
         }
     }
 }
@@ -248,7 +558,7 @@ impl TelemetryConsent {
 }
 
 /// Strongly typed reference to a managed skill in one scope.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ManagedSkillRef {
     /// Owning scope for the managed skill.
     pub scope: ManagedScope,
@@ -338,9 +648,78 @@ pub struct UpdateCheckRecord {
     pub overlay_detected: bool,
     /// Whether unmanaged local changes were detected during the check.
     pub local_modification_detected: bool,
+    /// Why the check's trust gate held back the apply of the update it observed.
+    ///
+    /// The row is the only place the check's look at the upstream tree
+    /// survives, because no later reader can see the revision it saw. The
+    /// reason describes what the check observed, so a review recorded after
+    /// the check can still license the move it held back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apply_blocked_by: Option<UpdateCheckBlockReason>,
     /// Optional explanatory note captured with the check.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+}
+
+impl UpdateCheckRecord {
+    /// Fit one recorded check to the revision an install now holds.
+    ///
+    /// A check observes one moment: it compared the upstream it saw with the
+    /// revision pinned then, and the store keeps that observation. A later
+    /// apply, `pin`, or `rollback` can move the import onto the very revision
+    /// the check named, which leaves the row claiming an update that no longer
+    /// waits. The mirror move leaves the import on a revision the check never
+    /// certified, which strands an `up-to-date` certification on a revision the
+    /// install left. Surfaces that report current state, such as `skillctl
+    /// list` and the dashboard, carry this fitted view instead of replaying the
+    /// row, so neither direction can contradict the install line. Checks that
+    /// still describe the installed revision pass through unchanged.
+    pub fn fitted_to(mut self, install: &InstallRecord) -> Self {
+        let Some(latest) = self.latest_revision.clone() else {
+            // A check that observed no upstream revision cannot name one that
+            // arrived or one that waits again.
+            return self;
+        };
+        let install_holds_latest = latest == install.resolved_revision;
+        let claims_waiting_update = matches!(
+            self.outcome,
+            UpdateCheckOutcome::UpdateAvailable | UpdateCheckOutcome::Blocked
+        );
+        if install_holds_latest && claims_waiting_update {
+            self.outcome = UpdateCheckOutcome::UpToDate;
+            self.pinned_revision = install.resolved_revision.clone();
+            // The revision the gate held back is the revision the install now holds,
+            // so the block no longer describes anything an apply could move to.
+            self.apply_blocked_by = None;
+            self.notes = Some(format!(
+                "recorded check named {} as the newest upstream revision; the install already holds it",
+                install.resolved_revision
+            ));
+            return self;
+        }
+
+        // The mirror case: the row certified its pinned revision as current,
+        // but the install no longer holds that revision, because a `rollback`
+        // or a `pin` moved it after the check ran. The certification no longer
+        // covers the installed revision, while the row stays the only record
+        // of what upstream held. That record names a revision the install does
+        // not hold, so it waits again instead of the install reading as up to
+        // date for a revision it no longer holds.
+        if self.outcome == UpdateCheckOutcome::UpToDate
+            && self.pinned_revision != install.resolved_revision
+            && !install_holds_latest
+        {
+            self.outcome = UpdateCheckOutcome::UpdateAvailable;
+            self.pinned_revision = install.resolved_revision.clone();
+            self.notes = Some(format!(
+                "recorded check named {latest} as the newest upstream revision; \
+                 the install holds {} instead",
+                install.resolved_revision
+            ));
+        }
+
+        self
+    }
 }
 
 /// One detected local modification relevant to lifecycle decisions.
@@ -361,6 +740,49 @@ pub struct LocalModificationRecord {
     /// Optional explanatory detail.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<String>,
+}
+
+/// Outcome of one recorded local review decision.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewDecision {
+    /// The reviewed content is accepted.
+    Approved,
+    /// A previously recorded approval was withdrawn.
+    Revoked,
+}
+
+impl ReviewDecision {
+    /// Return the stable persisted identifier.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::Revoked => "revoked",
+        }
+    }
+}
+
+/// Current local review decision for one managed imported skill.
+///
+/// A decision covers exactly one effective version hash, so it stops counting
+/// as soon as the import moves to different content.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TrustReviewRecord {
+    /// Managed skill identity.
+    pub skill: ManagedSkillRef,
+    /// Recorded decision.
+    pub decision: ReviewDecision,
+    /// Revision that was current when the decision was recorded.
+    pub resolved_revision: String,
+    /// Effective version hash the decision covers.
+    pub effective_version_hash: String,
+    /// Whether the reviewed content holds a top-level `scripts/` directory.
+    pub contains_scripts: bool,
+    /// Timestamp of the decision.
+    pub reviewed_at: String,
+    /// Optional reviewer note.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// Current active pin for one managed skill.
@@ -515,6 +937,9 @@ impl LocalStateStore {
     }
 
     /// Open or create a store at an explicit database path for one workspace.
+    ///
+    /// Opening coordinates with other processes because bootstrapping may
+    /// create or migrate the shared database.
     pub fn open_at_for(
         path: impl Into<PathBuf>,
         working_directory: &Path,
@@ -530,11 +955,18 @@ impl LocalStateStore {
             })?;
         }
 
-        let connection = Connection::open(&path).map_err(|source| AppError::LocalStateOpen {
-            path: path.clone(),
-            source,
-        })?;
-        bootstrap_connection(&connection, &path, &workspace_key)?;
+        let mut connection =
+            Connection::open(&path).map_err(|source| AppError::LocalStateOpen {
+                path: path.clone(),
+                source,
+            })?;
+        configure_connection(&connection, &path)?;
+        {
+            let _guard = self::lock::acquire(&path, "bootstrap local state")?;
+            if let Err(error) = bootstrap_connection(&mut connection, &path, &workspace_key) {
+                return Err(unreadable_state_database(&path, error));
+            }
+        }
 
         Ok(Self {
             path,
@@ -554,12 +986,13 @@ impl LocalStateStore {
     pub fn open_in_memory_for(working_directory: &Path) -> Result<Self, AppError> {
         let path = PathBuf::from(":memory:");
         let workspace_key = workspace_key_for_path(working_directory)?;
-        let connection =
+        let mut connection =
             Connection::open_in_memory().map_err(|source| AppError::LocalStateOpen {
                 path: path.clone(),
                 source,
             })?;
-        bootstrap_connection(&connection, &path, &workspace_key)?;
+        configure_connection(&connection, &path)?;
+        bootstrap_connection(&mut connection, &path, &workspace_key)?;
 
         Ok(Self {
             path,
@@ -590,6 +1023,15 @@ impl LocalStateStore {
             Some(ManagedScope::Workspace) => self.workspace_key.as_str(),
             Some(ManagedScope::User) | None => GLOBAL_WORKSPACE_KEY,
         }
+    }
+
+    /// Acquire the coordination lock that guards this store.
+    ///
+    /// In-memory stores have no shared state and coordinate nothing. Acquiring
+    /// the lock again inside one process, for example from a lifecycle
+    /// transaction that already holds it, returns immediately.
+    fn coordinate(&self, purpose: &'static str) -> Result<lock::CoordinationGuard, AppError> {
+        lock::acquire(&self.path, purpose)
     }
 
     /// List every current install record in stable scope and skill order.
@@ -699,12 +1141,103 @@ impl LocalStateStore {
 
     /// Insert or update the current install record for a managed skill.
     pub fn upsert_install_record(&mut self, record: &InstallRecord) -> Result<(), AppError> {
+        let _guard = self.coordinate("write install record")?;
         upsert_install_record_in(
             &self.connection,
             &self.path,
             self.workspace_key_for_scope(record.skill.scope),
             record,
         )
+    }
+
+    /// List every recorded review decision visible to this workspace.
+    pub fn trust_reviews(&self) -> Result<Vec<TrustReviewRecord>, AppError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT workspace_key, scope, skill_id, decision, resolved_revision, \
+                 effective_version_hash, contains_scripts, reviewed_at, note FROM skill_reviews \
+                 WHERE (scope = 'workspace' AND workspace_key = ?1) \
+                    OR (scope = 'user' AND workspace_key = ?2) \
+                 ORDER BY CASE scope WHEN 'workspace' THEN 0 ELSE 1 END, skill_id",
+            )
+            .map_err(|source| {
+                local_state_query(&self.path, "prepare trust review query", source)
+            })?;
+
+        let rows = statement
+            .query_map(
+                params![self.workspace_key.as_str(), GLOBAL_WORKSPACE_KEY],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                    ))
+                },
+            )
+            .map_err(|source| local_state_query(&self.path, "query trust reviews", source))?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let row =
+                row.map_err(|source| local_state_query(&self.path, "read trust review", source))?;
+            records.push(decode_trust_review_record(&self.path, row)?);
+        }
+
+        Ok(records)
+    }
+
+    /// Load the recorded review decision for one managed skill.
+    pub fn trust_review(
+        &self,
+        skill: &ManagedSkillRef,
+    ) -> Result<Option<TrustReviewRecord>, AppError> {
+        validate_skill_ref(&self.path, skill)?;
+
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT workspace_key, scope, skill_id, decision, resolved_revision, \
+                 effective_version_hash, contains_scripts, reviewed_at, note FROM skill_reviews \
+                 WHERE scope = ?1 AND workspace_key = ?2 AND skill_id = ?3",
+            )
+            .map_err(|source| {
+                local_state_query(&self.path, "prepare trust review query", source)
+            })?;
+
+        let row = statement
+            .query_row(
+                params![
+                    skill.scope.as_str(),
+                    self.workspace_key_for_scope(skill.scope),
+                    skill.skill_id
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|source| local_state_query(&self.path, "load trust review", source))?;
+
+        row.map(|record| decode_trust_review_record(&self.path, record))
+            .transpose()
     }
 
     /// List projection records, optionally filtered to one managed skill.
@@ -805,6 +1338,7 @@ impl LocalStateStore {
 
     /// Insert or update the current projection record for a managed skill.
     pub fn upsert_projection_record(&mut self, record: &ProjectionRecord) -> Result<(), AppError> {
+        let _guard = self.coordinate("write projection record")?;
         upsert_projection_record_in(
             &self.connection,
             &self.path,
@@ -820,6 +1354,7 @@ impl LocalStateStore {
         records: &[ProjectionRecord],
     ) -> Result<(), AppError> {
         let workspace_key = self.workspace_key_for_scope(scope).to_string();
+        let _guard = self.coordinate("replace projection records")?;
         self.with_transaction("replace projection records", |connection, path| {
             connection
                 .execute(
@@ -856,14 +1391,16 @@ impl LocalStateStore {
     ) -> Result<Vec<UpdateCheckRecord>, AppError> {
         let sql_all = concat!(
             "SELECT id, workspace_key, scope, skill_id, checked_at, pinned_revision, latest_revision, ",
-            "outcome, overlay_detected, local_modification_detected, notes FROM update_checks ",
+            "outcome, overlay_detected, local_modification_detected, apply_blocked_by, notes ",
+            "FROM update_checks ",
             "WHERE (scope = 'workspace' AND workspace_key = ?1) ",
             "   OR (scope = 'user' AND workspace_key = ?2) ",
             "ORDER BY checked_at DESC, id DESC"
         );
         let sql_filtered = concat!(
             "SELECT id, workspace_key, scope, skill_id, checked_at, pinned_revision, latest_revision, ",
-            "outcome, overlay_detected, local_modification_detected, notes FROM update_checks ",
+            "outcome, overlay_detected, local_modification_detected, apply_blocked_by, notes ",
+            "FROM update_checks ",
             "WHERE scope = ?1 AND workspace_key = ?2 AND skill_id = ?3 ORDER BY checked_at DESC, id DESC"
         );
 
@@ -901,6 +1438,7 @@ impl LocalStateStore {
                             row.get::<_, i64>(8)?,
                             row.get::<_, i64>(9)?,
                             row.get::<_, Option<String>>(10)?,
+                            row.get::<_, Option<String>>(11)?,
                         ))
                     },
                 )
@@ -928,6 +1466,7 @@ impl LocalStateStore {
                             row.get::<_, i64>(8)?,
                             row.get::<_, i64>(9)?,
                             row.get::<_, Option<String>>(10)?,
+                            row.get::<_, Option<String>>(11)?,
                         ))
                     },
                 )
@@ -954,7 +1493,7 @@ impl LocalStateStore {
             .connection
             .prepare(
                 "SELECT id, workspace_key, scope, skill_id, checked_at, pinned_revision, latest_revision, \
-                 outcome, overlay_detected, local_modification_detected, notes \
+                 outcome, overlay_detected, local_modification_detected, apply_blocked_by, notes \
                  FROM update_checks WHERE scope = ?1 AND workspace_key = ?2 AND skill_id = ?3 \
                  ORDER BY checked_at DESC, id DESC LIMIT 1",
             )
@@ -982,6 +1521,7 @@ impl LocalStateStore {
                         row.get::<_, i64>(8)?,
                         row.get::<_, i64>(9)?,
                         row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
                     ))
                 },
             )
@@ -994,6 +1534,7 @@ impl LocalStateStore {
 
     /// Insert one immutable update check row.
     pub fn record_update_check(&mut self, record: &UpdateCheckRecord) -> Result<i64, AppError> {
+        let _guard = self.coordinate("write update check record")?;
         insert_update_check_record_in(
             &self.connection,
             &self.path,
@@ -1099,6 +1640,7 @@ impl LocalStateStore {
         &mut self,
         record: &LocalModificationRecord,
     ) -> Result<i64, AppError> {
+        let _guard = self.coordinate("write local modification record")?;
         insert_local_modification_record_in(
             &self.connection,
             &self.path,
@@ -1147,6 +1689,7 @@ impl LocalStateStore {
 
     /// Insert or update the current pin for a managed skill.
     pub fn upsert_pin_record(&mut self, record: &PinRecord) -> Result<(), AppError> {
+        let _guard = self.coordinate("write pin record")?;
         upsert_pin_record_in(
             &self.connection,
             &self.path,
@@ -1159,6 +1702,7 @@ impl LocalStateStore {
     pub fn delete_current_skill_state(&mut self, skill: &ManagedSkillRef) -> Result<(), AppError> {
         validate_skill_ref(&self.path, skill)?;
         let workspace_key = self.workspace_key_for_scope(skill.scope).to_string();
+        let _guard = self.coordinate("delete current skill state")?;
 
         self.with_transaction("delete current skill state", |connection, path| {
             connection
@@ -1175,6 +1719,15 @@ impl LocalStateStore {
                     params![skill.scope.as_str(), workspace_key.as_str(), skill.skill_id],
                 )
                 .map_err(|source| local_state_query(path, "delete pin record", source))?;
+            // The recorded review covers one install's content, so it leaves
+            // with that install. The history entry stays as the audit trail.
+            connection
+                .execute(
+                    "DELETE FROM skill_reviews WHERE scope = ?1 AND workspace_key = ?2 AND \
+                     skill_id = ?3",
+                    params![skill.scope.as_str(), workspace_key.as_str(), skill.skill_id],
+                )
+                .map_err(|source| local_state_query(path, "delete trust review", source))?;
             connection
                 .execute(
                     "DELETE FROM install_records WHERE scope = ?1 AND workspace_key = ?2 AND skill_id = ?3",
@@ -1278,6 +1831,7 @@ impl LocalStateStore {
 
     /// Insert one immutable rollback record.
     pub fn record_rollback(&mut self, record: &RollbackRecord) -> Result<i64, AppError> {
+        let _guard = self.coordinate("write rollback record")?;
         insert_rollback_record_in(
             &self.connection,
             &self.path,
@@ -1318,16 +1872,19 @@ impl LocalStateStore {
         &mut self,
         settings: &TelemetrySettings,
     ) -> Result<(), AppError> {
+        let _guard = self.coordinate("write telemetry settings")?;
         upsert_telemetry_settings_in(&self.connection, &self.path, settings)
     }
 
     /// Append one immutable history entry to the local ledger.
     pub fn append_history_entry(&mut self, entry: &HistoryEntry) -> Result<i64, AppError> {
+        let _guard = self.coordinate("write history entry")?;
         insert_history_entry_in(&self.connection, &self.path, &self.workspace_key, entry)
     }
 
     /// Remove every current projection record across all scopes.
     pub fn clear_projection_records(&mut self) -> Result<(), AppError> {
+        let _guard = self.coordinate("delete projection records")?;
         self.connection
             .execute(
                 "DELETE FROM projection_records WHERE (scope = 'workspace' AND workspace_key = ?1) \
@@ -1463,6 +2020,67 @@ impl LocalStateStore {
     }
 }
 
+/// Rewrite a store failure caused by an unreadable database file.
+///
+/// SQLite reports a corrupt or foreign file as `file is not a database` or a
+/// malformed disk image. Those failures have one documented recovery, so they
+/// carry the actionable message instead of the raw SQLite text.
+fn unreadable_state_database(path: &Path, error: AppError) -> AppError {
+    let (AppError::LocalStateOpen {
+        source: sqlite_error,
+        ..
+    }
+    | AppError::LocalStateQuery {
+        source: sqlite_error,
+        ..
+    }) = &error
+    else {
+        return error;
+    };
+
+    if schema::is_unreadable_database_error(sqlite_error) {
+        AppError::LocalStateDatabaseUnreadable {
+            path: path.to_path_buf(),
+            reason: sqlite_error.to_string(),
+        }
+    } else {
+        error
+    }
+}
+
+/// Apply the connection settings every state connection shares.
+///
+/// The busy timeout is the one wait that keeps uncoordinated connections
+/// working while a coordinated writer commits. It covers readers such as
+/// `list` and `history`, which take no coordination lock, and writers blocked
+/// by an external reader that holds a shared lock.
+pub(crate) fn configure_connection(connection: &Connection, path: &Path) -> Result<(), AppError> {
+    connection
+        .busy_timeout(state_busy_timeout())
+        .map_err(|source| AppError::LocalStateQuery {
+            path: path.to_path_buf(),
+            operation: "set state busy timeout",
+            source,
+        })
+}
+
+/// Resolve the configured SQLite busy timeout for state connections.
+fn state_busy_timeout() -> Duration {
+    state_busy_timeout_from_env(env::var(STATE_BUSY_TIMEOUT_ENV).ok().as_deref())
+}
+
+/// Resolve one `SKILLCTL_STATE_BUSY_TIMEOUT_MS` value.
+///
+/// A missing or invalid value falls back to the default, matching how the
+/// coordination lock treats `SKILLCTL_LOCK_TIMEOUT_MS`.
+fn state_busy_timeout_from_env(value: Option<&str>) -> Duration {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map_or(DEFAULT_STATE_BUSY_TIMEOUT, |milliseconds| {
+            Duration::from_millis(milliseconds.max(1))
+        })
+}
+
 /// Derive the stable workspace namespace key used for workspace-scoped state.
 pub fn workspace_key_for_path(path: &Path) -> Result<String, AppError> {
     let canonical = fs::canonicalize(path).map_err(|source| AppError::FilesystemOperation {
@@ -1485,6 +2103,27 @@ pub fn default_state_root() -> Result<PathBuf, AppError> {
 /// Resolve the default `~/.skillctl/state.db` path.
 pub fn default_state_database_path() -> Result<PathBuf, AppError> {
     Ok(default_state_root()?.join(DEFAULT_LOCAL_STATE_DATABASE_FILE))
+}
+
+/// Acquire the coordination lock that guards one optional state database.
+///
+/// A missing database path coordinates nothing.
+pub(crate) fn acquire_coordination_lock(
+    database_path: Option<&Path>,
+    purpose: &'static str,
+) -> Result<CoordinationGuard, AppError> {
+    lock::acquire(
+        database_path.unwrap_or_else(|| Path::new(":memory:")),
+        purpose,
+    )
+}
+
+/// Resolve the root that holds lifecycle journals for the default store.
+///
+/// A missing home directory falls back to a temporary root so lifecycle
+/// operations still journal their work instead of running unrecorded.
+pub fn default_journal_root() -> PathBuf {
+    default_state_root().unwrap_or_else(|_| env::temp_dir().join("skillctl-journal"))
 }
 
 pub(crate) fn upsert_install_record_in(
@@ -1580,8 +2219,9 @@ pub(crate) fn insert_update_check_record_in(
     connection
         .execute(
             "INSERT INTO update_checks (scope, workspace_key, skill_id, checked_at, pinned_revision, \
-             latest_revision, outcome, overlay_detected, local_modification_detected, notes) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             latest_revision, outcome, overlay_detected, local_modification_detected, \
+             apply_blocked_by, notes) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 record.skill.scope.as_str(),
                 workspace_key,
@@ -1592,6 +2232,7 @@ pub(crate) fn insert_update_check_record_in(
                 record.outcome.as_str(),
                 bool_to_int(record.overlay_detected),
                 bool_to_int(record.local_modification_detected),
+                record.apply_blocked_by.map(UpdateCheckBlockReason::as_str),
                 record.notes,
             ],
         )
@@ -1653,6 +2294,42 @@ pub(crate) fn upsert_pin_record_in(
             ],
         )
         .map_err(|source| local_state_query(path, "write pin record", source))?;
+
+    Ok(())
+}
+
+pub(crate) fn upsert_trust_review_in(
+    connection: &Connection,
+    path: &Path,
+    workspace_key: &str,
+    record: &TrustReviewRecord,
+) -> Result<(), AppError> {
+    validate_trust_review_record(path, record)?;
+    connection
+        .execute(
+            "INSERT INTO skill_reviews (scope, workspace_key, skill_id, decision, \
+             resolved_revision, effective_version_hash, contains_scripts, reviewed_at, note) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+             ON CONFLICT(scope, workspace_key, skill_id) DO UPDATE SET \
+             decision = excluded.decision, \
+             resolved_revision = excluded.resolved_revision, \
+             effective_version_hash = excluded.effective_version_hash, \
+             contains_scripts = excluded.contains_scripts, \
+             reviewed_at = excluded.reviewed_at, \
+             note = excluded.note",
+            params![
+                record.skill.scope.as_str(),
+                workspace_key,
+                record.skill.skill_id,
+                record.decision.as_str(),
+                record.resolved_revision,
+                record.effective_version_hash,
+                bool_to_int(record.contains_scripts),
+                record.reviewed_at,
+                record.note,
+            ],
+        )
+        .map_err(|source| local_state_query(path, "write trust review", source))?;
 
     Ok(())
 }
@@ -1739,11 +2416,362 @@ pub(crate) fn insert_history_entry_in(
     Ok(connection.last_insert_rowid())
 }
 
+/// Preview of one journal that never reached a terminal state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PendingOperationView {
+    /// Journal identifier.
+    pub id: String,
+    /// Lifecycle operation that created the journal.
+    pub operation: String,
+    /// Journal state: `active` or `needs-review`.
+    pub state: String,
+    /// Absolute workspace path recorded when the journal was created.
+    pub workspace_path: String,
+    /// Process identifier that created the journal.
+    pub pid: u32,
+    /// Creation timestamp.
+    pub started_at: String,
+    /// Journal boundaries reached before the process stopped.
+    pub steps: Vec<String>,
+    /// Paths the journal can restore.
+    pub tracked_paths: Vec<String>,
+}
+
+/// Preview of one legacy table that still exists beside the current schema.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LegacyTableView {
+    /// Legacy table name.
+    pub legacy: String,
+    /// Current table name.
+    pub current: String,
+    /// Rows held by the legacy table.
+    pub legacy_rows: i64,
+    /// Rows held by the current table.
+    pub current_rows: i64,
+    /// `copy-and-drop`, `drop-only`, or `ambiguous`.
+    pub action: String,
+    /// Why the table cannot be recovered automatically, when it cannot.
+    pub detail: String,
+}
+
+/// Result of inspecting or repairing recoverable local state.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct StateRecoveryReport {
+    /// Schema version of the state database, `0` when it does not exist.
+    pub schema_version: u32,
+    /// Whether the state database file exists.
+    pub state_database_exists: bool,
+    /// Why SQLite cannot read the state database, when it cannot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_database_unreadable: Option<String>,
+    /// Journals that never reached a terminal state.
+    pub pending_operations: Vec<PendingOperationView>,
+    /// Legacy tables that still exist beside the current schema.
+    pub legacy_tables: Vec<LegacyTableView>,
+    /// Retained state database backups.
+    pub migration_backups: Vec<String>,
+    /// Repairs that were applied.
+    pub repairs: Vec<String>,
+    /// Findings that need a human decision.
+    pub unresolved: Vec<String>,
+}
+
+impl StateRecoveryReport {
+    /// Whether anything was found that a repair could act on or report.
+    pub fn has_findings(&self) -> bool {
+        self.state_database_unreadable.is_some()
+            || !self.pending_operations.is_empty()
+            || !self.legacy_tables.is_empty()
+    }
+}
+
+/// Inspect recoverable local state without changing anything.
+pub fn inspect_state_recovery(working_directory: &Path) -> Result<StateRecoveryReport, AppError> {
+    build_recovery_report(working_directory, StateRecoveryReport::default(), false)
+}
+
+/// Preview or apply local state recovery.
+///
+/// With `apply` set, the report describes the repairs that were performed.
+/// Repairs only act where row ownership and reconciliation are unambiguous;
+/// every other finding is reported in `unresolved`.
+pub fn repair_state(
+    working_directory: &Path,
+    apply: bool,
+) -> Result<StateRecoveryReport, AppError> {
+    if !apply {
+        return inspect_state_recovery(working_directory);
+    }
+
+    let mut report = StateRecoveryReport::default();
+    let database_path = default_state_database_path()?;
+    let state_root = default_state_root()?;
+
+    // An unreadable database is moved aside before journal recovery. A journal
+    // that carries a database snapshot can then restore its rows into the
+    // rebuilt store, while recovering first would fail on the corrupt file and
+    // leave the journal, and its snapshot, stranded in `needs-review`.
+    if let schema::DatabaseHealth::Unreadable { reason } = schema::database_health(&database_path) {
+        report.state_database_unreadable = Some(reason);
+        quarantine_unreadable_state_database(&database_path, working_directory, &mut report)?;
+    }
+
+    // Restore interrupted operations so later schema work sees the state those
+    // operations started from.
+    {
+        let _guard = lock::acquire(&database_path, "recover local state")?;
+        for outcome in journal::recover_pending_operations(&state_root)? {
+            match outcome {
+                RecoveryOutcome::Recovered(operation) => report.repairs.push(format!(
+                    "restored the pre-operation state of interrupted '{}' (journal {})",
+                    operation.operation, operation.id
+                )),
+                RecoveryOutcome::NeedsReview { id, reason } => {
+                    report.unresolved.push(format!(
+                        "journal {id} could not be restored automatically: {reason}"
+                    ));
+                }
+                RecoveryOutcome::Unreadable { directory, reason } => {
+                    report.unresolved.push(format!(
+                        "journal {} is unreadable: {reason}",
+                        directory.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    build_recovery_report(working_directory, report, true)
+}
+
+fn build_recovery_report(
+    working_directory: &Path,
+    mut report: StateRecoveryReport,
+    apply: bool,
+) -> Result<StateRecoveryReport, AppError> {
+    let database_path = default_state_database_path()?;
+    let state_root = default_state_root()?;
+    let workspace_key = workspace_key_for_path(working_directory)?;
+
+    report.state_database_exists = database_path.exists();
+    report.migration_backups = journal::migration_backups(&state_root);
+
+    report.pending_operations = journal::pending_operations(&state_root)?
+        .into_iter()
+        .map(|operation| PendingOperationView {
+            id: operation.id,
+            operation: operation.operation,
+            state: operation.state,
+            workspace_path: operation.workspace_path,
+            pid: operation.pid,
+            started_at: operation.started_at,
+            steps: operation.steps,
+            tracked_paths: operation.tracked_paths,
+        })
+        .collect();
+
+    if report.state_database_exists {
+        // A file that is not a readable database has one recovery: move it
+        // aside and let the next command rebuild local state. It is reported
+        // as its own finding instead of failing the inspection, so the
+        // recovery entry point still answers.
+        let health = schema::database_health(&database_path);
+        if let schema::DatabaseHealth::Unreadable { reason } = &health {
+            report.state_database_unreadable = Some(reason.clone());
+        }
+
+        match health {
+            schema::DatabaseHealth::Unreadable { .. } => {
+                if apply {
+                    quarantine_unreadable_state_database(
+                        &database_path,
+                        working_directory,
+                        &mut report,
+                    )?;
+                }
+            }
+            schema::DatabaseHealth::Missing => {}
+            schema::DatabaseHealth::Readable => {
+                inspect_and_repair_database(
+                    &database_path,
+                    &workspace_key,
+                    working_directory,
+                    apply,
+                    &mut report,
+                )?;
+            }
+        }
+    } else if apply {
+        report
+            .repairs
+            .push("state database does not exist; the next command creates it".to_string());
+    }
+
+    report.unresolved.extend(
+        report
+            .legacy_tables
+            .iter()
+            .filter(|table| table.action == "ambiguous")
+            .map(|table| {
+                format!(
+                    "legacy table {} cannot be attributed to one workspace: {}",
+                    table.legacy, table.detail
+                )
+            }),
+    );
+
+    Ok(report)
+}
+
+/// Inspect a readable database and, with `apply`, run the ordinary repairs.
+fn inspect_and_repair_database(
+    database_path: &Path,
+    workspace_key: &str,
+    working_directory: &Path,
+    apply: bool,
+    report: &mut StateRecoveryReport,
+) -> Result<(), AppError> {
+    let inspection = schema::inspect_database(database_path, workspace_key)?;
+    report.schema_version = inspection.version;
+    for disposition in inspection.dispositions {
+        let (action, detail) = match &disposition.action {
+            LegacyTableAction::CopyAndDrop { missing, identical } => (
+                "copy-and-drop".to_string(),
+                format!("{missing} row(s) to copy, {identical} already present"),
+            ),
+            LegacyTableAction::DropOnly { identical } => (
+                "drop-only".to_string(),
+                format!("{identical} row(s) already migrated"),
+            ),
+            LegacyTableAction::Ambiguous { reason } => ("ambiguous".to_string(), reason.clone()),
+        };
+        report.legacy_tables.push(LegacyTableView {
+            legacy: disposition.legacy.to_string(),
+            current: disposition.current.to_string(),
+            legacy_rows: disposition.legacy_rows,
+            current_rows: disposition.current_rows,
+            action,
+            detail,
+        });
+    }
+
+    if apply {
+        apply_database_repairs(database_path, working_directory, report)?;
+    }
+
+    Ok(())
+}
+
+/// Move an unreadable state database aside and rebuild an empty one.
+///
+/// Nothing is deleted. The corrupt file is renamed beside the database so it
+/// stays available for inspection, and its write-ahead sidecars move with it
+/// because SQLite refuses a fresh database that still carries a stale sidecar.
+fn quarantine_unreadable_state_database(
+    database_path: &Path,
+    working_directory: &Path,
+    report: &mut StateRecoveryReport,
+) -> Result<(), AppError> {
+    let _guard = lock::acquire(database_path, "quarantine unreadable state database")?;
+    let state_root = match database_path.parent() {
+        Some(parent) => parent.to_path_buf(),
+        None => default_state_root()?,
+    };
+
+    let stamp = journal::coarse_timestamp().replace('.', "-");
+    let mut quarantined = state_root.join(format!("state.db.corrupt.{stamp}"));
+    let mut attempt = 1;
+    while quarantined.exists() {
+        attempt += 1;
+        quarantined = state_root.join(format!("state.db.corrupt.{stamp}-{attempt}"));
+    }
+
+    fs::rename(database_path, &quarantined).map_err(|source| AppError::FilesystemOperation {
+        action: "move the unreadable state database aside",
+        path: database_path.to_path_buf(),
+        source,
+    })?;
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = database_path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let sidecar = PathBuf::from(sidecar);
+        if !sidecar.exists() {
+            continue;
+        }
+        let mut moved = quarantined.as_os_str().to_os_string();
+        moved.push(suffix);
+        fs::rename(&sidecar, moved).map_err(|source| AppError::FilesystemOperation {
+            action: "move a sidecar of the unreadable state database aside",
+            path: sidecar,
+            source,
+        })?;
+    }
+
+    let store = LocalStateStore::open_at_for(database_path.to_path_buf(), working_directory)?;
+    report.schema_version = store.schema_version()?;
+    report.repairs.push(format!(
+        "moved the unreadable state database to '{}' and rebuilt an empty local state store; run \
+         'skillctl restore --frozen' to rebuild the import records from .agents/skillctl.yaml \
+         and .agents/skillctl.lock",
+        quarantined.display()
+    ));
+
+    Ok(())
+}
+
+/// Run the ordinary bootstrap path under the coordination lock.
+///
+/// This performs the same migration and stranded-state recovery as a normal
+/// store open. Failures are recorded as unresolved findings instead of
+/// aborting the report so a partially damaged database still produces guidance.
+fn apply_database_repairs(
+    database_path: &Path,
+    working_directory: &Path,
+    report: &mut StateRecoveryReport,
+) -> Result<(), AppError> {
+    let _guard = lock::acquire(database_path, "repair local state")?;
+    match LocalStateStore::open_at_for(database_path.to_path_buf(), working_directory) {
+        Ok(_) => {
+            report
+                .repairs
+                .push("verified the state database opens with the current schema".to_string());
+            report.legacy_tables.clear();
+        }
+        Err(error) => report
+            .unresolved
+            .push(format!("state database could not be opened: {error}")),
+    }
+
+    Ok(())
+}
+
 fn local_state_query(path: &Path, operation: &'static str, source: rusqlite::Error) -> AppError {
+    if schema::is_busy_timeout_error(&source) {
+        return state_busy_timeout_failure(path, operation, source);
+    }
+
     AppError::LocalStateQuery {
         path: path.to_path_buf(),
         operation,
         source,
+    }
+}
+
+/// Build the failure a connection meets when a lock outlasts the busy timeout.
+///
+/// The timeout reported here is resolved again from the environment, which is
+/// the same value `configure_connection` applied to the connection, so the
+/// message states the wait the command really used.
+fn state_busy_timeout_failure(
+    path: &Path,
+    operation: &'static str,
+    source: rusqlite::Error,
+) -> AppError {
+    AppError::LocalStateBusyTimeout {
+        path: path.to_path_buf(),
+        operation,
+        timeout_ms: state_busy_timeout().as_millis() as u64,
+        reason: source.to_string(),
     }
 }
 

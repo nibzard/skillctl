@@ -1,6 +1,6 @@
 # skillctl: product strategy and development roadmap
 
-Status: Proposed roadmap; implementation has not started under this plan
+Status: Controlling roadmap, maintainer decision 2026-11-07; the foundation packages W02–W05 are complete with evidence in section 15
 Authoring date: 2026-11-05
 Repository baseline: `f9fd697` (`0.1.0`, Rust edition 2024)
 Initial desktop platform: macOS
@@ -28,7 +28,7 @@ This document consolidates the product discussion, repository review, and curren
 
 This is a program roadmap, not permission to implement every phase immediately. Work packages define bounded deliverables and verification requirements. Before each package starts, turn its scope into a small implementation issue or plan with exact changed files and commands for any new component. Do not invent backend or desktop build commands before those projects exist.
 
-The existing `docs/plan.md` was untracked when this document was written and remains untouched. It contains useful earlier priorities. This document is the proposed controlling roadmap for the expanded team-product direction, subject to maintainer acceptance. `spec.md` and `docs/broader-product-completion-note.md` describe an earlier product slice; explicit differences are listed below rather than silently treating those documents as current commitments.
+`docs/plan.md` was untracked when this document was written; commit `736fb43` then tracked it beside this roadmap. On 2026-11-07 the maintainer accepted this document as the controlling roadmap for the expanded team-product direction. `docs/plan.md` is now a subordinate engine-history plan: its Phases 1–3 are complete with the evidence recorded in section 15, and its Phase 4 and Phase 5 dispositions are recorded in section 20. `spec.md` and `docs/broader-product-completion-note.md` describe an earlier product slice; explicit differences are listed below rather than silently treating those documents as current commitments.
 
 ### Decisions carried forward from the discussion
 
@@ -129,6 +129,8 @@ Checks run during the review:
 
 The Clippy failures included three `map_unwrap_or` violations in `src/lifecycle.rs` and `src/source.rs`, plus a diagnostic at the `thiserror` conversion in `src/error.rs`. Inspect the generated-code/toolchain interaction before selecting the smallest fix for the latter. Do not weaken project-wide lint policy just to hide the baseline failure.
 
+Update 2026-11-05: commit `81233dc` fixed all four diagnostics, so the table above records the review-time baseline only. Clippy passed again at `f5c5ba2` during the section 15 re-verification and at `396f1a5` on 2026-11-07; `docs/development.md` holds the toolchain policy and the command evidence. W02 step 4 therefore needed evidence only.
+
 ### Domain map
 
 | Existing file/module | Responsibility | Planned use |
@@ -157,7 +159,7 @@ The Clippy failures included three `map_unwrap_or` violations in `src/lifecycle.
 8. **Current trust is not organizational approval.** `src/trust.rs` classifies canonical, detached, and forked content as locally trusted. That is ownership semantics, not evidence of organizational review or safety. A fork must not bypass team approval.
 9. **Current telemetry is not usage analytics.** `src/telemetry.rs` constructs install/update event reports and sets `emitted` based on eligibility. It does not establish runtime invocation or successful completion.
 
-### Load-bearing excerpts for drift checks
+### Key excerpts for drift checks
 
 `src/resolver.rs`, current import resolution:
 
@@ -638,13 +640,13 @@ For each supported destination record tested date, documentation URLs, runtime/a
 
 Effort estimates are rough focused engineering effort, including tests and documentation, not calendar commitments. Vendor approvals, customer recruitment, security review, and account eligibility can extend elapsed time. Estimate again after the first integration and desktop spikes.
 
-| Package | Deliverable | Priority | Depends on | Rough effort | Initial status |
+| Package | Deliverable | Priority | Depends on | Rough effort | Status |
 | --- | --- | --- | --- | --- | --- |
 | W01 | Customer validation and desktop/vendor feasibility | P0 | None | 1–2 weeks | TODO |
-| W02 | Clean verification baseline and accurate diagnostics | P0 | None | 3–5 days | TODO |
-| W03 | Atomic migrations and coordinated recoverable mutations | P0 | W02 | 2–3 weeks | TODO |
-| W04 | Canonical bundles and frozen empty-cache restoration | P0 | W03 | 1–2 weeks | TODO |
-| W05 | Shared reviewed update/apply and consistent drift protection | P0 | W03, W04 | 1–2 weeks | TODO |
+| W02 | Clean verification baseline and accurate diagnostics | P0 | None | 3–5 days | Complete 2026-11-05 (T049) |
+| W03 | Atomic migrations and coordinated recoverable mutations | P0 | W02 | 2–3 weeks | Complete 2026-11-05 (T050) |
+| W04 | Canonical bundles and frozen empty-cache restoration | P0 | W03 | 1–2 weeks | Complete 2026-11-05 (T051) |
+| W05 | Shared reviewed update/apply and consistent drift protection | P0 | W03, W04 | 1–2 weeks | Complete 2026-11-05 (T052) |
 | W06 | Approval, policy, and portable contract models | P0 | W01, W04 | 1–2 weeks | TODO |
 | W07 | Private team service, tenancy, artifacts, and imports | P1 | W01, W06 | 2–4 weeks | TODO |
 | W08 | Review, release channels, audit, and incident controls | P1 | W05, W07 | 1–3 weeks | TODO |
@@ -655,6 +657,37 @@ Effort estimates are rough focused engineering effort, including tests and docum
 | W13 | Runtime observations and coverage-aware analytics | P2 | W12, validated runtime signals | 3–6 weeks | TODO |
 | W14 | Evaluation and champion-to-team learning | P2 | W12, W13, customer evidence | 4–8 weeks | TODO |
 | W15 | Windows and optional advanced deployment models | P3 | Stable v1 plus demonstrated demand | Separate estimate | TODO |
+
+### Work-package status evidence
+
+The maintenance rule in section 23 applies to this table: update status with
+evidence after each completed milestone, and treat a package as complete only
+when its acceptance tests and the relevant launch gates pass. The task numbers
+below refer to the development backlog that executes these packages.
+
+| Package | Status | Evidence |
+| --- | --- | --- |
+| W02 | Complete 2026-11-05 | Backlog task T049. Diagnostics report observed presence and digest per destination (`src/doctor.rs`), and CLI JSON, process exit code, and MCP `isError` agree on conflict results (`tests/cli/diagnostics.rs`, `tests/mcp.rs::mcp_conflict_results_agree_with_cli_json_and_exit_code`). Commit `81233dc` fixed the Clippy baseline. `docs/development.md` records the toolchain policy, the Clippy evidence, and the 2026-11-05 adapter re-verification. |
+| W03 | Complete 2026-11-05 | Backlog task T050. Migration steps and version advancement run in one SQLite transaction (`src/state/schema.rs`). Shared mutation holds a process coordination lock (`src/state/lock.rs`) and a durable journal (`src/state/journal.rs`). `tests/cli/state_recovery.rs` proves that a terminated operation leaves an explicit recoverable state and that a second process cannot erase committed history. |
+| W04 | Complete 2026-11-05 | Backlog task T051. The canonical bundle format lives in `src/bundle.rs` and `docs/bundle-format.md`, immutable retained artifacts in `src/artifact.rs`, and frozen restore in `src/restore.rs`. `tests/cli/restore.rs` covers fresh-checkout digest reproduction, a moved checkout after cache eviction, offline refusal, a missing locked revision, tampered retained artifacts, and retained folder and ZIP snapshots. |
+| W05 | Complete 2026-11-05 | Backlog task T052. One guarded apply engine (`src/apply.rs`) serves update, pin, rollback, sync, enable, disable, remove, and clean. `tests/cli/update_apply.rs` covers clean apply, preserve-as-overlay, discard after a durable backup, rollback, stale and tampered plan refusal, and recovery after an interrupted apply. `tests/cli/drift.rs` covers drift protection across the mutating commands. Backlog task T067 closed the deferred MCP exposure on 2026-11-07: `skills_restore` (explicit `frozen` argument, so a lockfile-changing restore is never implied) and `skills_verify` dispatch through the same shared command path (`src/mcp.rs`), and `tests/mcp.rs::mcp_restore_and_verify_reproduce_a_fresh_checkout_like_the_cli` reproduces a fresh checkout over MCP with the lockfile byte-identical. |
+
+All four verification gates from section 21 pass. They were re-run on
+2026-11-06 on a checkout of commit `f5c5ba2`, which carries the W02–W05
+result; this section adds documentation only:
+
+- `cargo fmt --check`: passes.
+- `cargo clippy --all-targets --all-features --locked -- -D warnings`: passes.
+- `cargo test --locked`: passes (171 lib, 291 cli, 8 integration_matrix, 6 mcp,
+  and 7 release tests).
+- `RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps`: passes.
+
+The engine items in the section 22 launch checklist now have evidence through
+these packages: the strict Clippy baseline, fresh-cache frozen restoration,
+atomic migrations with non-destructive recovery, concurrent and
+forced-termination tests, shared drift protection, and canonical digests over
+all distributed content. The remaining checklist items stay open with W01 and
+W06–W11.
 
 Suggested release stages:
 
@@ -1111,6 +1144,24 @@ Considered and intentionally rejected:
 - Treating directory projection as proof of runtime loading: preserve separate evidence states.
 - Building a proprietary scanner or generic agent-observability platform first: integrate existing evidence sources and focus on skill identity/version lineage.
 
+### Reconciliation with `docs/plan.md` (2026-11-07)
+
+The maintainer selected this roadmap as the controlling plan. `docs/plan.md` is a subordinate engine-history plan, and its phases map to this roadmap as follows:
+
+- Phase 1, adapter re-verification: complete 2026-11-05 under W02. The verification log in `docs/development.md` holds the matrix, the sources, and the cadence.
+- Phase 2, update apply: complete 2026-11-05 under W05.
+- Phase 3, state hardening: complete 2026-11-05 under W03.
+- Phase 4, telemetry: decided 2026-11-07. Telemetry stays enabled by default and the claims get corrected, because no emission backend exists and nothing is transmitted. Backlog task T134 carries the alignment work. The opt-in default proposed in section 17 stays a proposal for the team product.
+- Phase 6, optional expansion: staged behind W06–W14 and their decision gates.
+
+Phase 5 distribution decisions:
+
+- **crates.io publish: rejected.** Distribution stays on the GitHub release archive matrix and the curl installer (`README.md`, `.github/workflows/release.yml`). No work package requires a crates.io artifact, and `Cargo.toml` declares no `publish` restriction, so the option stays open without a roadmap commitment.
+- **Homebrew tap or formula: rejected.** The Phase 5 item claimed the release runbook already supports formula updates. It does not: `.github/workflows/release.yml` builds release archives and stages the installer, and it has no formula step. A tap would add a second distribution channel to verify on every release.
+- **Exit code 2: reviewed and kept.** Exit code 2 is `SuccessWithWarnings` in `src/error.rs`, and W02 pinned the agreement between CLI JSON, the process exit code, and MCP `isError` (`tests/cli/diagnostics.rs`, `tests/mcp.rs`). Changing it would break the unified machine contract, and `--strict-warnings` would grow the flag surface without demonstrated demand. `docs/user-guide.md` documents the pattern for scripts: code 2 keeps `ok: true`, and callers inspect `data.issues`.
+
+The two remaining Phase 5 positioning items, the README opening and the quickstart, stay open and belong to the W11 release gate.
+
 ## 21. Engineering workflow and verification
 
 ### Repository conventions
@@ -1166,7 +1217,7 @@ git status --short
 git diff --stat f9fd697..HEAD -- src tests Cargo.toml .github
 ```
 
-Review drift in each work package's scope before using this baseline. Preserve unrelated uncommitted and untracked work, especially `docs/plan.md`.
+Review drift in each work package's scope before using this baseline. Preserve unrelated uncommitted and untracked work.
 
 Use worktrees under `~/dev/.worktrees/skillctl/<task>`. Inspect uncommitted, untracked, and ignored files before removing a completed worktree; preserve needed artifacts and never force removal to discard work. Do not push, publish, or deploy merely because a work package is ready; follow the operator's authorized scope.
 
@@ -1212,7 +1263,7 @@ All required items must have evidence, not just checked boxes:
 
 ### Immediate implementation order
 
-1. Accept or amend this roadmap's scope and proposed architectural choices.
+1. Done 2026-11-07: the maintainer accepted this roadmap as controlling. `docs/plan.md` is subordinate; section 20 records the reconciliation.
 2. Open bounded W01 and W02 implementation/research tasks, with explicit owners.
 3. Fix verification and response/diagnostic semantics.
 4. Complete migration/concurrency/recovery work before adding new mutation entry points.
@@ -1234,7 +1285,7 @@ Vendor documentation checked on 2026-11-05; these are capability references, not
 - `README.md`: current installation, commands, telemetry statements, and development checks.
 - `spec.md`: original product definition, domain vocabulary, engineering/TDD expectations, and earlier non-goals.
 - `docs/broader-product-completion-note.md`: earlier gap analysis.
-- `docs/plan.md`: prior untracked plan, left unchanged.
+- `docs/plan.md`: subordinate engine-history plan since 2026-11-07; the reconciliation record is in section 20.
 - `Cargo.toml`, `.github/workflows/ci.yml`: language/dependencies and verification baseline.
 - `src/source.rs`, `src/resolver.rs`, `src/lockfile.rs`: import/cache and reproducibility behavior.
 - `src/lifecycle.rs`, `src/state/schema.rs`: current operation rollback and migration boundaries.

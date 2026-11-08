@@ -2,10 +2,10 @@ version: 1
 
 imports:
   - id: skillctl
-    type: local-path
-    url: file:///tmp/skillctl-demo-source.jPBB6w/
-    ref: sha256:b6441df1c4a5dbace12850905b02e14712352ddf3acd19d4818d5594b9c2058b
-    path: .agents/skills/skillctl
+    type: git
+    url: https://github.com/nibzard/skillctl
+    ref: 736fb43a2199587425a9e979436b1f1760ea5b99
+    path: assets/bundled/skillctl
     scope: workspace
     enabled: true
 

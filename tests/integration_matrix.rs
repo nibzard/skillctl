@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 mod support;
 
 use assert_cmd::Command;
@@ -211,7 +212,7 @@ fn user_copy_mode_matrix_matches_spec_target_combinations() {
         MatrixCase {
             name: "claude-code+github-copilot",
             targets: &["claude-code", "github-copilot"],
-            expected_roots: &["~/.claude/skills"],
+            expected_roots: &["~/.claude/skills", "~/.copilot/skills"],
         },
     ];
 
@@ -524,7 +525,7 @@ fn broken_symlink_fixture_refuses_managed_import_installation() {
         .failure()
         .code(3)
         .stderr(predicate::str::contains(
-            "symlinked install source entries are not supported for stored imports",
+            "is not supported inside a canonical bundle",
         ));
 }
 

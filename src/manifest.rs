@@ -116,6 +116,56 @@ impl WorkspaceManifest {
         Self::load_from_path(working_directory.join(DEFAULT_MANIFEST_PATH))
     }
 
+    /// Load the workspace manifest, or the documented defaults when it is absent.
+    ///
+    /// The manifest is optional for the simplest local-only flow (spec section
+    /// 11.1), so a missing file yields the same defaults `skillctl init` writes
+    /// instead of an error. The returned flag reports whether the defaults were
+    /// used, because diagnostics report that state as an issue while mutating
+    /// commands only warn. Every other read failure, such as an unreadable or
+    /// invalid manifest, still fails.
+    pub fn load_from_workspace_or_default(
+        working_directory: &Path,
+    ) -> Result<(Self, bool), AppError> {
+        match Self::load_from_workspace(working_directory) {
+            Ok(manifest) => Ok((manifest, false)),
+            Err(AppError::FilesystemOperation {
+                action: "read manifest",
+                path,
+                source,
+            }) if source.kind() == io::ErrorKind::NotFound => Ok((Self::default_at(path), true)),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Load the workspace manifest for a command that answers from declared
+    /// state.
+    ///
+    /// `restore`, `verify`, and `update` report against the imports and
+    /// overrides the manifest declares, and `pin`, `rollback`, `override`, and
+    /// `fork` rewrite them. Defaults would invent an empty declaration, so a
+    /// checkout that lost its manifest would hear that every pinned import is
+    /// stale instead of the truth: no declaration exists. The absence is
+    /// therefore a validation failure that names the repair, never the raw
+    /// filesystem error. Every other read failure passes through unchanged.
+    pub fn load_required_from_workspace(
+        context: &AppContext,
+        command: &'static str,
+    ) -> Result<Self, AppError> {
+        match Self::load_from_workspace(&context.working_directory) {
+            Ok(manifest) => Ok(manifest),
+            Err(AppError::FilesystemOperation {
+                action: "read manifest",
+                path,
+                source,
+            }) if source.kind() == io::ErrorKind::NotFound => Err(AppError::ManifestMissing {
+                path: PathBuf::from(crate::planner::display_path(context, &path)),
+                command,
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Resolve the managed overlay path for one imported skill.
     pub fn overlay_path_for(&self, skill_id: &str) -> ManifestPath {
         self.overrides.get(skill_id).cloned().unwrap_or_else(|| {
@@ -184,11 +234,8 @@ impl WorkspaceManifest {
             })?;
         }
 
-        fs::write(&self.path, contents).map_err(|source| AppError::FilesystemOperation {
-            action: "write manifest",
-            path: self.path.clone(),
-            source,
-        })
+        // Staged replacement keeps readers from observing a partial file.
+        crate::state::write_file_atomically(&self.path, contents.as_bytes())
     }
 
     /// Validate manifest invariants that require more than enum parsing.
@@ -402,6 +449,8 @@ pub enum ImportSourceType {
     LocalPath,
     /// Local archive source.
     Archive,
+    /// Well-known discovery index source.
+    WellKnown,
 }
 
 /// Supported import scope targets.
@@ -455,12 +504,15 @@ impl ImportDefinition {
 }
 
 /// Telemetry emission policy.
+///
+/// The policy drives local classification only. No emission backend exists, so
+/// classified events are never transmitted.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TelemetryMode {
-    /// Emit only public-source events.
+    /// Classify only public-source events as eligible for emission.
     PublicOnly,
-    /// Disable remote telemetry emission.
+    /// Disable telemetry emission classification.
     Off,
 }
 
@@ -1461,6 +1513,121 @@ mod tests {
         let manifest = WorkspaceManifest::load_from_path(&path).expect("manifest loads");
 
         assert_eq!(manifest.path, path);
+    }
+
+    #[test]
+    fn required_loader_names_init_when_the_manifest_is_absent() {
+        let workspace = TempWorkspace::new("skillctl-manifest-required");
+        let context = context_in(workspace.path());
+
+        let error = WorkspaceManifest::load_required_from_workspace(&context, "verify")
+            .expect_err("an absent manifest is refused, not defaulted");
+
+        assert_eq!(
+            error.exit_status(),
+            crate::error::ExitStatus::ValidationFailure,
+            "the refusal is a validation failure: {error}",
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(".agents/skillctl.yaml"),
+            "the refusal names the missing manifest: {message}",
+        );
+        assert!(
+            message.contains("'verify'"),
+            "the refusal names the command that needs declared state: {message}",
+        );
+        assert!(
+            message.contains("skillctl init"),
+            "the refusal names the repair: {message}",
+        );
+        assert!(
+            !message.contains("os error"),
+            "the raw filesystem error must not surface: {message}",
+        );
+    }
+
+    #[test]
+    fn required_loader_returns_the_manifest_when_it_exists() {
+        let workspace = TempWorkspace::new("skillctl-manifest-required-present");
+        workspace.write_manifest(MINIMAL_MANIFEST);
+        let context = context_in(workspace.path());
+
+        let manifest =
+            WorkspaceManifest::load_required_from_workspace(&context, "update").expect("loads");
+
+        assert_eq!(
+            manifest.targets,
+            vec![
+                TargetRuntime::Codex,
+                TargetRuntime::GeminiCli,
+                TargetRuntime::Opencode
+            ]
+        );
+    }
+
+    #[test]
+    fn required_loader_passes_an_invalid_manifest_through() {
+        let workspace = TempWorkspace::new("skillctl-manifest-required-invalid");
+        workspace.write_manifest(concat!(
+            "version: 1\n",
+            "\n",
+            "targets:\n",
+            "  - not-a-runtime\n",
+        ));
+        let context = context_in(workspace.path());
+
+        let error = WorkspaceManifest::load_required_from_workspace(&context, "update")
+            .expect_err("an invalid manifest still fails");
+
+        assert!(
+            matches!(error, AppError::ManifestParse { .. }),
+            "parse failures are not rewritten into a missing-manifest refusal: {error}",
+        );
+    }
+
+    fn context_in(working_directory: &Path) -> AppContext {
+        AppContext {
+            working_directory: working_directory.to_path_buf(),
+            output_mode: crate::app::OutputMode::Json,
+            verbosity: crate::app::Verbosity::Normal,
+            interaction_mode: crate::app::InteractionMode::NonInteractive,
+            selector: crate::app::CommandSelector::default(),
+        }
+    }
+
+    /// Temporary directory a manifest loader test reads from.
+    struct TempWorkspace {
+        path: PathBuf,
+    }
+
+    impl TempWorkspace {
+        fn new(prefix: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time moved backwards")
+                .as_nanos();
+            let path = env::temp_dir().join(format!("{prefix}-{}-{unique}.d", std::process::id()));
+            fs::create_dir_all(&path).expect("workspace directory exists");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn write_manifest(&self, contents: &str) {
+            let path = self.path.join(".agents").join("skillctl.yaml");
+            fs::create_dir_all(path.parent().expect("parent exists"))
+                .expect("agents directory exists");
+            fs::write(path, contents).expect("manifest written");
+        }
+    }
+
+    impl Drop for TempWorkspace {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 
     #[test]

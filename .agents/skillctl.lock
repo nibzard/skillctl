@@ -1,4 +1,4 @@
-version: 1
+version: 2
 
 state:
   manifest_version: 1
@@ -7,16 +7,17 @@ state:
 imports:
   skillctl:
     source:
-      type: local-path
-      url: file:///tmp/skillctl-demo-source.jPBB6w/
-      subpath: .agents/skills/skillctl
+      type: git
+      url: https://github.com/nibzard/skillctl
+      subpath: assets/bundled/skillctl
     revision:
-      resolved: sha256:b6441df1c4a5dbace12850905b02e14712352ddf3acd19d4818d5594b9c2058b
-    timestamps:
-      fetched_at: 2026-03-21T17:23:51Z
-      first_installed_at: 2026-03-21T17:23:51Z
-      last_updated_at: 2026-03-21T17:23:51Z
+      resolved: 736fb43a2199587425a9e979436b1f1760ea5b99
+    bundle:
+      format_version: 1
+      digest: sha256:914ebcdb755f7b521a31357413e62c5030af2fd272fbabf1072e80e860406f59
+      files: 1
+      bytes: 737
     hashes:
-      content: sha256:4760121a74ee3e698fea9d5fd8cc981f0dbaf361cd3a3fe8f01f137a44afbe2c
+      content: sha256:7646ff71a4b67c806bac78ac77a1c5065e27573df642a7eaf803d42b4fc20eba
       overlay: sha256:none
-      effective_version: sha256:4cedbbdbd659250a008addde5958951603896434797a554ed4848f0c04b2ccd4
+      effective_version: sha256:e6536fdcc160864a3b1bdde5eeecc581e0ed2db52461029a5566d440efcee33b

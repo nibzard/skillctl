@@ -60,7 +60,8 @@ pub struct TuiSkillCard {
     /// Current pin, when one exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pin: Option<PinRecord>,
-    /// Latest recorded update check, when one exists.
+    /// Latest recorded update check fitted to the installed revision, when one
+    /// exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub update: Option<UpdateCheckRecord>,
     /// Overlay inspection details.
@@ -215,12 +216,17 @@ fn build_skill_card(
         doctor::build_explain_report_for_tui(&scoped_context, &managed_skill.skill_id)?;
     let history_preview = skill_history_preview(store, managed_skill)?;
 
+    let update = snapshot
+        .latest_update_check
+        .clone()
+        .map(|check| check.fitted_to(&install));
+
     Ok(TuiSkillCard {
         skill: managed_skill.skill_id.clone(),
         scope: managed_skill.scope,
         installed: install,
         pin: snapshot.pin.clone(),
-        update: snapshot.latest_update_check.clone(),
+        update,
         overlay: overlay_view(context, manifest, managed_skill, &snapshot, &visibility)?,
         local_modifications: snapshot.local_modifications.clone(),
         rollback: rollback_summary(&snapshot),
@@ -593,6 +599,7 @@ fn source_label(kind: SourceKind) -> &'static str {
         SourceKind::Git => "git",
         SourceKind::LocalPath => "local-path",
         SourceKind::Archive => "archive",
+        SourceKind::WellKnown => "well-known",
     }
 }
 

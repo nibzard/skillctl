@@ -96,8 +96,12 @@ fn update_doctor_explain_and_inspect_help_include_recovery_guidance() {
         .args(["update", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Recommended follow-up actions:"))
-        .stdout(predicate::str::contains("create-overlay:"))
+        .stdout(predicate::str::contains(
+            "Apply strategies (used with --apply):",
+        ))
+        .stdout(predicate::str::contains("overlay: move unmanaged edits"))
+        .stdout(predicate::str::contains("Trust gate:"))
+        .stdout(predicate::str::contains("refuses with exit code 4"))
         .stdout(predicate::str::contains("skillctl history <skill>"));
 
     Command::cargo_bin("skillctl")
@@ -130,6 +134,36 @@ fn update_doctor_explain_and_inspect_help_include_recovery_guidance() {
             "skillctl inspect ai-sdk --target codex",
         ))
         .stdout(predicate::str::contains("skillctl explain <skill>"));
+}
+
+#[test]
+fn inventory_help_describes_the_default_human_output() {
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .args(["list", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "one block per managed skill with its scope, source, revision, projected targets",
+        ));
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .args(["path", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "canonical, stored, overlay, planned-root, and projected paths",
+        ));
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .args(["history", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "one line per event with its time, kind, skill, recorded revision, and summary",
+        ));
 }
 
 #[test]
@@ -464,7 +498,7 @@ fn json_output_uses_stable_response_contract_for_command_errors() {
             "ok": false,
             "command": "install",
             "warnings": [],
-            "errors": ["install source './missing-source' is invalid: source must be a Git URL, existing local directory, or existing local archive"],
+            "errors": ["install source './missing-source' is invalid: source must be a Git URL, an HTTP(S) well-known discovery origin or index URL, existing local directory, or existing local archive"],
             "data": {}
         })
     );

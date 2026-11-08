@@ -38,7 +38,7 @@ fn init_bootstraps_the_default_workspace_layout() {
     assert_eq!(
         fs::read_to_string(workspace.path().join(".agents/skillctl.lock"))
             .expect("lockfile exists"),
-        MINIMAL_LOCKFILE
+        MINIMAL_LOCKFILE.as_str()
     );
 }
 

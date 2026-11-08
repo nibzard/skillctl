@@ -18,7 +18,6 @@ use crate::{
     doctor,
     error::AppError,
     history::{self, HistoryLedger},
-    lifecycle,
     lockfile::WorkspaceLockfile,
     manifest::{ImportDefinition, ManifestScope, WorkspaceManifest},
     materialize, planner,
@@ -526,10 +525,16 @@ pub fn handle_list(context: &AppContext, _request: ListRequest) -> Result<AppRes
                 .transpose()?
                 .map(|path| path.display().to_string()),
             "pinned_reference": snapshot.pin.as_ref().map(|pin| pin.requested_reference.clone()),
-            "latest_update": snapshot.latest_update_check.as_ref().map(|check| json!({
-                "outcome": check.outcome,
-                "checked_at": check.checked_at,
-            })),
+            // The stored check can predate the apply that moved this install,
+            // so the payload carries the fitted view instead of the raw row.
+            "latest_update": snapshot
+                .latest_update_check
+                .clone()
+                .map(|check| check.fitted_to(&install))
+                .map(|check| json!({
+                    "outcome": check.outcome,
+                    "checked_at": check.checked_at,
+                })),
             "local_modification_count": snapshot.local_modifications.len(),
             "rollback_count": snapshot.rollbacks.len(),
             "projections": snapshot
@@ -541,12 +546,15 @@ pub fn handle_list(context: &AppContext, _request: ListRequest) -> Result<AppRes
     }
 
     let count = skills.len();
+    let data = json!({ "skills": skills });
+    let detail = crate::human::list_detail_lines(&data);
     Ok(AppResponse::success("list")
         .with_summary(format!(
             "Listed {count} managed skill{}.",
             if count == 1 { "" } else { "s" }
         ))
-        .with_data(json!({ "skills": skills })))
+        .with_detail_lines(detail)
+        .with_data(data))
 }
 
 /// Handle `skillctl remove`.
@@ -554,49 +562,113 @@ pub fn handle_remove(
     context: &AppContext,
     request: RemoveRequest,
 ) -> Result<AppResponse, AppError> {
-    lifecycle::run_transaction("remove", |transaction| {
-        let mut store = LocalStateStore::open_default_for(&context.working_directory)?;
-        transaction.track_state_database()?;
-        let managed_skill =
-            match resolve_installed_skill(&store, request.skill.as_str(), context.selector.scope) {
-                Ok(skill) => skill,
-                Err(_error)
-                    if builtin::is_bundled_request(
-                        request.skill.as_str(),
-                        context.selector.scope,
-                    ) =>
-                {
-                    return builtin::handle_remove(context);
-                }
-                Err(error) => return Err(error),
-            };
-        let install_record = store.install_record(&managed_skill)?.ok_or_else(|| {
-            AppError::ResolutionValidation {
-                message: format!(
-                    "skill '{}' does not have an installed state record",
-                    request.skill.as_str()
-                ),
+    {
+        let store = LocalStateStore::open_default_for(&context.working_directory)?;
+        match classify_bundled_request(
+            context,
+            &store,
+            request.skill.as_str(),
+            context.selector.scope,
+        )? {
+            // The bundled skill is locally owned, but an unscoped request may
+            // also name a stale lockfile entry that shares the bundled name.
+            // Removing the bundled skill would leave that entry in place, so
+            // the request stays ambiguous until a scope selector resolves it.
+            BundledRequest::Bundled
+                if context.selector.scope.is_none()
+                    && names_undeclared_lockfile_entry(context, request.skill.as_str())? =>
+            {
+                return Err(bundled_name_and_stale_pin_error(request.skill.as_str()));
             }
-        })?;
-        if builtin::is_bundled_install(&install_record) {
-            return builtin::handle_remove(context);
+            BundledRequest::Bundled => return builtin::handle_remove(context),
+            BundledRequest::Ambiguous => return Err(multiple_scopes_error(request.skill.as_str())),
+            BundledRequest::Managed => {}
         }
+    }
 
-        let mut manifest = load_manifest_or_default(&context.working_directory)?;
-        let mut lockfile = load_lockfile_or_default(&context.working_directory)?;
-        transaction.track_path(&manifest.path)?;
-        transaction.track_path(&lockfile.path)?;
-        let scoped_context = history::context_for_scope(context, managed_skill.scope);
-        for root in materialize::planned_physical_root_paths(
+    let manifest = load_manifest_or_default(&context.working_directory)?;
+    let lockfile = load_lockfile_or_default(&context.working_directory)?;
+    let store = LocalStateStore::open_default_for(&context.working_directory)?;
+    let target = resolve_managed_import(
+        context,
+        &manifest,
+        &lockfile,
+        &store,
+        request.skill.as_str(),
+        ImportResolution::Remove,
+    )?;
+    let managed_skill = target.skill.clone();
+    let expected = target.expected_import(context, &lockfile)?;
+
+    let scoped_context = history::context_for_scope(context, managed_skill.scope);
+    let stored_source_root = stored_import_root(
+        managed_skill.scope,
+        &context.working_directory,
+        request.skill.as_str(),
+    )?;
+    let mut builder = crate::apply::MutationPlanBuilder::new(
+        crate::apply::MutationOperation::Remove,
+        &context.working_directory,
+    )
+    .skill(managed_skill.clone())
+    .propose(crate::apply::ProposedImport {
+        import_id: managed_skill.skill_id.clone(),
+        revision: None,
+        bundle_digest: None,
+        bundle_policy: crate::apply::BundlePolicy::Release,
+        summary: format!(
+            "remove '{}' from {} scope and release its retained artifact",
+            managed_skill.skill_id,
+            managed_skill.scope.as_str()
+        ),
+    })
+    .target(manifest.path.clone(), crate::apply::TargetAction::Update)
+    .target(lockfile.path.clone(), crate::apply::TargetAction::Update)
+    .targets(
+        materialize::sync_mutation_root_paths(
             &scoped_context,
             &manifest,
             target_scope(managed_skill.scope),
-        )? {
-            transaction.track_path(root)?;
-        }
+        )?,
+        crate::apply::TargetAction::Remove,
+    )
+    .target(stored_source_root, crate::apply::TargetAction::Remove);
+
+    if let Some(expected) = expected {
+        builder = builder.expect_import(expected);
+    }
+
+    // Removal drops the lockfile entry, so the retained artifact is the only
+    // remaining copy of the approved content. Record it as a recovery
+    // reference instead of losing the bundle identity.
+    if let Some(digest) = lockfile
+        .imports
+        .get(request.skill.as_str())
+        .and_then(|entry| entry.bundle_digest())
+    {
+        builder = builder.retained_artifacts(vec![digest.to_string()]);
+    }
+    let plan = builder.seal();
+
+    crate::apply::run_guarded(&plan, context, |transaction| {
+        transaction.track_state_database()?;
+        let mut store = LocalStateStore::open_default_for(&context.working_directory)?;
+        let mut manifest = load_manifest_or_default(&context.working_directory)?;
+        let mut lockfile = load_lockfile_or_default(&context.working_directory)?;
+        let target = resolve_managed_import(
+            context,
+            &manifest,
+            &lockfile,
+            &store,
+            request.skill.as_str(),
+            ImportResolution::Remove,
+        )?;
+        let managed_skill = target.skill.clone();
+
         let timestamp = current_timestamp();
         let mut removed_paths = Vec::new();
         let mut retained_paths = Vec::new();
+        let mut cleared_stale_pin = false;
 
         if let Some(import_index) = manifest_import_index(&manifest, &managed_skill) {
             manifest.imports.remove(import_index);
@@ -607,7 +679,19 @@ pub fn handle_remove(
 
             lockfile.imports.remove(request.skill.as_str());
             lockfile.write_to_path()?;
-        } else if !(install_record.detached || install_record.forked) {
+        } else if lockfile.imports.remove(request.skill.as_str()).is_some() {
+            // The manifest no longer declares the import but the lockfile still
+            // pins it, which is the `stale-lockfile-entry` state `doctor` and
+            // `explain` report. Clear the pin instead of refusing it, so the
+            // entry no longer needs a reinstall that exists only to be removed
+            // again.
+            if let Some(overlay_path) = manifest.overrides.remove(request.skill.as_str()) {
+                retained_paths.push(overlay_path.as_str().to_string());
+                manifest.write_to_path()?;
+            }
+            lockfile.write_to_path()?;
+            cleared_stale_pin = true;
+        } else if !target.detached_from_upstream() {
             return Err(AppError::ResolutionValidation {
                 message: format!(
                     "skill '{}' is not a managed import in the workspace manifest",
@@ -616,9 +700,7 @@ pub fn handle_remove(
             });
         }
 
-        if managed_skill.scope == ManagedScope::Workspace
-            && (install_record.detached || install_record.forked)
-        {
+        if managed_skill.scope == ManagedScope::Workspace && target.detached_from_upstream() {
             let local_root = context
                 .working_directory
                 .join(manifest.layout.skills_dir.as_str())
@@ -639,30 +721,55 @@ pub fn handle_remove(
             removed_paths.push(stored_source_root.display().to_string());
         }
 
-        let sync_report = materialize::sync_workspace(&scoped_context)?;
+        // Projection rebuild reads every enabled import, so a checkout that
+        // still holds an import it never reconstructed cannot run one. A
+        // removal is still correct without it, and refusing it would leave a
+        // fresh clone with no way to repair itself.
+        let unrestored = materialize::unrestored_imports(context, &manifest)?;
+        let mut sync_report = if unrestored.is_empty() {
+            Some(materialize::sync_workspace(&scoped_context)?)
+        } else {
+            None
+        };
+        // The record this removal is about to delete is what makes the update
+        // strategies repairable, so the report the response embeds must not
+        // name them for the removed skill.
+        if let Some(report) = sync_report.as_mut() {
+            report.advise_discard_only_for(managed_skill.skill_id.as_str(), managed_skill.scope);
+        }
 
         {
             let mut ledger = HistoryLedger::new(&mut store);
-            materialize::record_pruned_projection_history(
-                &mut ledger,
-                context,
-                managed_skill.scope,
-                &sync_report,
-                &timestamp,
-            )?;
+            if let Some(report) = &sync_report {
+                materialize::record_pruned_projection_history(
+                    &mut ledger,
+                    context,
+                    managed_skill.scope,
+                    report,
+                    &timestamp,
+                )?;
+            }
             for removed_path in &removed_paths {
                 ledger.record_cleanup(Some(&managed_skill), removed_path, &timestamp)?;
             }
         }
 
         store.delete_current_skill_state(&managed_skill)?;
-        materialize::rebuild_projection_records_for_scope(
-            &mut store,
-            managed_skill.scope,
-            &sync_report,
-            &timestamp,
-        )?;
-        transaction.checkpoint("after-state")?;
+        if let Some(report) = &sync_report {
+            materialize::rebuild_projection_records_for_scope(
+                &mut store,
+                managed_skill.scope,
+                report,
+                &timestamp,
+            )?;
+        }
+
+        let projection = match &sync_report {
+            Some(report) => {
+                serde_json::to_value(report).map_err(|source| AppError::JsonRender { source })?
+            }
+            None => skipped_projection_report(&unrestored, managed_skill.scope),
+        };
 
         let mut response = AppResponse::success("remove")
             .with_summary(format!(
@@ -673,16 +780,61 @@ pub fn handle_remove(
             .with_data(json!({
                 "skill": request.skill.as_str(),
                 "scope": managed_skill.scope.as_str(),
+                "resolved_from": target.resolved_from(),
                 "removed_paths": removed_paths,
                 "retained_paths": retained_paths,
-                "projection": sync_report,
+                "retained_artifacts": plan.recovery.retained_artifacts,
+                "projection": projection,
             }));
 
+        match target.origin {
+            ImportOrigin::InstallRecord => {
+                if cleared_stale_pin {
+                    response = response.with_warning(format!(
+                        "the workspace manifest no longer declared '{}', so remove cleared the \
+                         stale entry .agents/skillctl.lock still pinned",
+                        request.skill.as_str()
+                    ));
+                }
+            }
+            ImportOrigin::ManifestAndLockfile => {
+                response = response.with_warning(format!(
+                    "no install record for '{}' existed in this checkout, so remove acted on the \
+                     import declared by .agents/skillctl.yaml and .agents/skillctl.lock",
+                    request.skill.as_str()
+                ));
+            }
+            ImportOrigin::LockfileOnly => {
+                response = response.with_warning(format!(
+                    "no install record or manifest import for '{}' existed in this checkout, so \
+                     remove cleared the stale entry .agents/skillctl.lock pinned",
+                    request.skill.as_str()
+                ));
+            }
+        }
+        if !unrestored.is_empty() {
+            response =
+                response.with_warning(skipped_projection_warning(&unrestored, managed_skill.scope));
+        }
         for retained_path in &retained_paths {
             response = response.with_warning(format!(
                 "retained overlay directory '{}' for manual reuse",
                 retained_path
             ));
+        }
+        for digest in &plan.recovery.retained_artifacts {
+            response = response.with_warning(format!(
+                "retained artifact '{digest}' stays in the artifact store for recovery"
+            ));
+        }
+        // A preserved copy outlives the skill it belonged to, so the removal is
+        // the last command that can still name the skill. Its warnings carry the
+        // repair advice, which the deleted record leaves pointing at the
+        // explicit discard alone.
+        if let Some(report) = &sync_report {
+            for warning in &report.warnings {
+                response = response.with_warning(warning.clone());
+            }
         }
 
         Ok(response)
@@ -705,28 +857,221 @@ pub fn handle_inspect(
     doctor::build_inspect_response(context, request.skill.as_str())
 }
 
+/// The managed skill one mutating command acts on.
+#[derive(Clone, Debug)]
+pub(crate) struct ManagedImportTarget {
+    /// Managed skill identity.
+    pub(crate) skill: ManagedSkillRef,
+    /// Recorded install from the local state store, when one exists.
+    pub(crate) install: Option<crate::state::InstallRecord>,
+    /// Which layer supplied the import identity.
+    origin: ImportOrigin,
+}
+
+/// Which layer declared the import a mutating command resolved.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImportOrigin {
+    /// The local state store recorded the install.
+    InstallRecord,
+    /// The committed manifest declares the import and the lockfile pins it.
+    ManifestAndLockfile,
+    /// Only the committed lockfile pins the import.
+    LockfileOnly,
+}
+
+impl ManagedImportTarget {
+    /// Label the remove and toggle responses report under `resolved_from`.
+    fn resolved_from(&self) -> &'static str {
+        match self.origin {
+            ImportOrigin::InstallRecord => "install-record",
+            ImportOrigin::ManifestAndLockfile => "manifest-and-lockfile",
+            ImportOrigin::LockfileOnly => "lockfile-only",
+        }
+    }
+
+    /// Whether the install stopped tracking upstream lifecycle management.
+    fn detached_from_upstream(&self) -> bool {
+        self.install
+            .as_ref()
+            .is_some_and(|record| record.detached || record.forked)
+    }
+
+    /// Pre-state the mutation plan guards against.
+    ///
+    /// An install that was never recorded locally still carries dependency
+    /// identity in the lockfile, so the plan fails before it mutates anything
+    /// when that entry moved. An import the lockfile does not carry at all has
+    /// no identity left to guard.
+    fn expected_import(
+        &self,
+        context: &AppContext,
+        lockfile: &WorkspaceLockfile,
+    ) -> Result<Option<crate::apply::ExpectedImport>, AppError> {
+        match (&self.install, lockfile.imports.get(&self.skill.skill_id)) {
+            (Some(record), _) => Ok(Some(crate::apply::capture_expected_import(
+                context, record,
+            )?)),
+            (None, Some(entry)) => Ok(Some(crate::apply::capture_expected_import_from_lockfile(
+                &self.skill,
+                entry,
+            ))),
+            (None, None) => Ok(None),
+        }
+    }
+
+    /// Pre-state an enable or disable guards against.
+    ///
+    /// The toggle acts on managed imports only. A bundled install is locally
+    /// owned rather than imported, a detached or forked install stopped
+    /// tracking upstream lifecycle management, and an install without a
+    /// lockfile entry is locally owned too, so none carries the dependency
+    /// identity the toggle guards. A bundled install must not adopt the
+    /// identity of an import that shares its name either, because the lockfile
+    /// pins imports by name without a scope.
+    fn toggle_expected_import(
+        &self,
+        context: &AppContext,
+        lockfile: &WorkspaceLockfile,
+    ) -> Result<Option<crate::apply::ExpectedImport>, AppError> {
+        if self
+            .install
+            .as_ref()
+            .is_some_and(builtin::is_bundled_install)
+            || self.detached_from_upstream()
+            || !lockfile.imports.contains_key(&self.skill.skill_id)
+        {
+            return Ok(None);
+        }
+        self.expected_import(context, lockfile)
+    }
+}
+
+/// The mutating command an import resolution serves.
+#[derive(Clone, Copy)]
+pub(crate) enum ImportResolution {
+    /// `remove`, which may also clear an entry only the lockfile pins.
+    Remove,
+    /// `enable` and `disable`, which need the manifest declaration to flip.
+    Toggle,
+    /// `override` and `fork`, which read the stored import source.
+    Overlay,
+}
+
+impl ImportResolution {
+    /// Label the divergence error names.
+    fn action(self) -> &'static str {
+        match self {
+            Self::Remove => "removing",
+            Self::Toggle => "enabling or disabling",
+            Self::Overlay => "overriding or forking",
+        }
+    }
+
+    /// Whether an entry the lockfile pins alone is a valid target.
+    ///
+    /// `remove` clears such an entry, because the `stale-lockfile-entry` state
+    /// `doctor` reports has no other single-command repair. A toggle has no
+    /// manifest declaration to flip, so it keeps refusing the entry. The
+    /// overlay workflow also keeps refusing it, because it has no manifest
+    /// declaration to act on either.
+    fn accepts_lockfile_entry(self) -> bool {
+        matches!(self, Self::Remove)
+    }
+}
+
+/// Resolve the skill a mutating command acts on.
+///
+/// An install record is the normal source of truth. A checkout without one,
+/// such as a fresh clone whose import cache and state store are still empty,
+/// falls back to the import the committed manifest declares, so an import
+/// that `restore` cannot reconstruct can still be replaced or toggled without
+/// editing `.agents/skillctl.yaml` and `.agents/skillctl.lock` by hand.
+///
+/// A pin the manifest no longer declares resolves for `remove` alone. That is
+/// the genuinely stale entry `doctor` and `explain` report, and clearing it
+/// through `remove` replaces the reinstall-then-remove workaround.
+pub(crate) fn resolve_managed_import(
+    context: &AppContext,
+    manifest: &WorkspaceManifest,
+    lockfile: &WorkspaceLockfile,
+    store: &LocalStateStore,
+    skill: &str,
+    resolution: ImportResolution,
+) -> Result<ManagedImportTarget, AppError> {
+    if let Some(managed_skill) = find_installed_skill(store, skill, context.selector.scope)? {
+        let install = store.install_record(&managed_skill)?;
+        return Ok(ManagedImportTarget {
+            skill: managed_skill,
+            install,
+            origin: ImportOrigin::InstallRecord,
+        });
+    }
+
+    let Some(managed_skill) = find_manifest_import(manifest, skill, context.selector.scope)? else {
+        // The lockfile pins imports by name without a scope, so an entry no
+        // declaration at all covers resolves as a workspace import. A manifest
+        // declaration in another scope keeps the pin in use, and an explicit
+        // user selector keeps refusing the entry instead of guessing.
+        if !resolution.accepts_lockfile_entry()
+            || find_manifest_import(manifest, skill, None)?.is_some()
+            || context.selector.scope == Some(Scope::User)
+            || !lockfile.imports.contains_key(skill)
+        {
+            return Err(AppError::ResolutionValidation {
+                message: format!(
+                    "skill '{skill}' is not installed and no manifest import declares it"
+                ),
+            });
+        }
+        return Ok(ManagedImportTarget {
+            skill: ManagedSkillRef::new(ManagedScope::Workspace, skill),
+            install: None,
+            origin: ImportOrigin::LockfileOnly,
+        });
+    };
+    if !lockfile.imports.contains_key(skill) {
+        return Err(AppError::ResolutionValidation {
+            message: format!(
+                "import '{skill}' is declared by the manifest but missing from the lockfile; \
+                 run 'skillctl doctor' to inspect the divergence before {} it",
+                resolution.action()
+            ),
+        });
+    }
+    Ok(ManagedImportTarget {
+        skill: managed_skill,
+        install: None,
+        origin: ImportOrigin::ManifestAndLockfile,
+    })
+}
+
 /// Handle `skillctl enable`.
 pub fn handle_enable(
     context: &AppContext,
     request: EnableRequest,
 ) -> Result<AppResponse, AppError> {
-    if builtin::is_bundled_request(request.skill.as_str(), context.selector.scope) {
+    {
         let store = LocalStateStore::open_default_for(&context.working_directory)?;
-        match resolve_installed_skill(&store, request.skill.as_str(), context.selector.scope) {
-            Ok(managed_skill) => {
-                let install_record = store.install_record(&managed_skill)?.ok_or_else(|| {
-                    AppError::ResolutionValidation {
-                        message: format!(
-                            "skill '{}' does not have an installed state record",
-                            request.skill.as_str()
-                        ),
-                    }
-                })?;
-                if builtin::is_bundled_install(&install_record) {
-                    return builtin::handle_enable(context);
-                }
+        match classify_bundled_request(
+            context,
+            &store,
+            request.skill.as_str(),
+            context.selector.scope,
+        )? {
+            // The bundled skill is the only thing enable can act on, but an
+            // unscoped request may also name a stale lockfile entry that shares
+            // the bundled name. Enabling the bundled skill would report success
+            // for a name the stale entry still pins, so the request stays
+            // ambiguous until a scope selector resolves it.
+            BundledRequest::Bundled
+                if context.selector.scope.is_none()
+                    && names_undeclared_lockfile_entry(context, request.skill.as_str())? =>
+            {
+                return Err(bundled_enable_and_stale_pin_error(request.skill.as_str()));
             }
-            Err(_) => return builtin::handle_enable(context),
+            BundledRequest::Bundled => return builtin::handle_enable(context),
+            BundledRequest::Ambiguous => return Err(multiple_scopes_error(request.skill.as_str())),
+            BundledRequest::Managed => {}
         }
     }
     toggle_managed_import(context, request.skill.as_str(), true, "enable")
@@ -737,16 +1082,98 @@ pub fn handle_disable(
     context: &AppContext,
     request: DisableRequest,
 ) -> Result<AppResponse, AppError> {
+    {
+        let store = LocalStateStore::open_default_for(&context.working_directory)?;
+        match classify_bundled_request(
+            context,
+            &store,
+            request.skill.as_str(),
+            context.selector.scope,
+        )? {
+            // Disable toggles a manifest import, and the bundled skill is
+            // locally owned, so its only lifecycle exit is an explicit remove.
+            BundledRequest::Bundled => return Err(bundled_disable_error(request.skill.as_str())),
+            BundledRequest::Ambiguous => return Err(multiple_scopes_error(request.skill.as_str())),
+            BundledRequest::Managed => {}
+        }
+    }
     toggle_managed_import(context, request.skill.as_str(), false, "disable")
 }
 
+/// The refusal a bundled skill gets from `skillctl disable`.
+///
+/// Without this gate, a checkout that also declares an import under the bundled
+/// skill's name resolves the toggle to the bundled install record and pairs it
+/// with that import's lockfile entry, so the guarded plan always reads as stale.
+fn bundled_disable_error(skill: &str) -> AppError {
+    AppError::ResolutionValidation {
+        message: format!(
+            "skill '{skill}' is the bundled user-scope skill, which disable cannot toggle because \
+             it is not a managed import; run 'skillctl --scope user remove {skill}' to stop \
+             projecting it"
+        ),
+    }
+}
+
+/// Whether the lockfile pins the name while the manifest does not declare it.
+///
+/// That is the `stale-lockfile-entry` state `remove` clears.
+fn names_undeclared_lockfile_entry(context: &AppContext, skill: &str) -> Result<bool, AppError> {
+    let manifest = load_manifest_or_default(&context.working_directory)?;
+    if find_manifest_import(&manifest, skill, None)?.is_some() {
+        return Ok(false);
+    }
+    let lockfile = load_lockfile_or_default(&context.working_directory)?;
+    Ok(lockfile.imports.contains_key(skill))
+}
+
+/// The refusal an unscoped bundled-name removal gets when the lockfile also
+/// pins the name without a manifest declaration.
+///
+/// Routing the request to the bundled skill would silently drop an unrelated
+/// skill while the stale entry the user asked about stays pinned.
+fn bundled_name_and_stale_pin_error(skill: &str) -> AppError {
+    AppError::ResolutionValidation {
+        message: format!(
+            "skill '{skill}' names both the bundled user-scope skill and a lockfile entry the \
+             workspace manifest does not declare; re-run with --scope user to remove the bundled \
+             skill, or --scope workspace to clear the entry"
+        ),
+    }
+}
+
+/// The refusal an unscoped bundled-name enable gets when the lockfile also
+/// pins the name without a manifest declaration.
+///
+/// Routing the request to the bundled skill reports success for a name the
+/// stale entry still pins, so the request stays ambiguous until a scope
+/// selector resolves it.
+fn bundled_enable_and_stale_pin_error(skill: &str) -> AppError {
+    AppError::ResolutionValidation {
+        message: format!(
+            "skill '{skill}' names both the bundled user-scope skill and a lockfile entry the \
+             workspace manifest does not declare; re-run with --scope user to enable the bundled \
+             skill, or run 'skillctl --scope workspace remove {skill}' to clear the entry"
+        ),
+    }
+}
+
 /// Handle `skillctl path`.
+///
+/// An install record answers first. A canonical local skill in the workspace
+/// skills root has no install record, because the state store only records
+/// imports, so a name without one falls back to that root. `explain` resolves
+/// the same skills, and the README lists `path` among the four commands to
+/// remember, so the two commands must not disagree about a canonical skill.
 pub fn handle_path(context: &AppContext, request: PathRequest) -> Result<AppResponse, AppError> {
     let manifest = load_manifest_or_default(&context.working_directory)?;
     let lockfile = load_lockfile_or_default(&context.working_directory)?;
     let store = LocalStateStore::open_default_for(&context.working_directory)?;
-    let managed_skill =
-        resolve_installed_skill(&store, request.skill.as_str(), context.selector.scope)?;
+    let Some(managed_skill) =
+        find_installed_skill(&store, request.skill.as_str(), context.selector.scope)?
+    else {
+        return canonical_local_path(context, &manifest, &store, &request);
+    };
     let install_record =
         store
             .install_record(&managed_skill)?
@@ -770,54 +1197,168 @@ pub fn handle_path(context: &AppContext, request: PathRequest) -> Result<AppResp
         )?
     };
 
+    let data = json!({
+        "skill": request.skill.as_str(),
+        "scope": managed_skill.scope.as_str(),
+        "builtin": builtin::is_bundled_install(&install_record),
+        "managed_import": managed_import.is_some(),
+        "managed_import_enabled": managed_import.map(|import| import.enabled),
+        "stored_source_root": lockfile_entry
+            .map(|_| stored_import_root(managed_skill.scope, &context.working_directory, request.skill.as_str()))
+            .transpose()?
+            .map(|root| root.display().to_string()),
+        "active_source_root": lockfile_entry
+            .map(|entry| stored_import_root(managed_skill.scope, &context.working_directory, request.skill.as_str()).map(|root| root.join(entry.source.subpath.as_str())))
+            .transpose()?
+            .map(|path| path.display().to_string()),
+        "overlay_root": managed_import
+            .and_then(|import| manifest.overrides.get(&import.id))
+            .map(|path| path.as_str().to_string()),
+        "canonical_root": canonical_local_root(context, &manifest, request.skill.as_str())
+            .filter(|_| managed_import.is_none() && managed_skill.scope == ManagedScope::Workspace)
+            .map(|root| planner::display_path(context, &root)),
+        "source": {
+            "type": source_type_label(&install_record),
+            "url": install_record.source_url,
+            "subpath": install_record.source_subpath,
+        },
+        "resolved_revision": install_record.resolved_revision,
+        "effective_version_hash": install_record.effective_version_hash,
+        "planned_roots": planned_roots,
+        "projections": snapshot
+            .projections
+            .iter()
+            .map(|projection| projection_view(context, projection))
+            .collect::<Result<Vec<_>, _>>()?,
+    });
+    let detail = crate::human::path_detail_lines(&data);
+
     Ok(AppResponse::success("path")
-        .with_summary(format!("Resolved filesystem paths for {}.", request.skill.as_str()))
-        .with_data(json!({
-            "skill": request.skill.as_str(),
-            "scope": managed_skill.scope.as_str(),
-            "builtin": builtin::is_bundled_install(&install_record),
-            "managed_import": managed_import.is_some(),
-            "managed_import_enabled": managed_import.map(|import| import.enabled),
-            "stored_source_root": lockfile_entry
-                .map(|_| stored_import_root(managed_skill.scope, &context.working_directory, request.skill.as_str()))
-                .transpose()?
-                .map(|root| root.display().to_string()),
-            "active_source_root": lockfile_entry
-                .map(|entry| stored_import_root(managed_skill.scope, &context.working_directory, request.skill.as_str()).map(|root| root.join(entry.source.subpath.as_str())))
-                .transpose()?
-                .map(|path| path.display().to_string()),
-            "overlay_root": managed_import
-                .and_then(|import| manifest.overrides.get(&import.id))
-                .map(|path| path.as_str().to_string()),
-            "canonical_root": if managed_import.is_none() && managed_skill.scope == ManagedScope::Workspace {
-                let local_root = context
-                    .working_directory
-                    .join(manifest.layout.skills_dir.as_str())
-                    .join(request.skill.as_str());
-                fs::metadata(&local_root)
-                    .ok()
-                    .filter(std::fs::Metadata::is_dir)
-                    .map(|_| planner::display_path(context, &local_root))
-            } else {
-                None
-            },
-            "source": {
-                "type": source_type_label(&install_record),
-                "url": install_record.source_url,
-                "subpath": install_record.source_subpath,
-            },
-            "resolved_revision": install_record.resolved_revision,
-            "effective_version_hash": install_record.effective_version_hash,
-            "planned_roots": planned_roots,
-            "projections": snapshot
-                .projections
-                .iter()
-                .map(|projection| projection_view(context, projection))
-                .collect::<Result<Vec<_>, _>>()?,
-        })))
+        .with_summary(format!(
+            "Resolved filesystem paths for {}.",
+            request.skill.as_str()
+        ))
+        .with_detail_lines(detail)
+        .with_data(data))
 }
 
-fn load_manifest_or_default(working_directory: &Path) -> Result<WorkspaceManifest, AppError> {
+/// The `skillctl path` report for a name no install record covers.
+///
+/// A canonical local skill in the workspace skills root never enters the state
+/// store, so this is the branch that answers for it: its physical locations are
+/// the canonical root and the roots the workspace plan projects it into. An
+/// explicit user-scope selector keeps refusing, because canonical local skills
+/// belong to the workspace and the selector narrows the request.
+fn canonical_local_path(
+    context: &AppContext,
+    manifest: &WorkspaceManifest,
+    store: &LocalStateStore,
+    request: &PathRequest,
+) -> Result<AppResponse, AppError> {
+    let skill = request.skill.as_str();
+    if context.selector.scope == Some(Scope::User) {
+        return Err(path_refusal(context, manifest, skill));
+    }
+    let Some(canonical_root) = canonical_local_root(context, manifest, skill) else {
+        return Err(path_refusal(context, manifest, skill));
+    };
+    if crate::resolver::is_generated_projection_root(&canonical_root)? {
+        // The directory holds a generated copy of some install, not a skill
+        // someone authored, so it is not a canonical root the command reports.
+        return Err(AppError::ResolutionValidation {
+            message: format!(
+                "skill '{skill}' has no install record and '{}' is a generated projection rather \
+                 than a canonical local skill; run 'skillctl explain {skill}' to see every \
+                 candidate it found",
+                planner::display_path(context, &canonical_root),
+            ),
+        });
+    }
+
+    // Canonical local skills keep no projection rows: sync materializes the
+    // plan straight from the canonical root, and only installs carry records.
+    let snapshot = store.skill_snapshot(&ManagedSkillRef::new(ManagedScope::Workspace, skill))?;
+    let planned_roots = planned_root_views(context, manifest, ManagedScope::Workspace, skill)?;
+    let data = json!({
+        "skill": skill,
+        "scope": ManagedScope::Workspace.as_str(),
+        "builtin": false,
+        "managed_import": false,
+        "managed_import_enabled": None::<bool>,
+        "stored_source_root": None::<String>,
+        "active_source_root": None::<String>,
+        "overlay_root": None::<String>,
+        "canonical_root": planner::display_path(context, &canonical_root),
+        "source": {
+            "type": "canonical-local",
+            "url": None::<String>,
+            "subpath": None::<String>,
+        },
+        "resolved_revision": None::<String>,
+        "effective_version_hash": None::<String>,
+        "planned_roots": planned_roots,
+        "projections": snapshot
+            .projections
+            .iter()
+            .map(|projection| projection_view(context, projection))
+            .collect::<Result<Vec<_>, _>>()?,
+    });
+    let detail = crate::human::path_detail_lines(&data);
+
+    Ok(AppResponse::success("path")
+        .with_summary(format!("Resolved filesystem paths for {skill}."))
+        .with_detail_lines(detail)
+        .with_data(data))
+}
+
+/// The canonical local root of one workspace skill, when the directory exists.
+pub(crate) fn canonical_local_root(
+    context: &AppContext,
+    manifest: &WorkspaceManifest,
+    skill: &str,
+) -> Option<PathBuf> {
+    let root = context
+        .working_directory
+        .join(manifest.layout.skills_dir.as_str())
+        .join(skill);
+    fs::metadata(&root)
+        .ok()
+        .filter(std::fs::Metadata::is_dir)
+        .map(|_| root)
+}
+
+/// The refusal `skillctl path` reports for a name it cannot place on disk.
+///
+/// The message names the roots the command consulted, because a bare "not
+/// installed" hides that `path` also answers for canonical local skills.
+/// `explain` is the command that reports every candidate it found, shadowed or
+/// not, so the refusal hands the name over to it.
+fn path_refusal(context: &AppContext, manifest: &WorkspaceManifest, skill: &str) -> AppError {
+    let skills_root = planner::display_path(
+        context,
+        &context
+            .working_directory
+            .join(manifest.layout.skills_dir.as_str()),
+    );
+    let message = if context.selector.scope == Some(Scope::User) {
+        format!(
+            "skill '{skill}' is not installed at user scope and canonical local skills live in \
+             the workspace at '{skills_root}'; run 'skillctl explain {skill}' to see every \
+             candidate it found",
+        )
+    } else {
+        format!(
+            "skill '{skill}' is not installed and no canonical local skill exists at \
+             '{skills_root}/{skill}'; run 'skillctl explain {skill}' to see every candidate it \
+             found",
+        )
+    };
+    AppError::ResolutionValidation { message }
+}
+
+pub(crate) fn load_manifest_or_default(
+    working_directory: &Path,
+) -> Result<WorkspaceManifest, AppError> {
     match WorkspaceManifest::load_from_workspace(working_directory) {
         Ok(manifest) => Ok(manifest),
         Err(AppError::FilesystemOperation {
@@ -829,7 +1370,9 @@ fn load_manifest_or_default(working_directory: &Path) -> Result<WorkspaceManifes
     }
 }
 
-fn load_lockfile_or_default(working_directory: &Path) -> Result<WorkspaceLockfile, AppError> {
+pub(crate) fn load_lockfile_or_default(
+    working_directory: &Path,
+) -> Result<WorkspaceLockfile, AppError> {
     match WorkspaceLockfile::load_from_workspace(working_directory) {
         Ok(lockfile) => Ok(lockfile),
         Err(AppError::FilesystemOperation {
@@ -846,6 +1389,17 @@ pub(crate) fn resolve_installed_skill(
     skill: &str,
     scope: Option<Scope>,
 ) -> Result<ManagedSkillRef, AppError> {
+    find_installed_skill(store, skill, scope)?.ok_or_else(|| AppError::ResolutionValidation {
+        message: format!("skill '{}' is not installed", skill),
+    })
+}
+
+/// Find the recorded install for one skill name, or `None` when absent.
+fn find_installed_skill(
+    store: &LocalStateStore,
+    skill: &str,
+    scope: Option<Scope>,
+) -> Result<Option<ManagedSkillRef>, AppError> {
     let scopes = match scope {
         Some(Scope::Workspace) => vec![ManagedScope::Workspace],
         Some(Scope::User) => vec![ManagedScope::User],
@@ -861,16 +1415,111 @@ pub(crate) fn resolve_installed_skill(
     }
 
     match matches.len() {
-        1 => Ok(matches.remove(0)),
-        0 => Err(AppError::ResolutionValidation {
-            message: format!("skill '{}' is not installed", skill),
+        1 => Ok(Some(matches.remove(0))),
+        0 => Ok(None),
+        _ => Err(multiple_scopes_error(skill)),
+    }
+}
+
+/// The shared resolution error for a skill name no scope selector narrows.
+pub(crate) fn multiple_scopes_error(skill: &str) -> AppError {
+    AppError::ResolutionValidation {
+        message: format!("skill '{skill}' exists in multiple scopes; re-run with --scope"),
+    }
+}
+
+/// How a lifecycle request relates to the bundled user-scope skill.
+///
+/// A repository may commit a workspace import under the bundled skill's own
+/// name, which is this repository's configuration. Such a request stays
+/// ambiguous until a `--scope` selector resolves it, so a mutating command must
+/// refuse it instead of guessing the bundled skill and silently leaving the
+/// import in place.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BundledRequest {
+    /// The request names the bundled user-scope skill.
+    Bundled,
+    /// The request names a managed import that normal resolution owns.
+    Managed,
+    /// Both scopes claim the name and no selector resolves it.
+    Ambiguous,
+}
+
+/// Decide which skill a request that matches the bundled skill's name names.
+///
+/// The install record decides when one exists. A workspace import the manifest
+/// declares also claims the name before any local record for it exists, which
+/// is the state a fresh clone of such a repository is in.
+pub(crate) fn classify_bundled_request(
+    context: &AppContext,
+    store: &LocalStateStore,
+    skill: &str,
+    scope: Option<Scope>,
+) -> Result<BundledRequest, AppError> {
+    if !builtin::is_bundled_request(skill, scope) {
+        return Ok(BundledRequest::Managed);
+    }
+
+    let import_claims_name = if scope.is_none() {
+        let manifest = load_manifest_or_default(&context.working_directory)?;
+        find_manifest_import(&manifest, skill, Some(Scope::Workspace))?.is_some()
+    } else {
+        false
+    };
+
+    match find_installed_skill(store, skill, scope)? {
+        Some(managed_skill) => {
+            let is_bundled_install = store
+                .install_record(&managed_skill)?
+                .is_some_and(|install| builtin::is_bundled_install(&install));
+            match (is_bundled_install, import_claims_name) {
+                (true, true) => Ok(BundledRequest::Ambiguous),
+                (true, false) => Ok(BundledRequest::Bundled),
+                (false, _) => Ok(BundledRequest::Managed),
+            }
+        }
+        None => Ok(if import_claims_name {
+            BundledRequest::Ambiguous
+        } else {
+            BundledRequest::Bundled
         }),
-        _ => Err(AppError::ResolutionValidation {
-            message: format!(
-                "skill '{}' exists in multiple scopes; re-run with --scope",
-                skill
-            ),
-        }),
+    }
+}
+
+/// Find a declared import in the committed manifest, or `None` when absent.
+///
+/// A fresh checkout carries `.agents/skillctl.yaml` and
+/// `.agents/skillctl.lock` but no install record, because the state store is
+/// local to each machine. Repair commands still work there: they resolve the
+/// import from that portable state instead of the local record.
+fn find_manifest_import(
+    manifest: &WorkspaceManifest,
+    skill: &str,
+    scope: Option<Scope>,
+) -> Result<Option<ManagedSkillRef>, AppError> {
+    let scopes: Vec<ManagedScope> = manifest
+        .imports
+        .iter()
+        .filter(|import| import.id == skill)
+        .filter(|import| match scope {
+            Some(Scope::Workspace) => import.scope == ManifestScope::Workspace,
+            Some(Scope::User) => import.scope == ManifestScope::User,
+            None => true,
+        })
+        .map(|import| managed_scope(import.scope))
+        .collect();
+
+    match scopes.as_slice() {
+        [scope] => Ok(Some(ManagedSkillRef::new(*scope, skill))),
+        [] => Ok(None),
+        _ => Err(multiple_scopes_error(skill)),
+    }
+}
+
+fn managed_scope(scope: ManifestScope) -> ManagedScope {
+    match scope {
+        ManifestScope::Workspace => ManagedScope::Workspace,
+        ManifestScope::User => ManagedScope::User,
     }
 }
 
@@ -898,6 +1547,7 @@ fn source_type_label(install: &crate::state::InstallRecord) -> &'static str {
             crate::source::SourceKind::Git => "git",
             crate::source::SourceKind::LocalPath => "local-path",
             crate::source::SourceKind::Archive => "archive",
+            crate::source::SourceKind::WellKnown => "well-known",
         }
     }
 }
@@ -935,31 +1585,123 @@ fn planned_root_views(
         .collect()
 }
 
+/// The report a mutation returns when it could not rebuild projections.
+///
+/// Resolution reads every enabled import, so a checkout that still holds one
+/// it never reconstructed cannot run a rebuild at all. A mutation that stays
+/// correct without one reports the skip instead of refusing. The named `sync`
+/// is qualified for `scope`, the scope the rebuild would have run in.
+fn skipped_projection_report(unrestored: &[String], scope: ManagedScope) -> serde_json::Value {
+    json!({
+        "skipped": true,
+        "unrestored_imports": unrestored,
+        "detail": format!(
+            "the projection rebuild was skipped because enabled imports have no stored \
+             source in this checkout; run 'skillctl restore --frozen' or remove them, \
+             then run '{}'",
+            crate::apply::scoped_sync_command(scope)
+        ),
+    })
+}
+
+/// The warning that names the imports whose missing stored source stopped a
+/// projection rebuild.
+fn skipped_projection_warning(unrestored: &[String], scope: ManagedScope) -> String {
+    format!(
+        "skipped the projection rebuild because enabled import{} {} ha{} no stored \
+         source in this checkout; run 'skillctl restore --frozen' or remove {}, then \
+         run '{}'",
+        if unrestored.len() == 1 { "" } else { "s" },
+        unrestored
+            .iter()
+            .map(|name| format!("'{name}'"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        if unrestored.len() == 1 { "s" } else { "ve" },
+        if unrestored.len() == 1 {
+            "it".to_string()
+        } else {
+            "them".to_string()
+        },
+        crate::apply::scoped_sync_command(scope),
+    )
+}
+
 fn toggle_managed_import(
     context: &AppContext,
     skill: &str,
     enabled: bool,
     command: &'static str,
 ) -> Result<AppResponse, AppError> {
-    lifecycle::run_transaction(command, |transaction| {
-        let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
-        let mut store = LocalStateStore::open_default_for(&context.working_directory)?;
-        transaction.track_path(&manifest.path)?;
-        transaction.track_state_database()?;
-        let managed_skill = resolve_installed_skill(&store, skill, context.selector.scope)?;
-        let scoped_context = history::context_for_scope(context, managed_skill.scope);
-        for root in materialize::planned_physical_root_paths(
+    let manifest = load_manifest_or_default(&context.working_directory)?;
+    let lockfile = load_lockfile_or_default(&context.working_directory)?;
+    let store = LocalStateStore::open_default_for(&context.working_directory)?;
+    let target = resolve_managed_import(
+        context,
+        &manifest,
+        &lockfile,
+        &store,
+        skill,
+        ImportResolution::Toggle,
+    )?;
+    let managed_skill = target.skill.clone();
+    // Enable and disable change local bookkeeping only, so the plan requires
+    // the recorded bundle identity to survive the mutation unchanged.
+    let expected = target
+        .toggle_expected_import(context, &lockfile)?
+        .ok_or_else(|| AppError::ResolutionValidation {
+            message: format!("skill '{skill}' is not a managed import"),
+        })?;
+
+    let scoped_context = history::context_for_scope(context, managed_skill.scope);
+    let plan = crate::apply::MutationPlanBuilder::new(
+        crate::apply::MutationOperation::Enable.or_disable(enabled),
+        &context.working_directory,
+    )
+    .skill(managed_skill.clone())
+    .expect_import(expected.clone())
+    .propose(crate::apply::ProposedImport {
+        import_id: managed_skill.skill_id.clone(),
+        revision: None,
+        bundle_digest: expected.bundle_digest,
+        bundle_policy: crate::apply::BundlePolicy::Preserve,
+        summary: format!(
+            "{} '{}' in {} scope without touching its bundle identity",
+            if enabled { "enable" } else { "disable" },
+            managed_skill.skill_id,
+            managed_skill.scope.as_str()
+        ),
+    })
+    .target(manifest.path.clone(), crate::apply::TargetAction::Update)
+    .targets(
+        materialize::sync_mutation_root_paths(
             &scoped_context,
             &manifest,
             target_scope(managed_skill.scope),
-        )? {
-            transaction.track_path(root)?;
-        }
+        )?,
+        crate::apply::TargetAction::Replace,
+    )
+    .seal();
+
+    crate::apply::run_guarded(&plan, context, |transaction| {
+        transaction.track_state_database()?;
+        let mut manifest = load_manifest_or_default(&context.working_directory)?;
+        let lockfile = load_lockfile_or_default(&context.working_directory)?;
+        let mut store = LocalStateStore::open_default_for(&context.working_directory)?;
+        let target = resolve_managed_import(
+            context,
+            &manifest,
+            &lockfile,
+            &store,
+            skill,
+            ImportResolution::Toggle,
+        )?;
+        let managed_skill = target.skill.clone();
+        let scoped_context = history::context_for_scope(context, managed_skill.scope);
         let import_index = manifest_import_index(&manifest, &managed_skill).ok_or_else(|| {
             AppError::ResolutionValidation {
                 message: format!(
-                    "skill '{}' is not a managed import in the workspace manifest",
-                    skill
+                    "skill '{skill}' is not a managed import in the workspace manifest"
                 ),
             }
         })?;
@@ -968,29 +1710,52 @@ fn toggle_managed_import(
         manifest.write_to_path()?;
 
         let timestamp = current_timestamp();
-        let sync_report = materialize::sync_workspace(&scoped_context)?;
-        let current_projections = materialize::rebuild_projection_records_for_scope(
-            &mut store,
-            managed_skill.scope,
-            &sync_report,
-            &timestamp,
-        )?;
+        // Projection rebuild reads every enabled import, so a checkout that
+        // still holds an import it never reconstructed cannot run one. The
+        // enablement change is still correct without it, and refusing it
+        // would leave a fresh clone unable to stop projecting an import it
+        // cannot restore.
+        let unrestored = materialize::unrestored_imports(context, &manifest)?;
+        let sync_report = if unrestored.is_empty() {
+            Some(materialize::sync_workspace(&scoped_context)?)
+        } else {
+            None
+        };
+        let current_projections = match &sync_report {
+            Some(report) => materialize::rebuild_projection_records_for_scope(
+                &mut store,
+                managed_skill.scope,
+                report,
+                &timestamp,
+            )?,
+            None => Vec::new(),
+        };
 
-        let mut ledger = HistoryLedger::new(&mut store);
-        materialize::record_pruned_projection_history(
-            &mut ledger,
-            context,
-            managed_skill.scope,
-            &sync_report,
-            &timestamp,
-        )?;
-        for record in current_projections
-            .iter()
-            .filter(|record| record.skill == managed_skill)
         {
-            ledger.record_projection(record)?;
+            let mut ledger = HistoryLedger::new(&mut store);
+            if let Some(report) = &sync_report {
+                materialize::record_pruned_projection_history(
+                    &mut ledger,
+                    context,
+                    managed_skill.scope,
+                    report,
+                    &timestamp,
+                )?;
+            }
+            for record in current_projections
+                .iter()
+                .filter(|record| record.skill == managed_skill)
+            {
+                ledger.record_projection(record)?;
+            }
         }
-        transaction.checkpoint("after-state")?;
+
+        let projection = match &sync_report {
+            Some(report) => {
+                serde_json::to_value(report).map_err(|source| AppError::JsonRender { source })?
+            }
+            None => skipped_projection_report(&unrestored, managed_skill.scope),
+        };
 
         let mut response = AppResponse::success(command)
             .with_summary(format!(
@@ -1004,10 +1769,24 @@ fn toggle_managed_import(
                 "scope": managed_skill.scope.as_str(),
                 "enabled": enabled,
                 "changed": changed,
-                "projection": sync_report,
+                "resolved_from": target.resolved_from(),
+                "bundle_digest": plan.expected.first().and_then(|expected| expected.bundle_digest.clone()),
+                "projection": projection,
             }));
-        for warning in &sync_report.warnings {
-            response = response.with_warning(warning.clone());
+        if target.origin == ImportOrigin::ManifestAndLockfile {
+            response = response.with_warning(format!(
+                "no install record for '{skill}' existed in this checkout, so {command} acted \
+                 on the import declared by .agents/skillctl.yaml and .agents/skillctl.lock"
+            ));
+        }
+        if !unrestored.is_empty() {
+            response =
+                response.with_warning(skipped_projection_warning(&unrestored, managed_skill.scope));
+        }
+        if let Some(report) = &sync_report {
+            for warning in &report.warnings {
+                response = response.with_warning(warning.clone());
+            }
         }
 
         Ok(response)
@@ -1189,42 +1968,46 @@ fn require_string_field<'a>(
 }
 
 fn validate_skill_name(value: &str, skill_path: &Path) -> Result<(), AppError> {
-    if value.is_empty() {
+    if let Some(message) = skill_name_format_error(value) {
         return Err(skill_validation(
             skill_path,
-            "SKILL.md field 'name' must not be empty",
+            format!("SKILL.md field 'name' {message}"),
         ));
     }
+
+    Ok(())
+}
+
+/// Return the reason a skill name violates the open Agent Skills naming rule.
+///
+/// The same rule governs `SKILL.md` frontmatter names, skill directory names,
+/// and the `name` field of remote discovery index entries, so every caller
+/// shares one definition of a valid skill name.
+pub fn skill_name_format_error(value: &str) -> Option<String> {
+    if value.is_empty() {
+        return Some("must not be empty".to_string());
+    }
     if value.len() > 64 {
-        return Err(skill_validation(
-            skill_path,
-            format!(
-                "SKILL.md field 'name' must be at most 64 characters, found {}",
-                value.len()
-            ),
+        return Some(format!(
+            "must be at most 64 characters, found {}",
+            value.len()
         ));
     }
     if value.starts_with('-') || value.ends_with('-') || value.contains("--") {
-        return Err(skill_validation(
-            skill_path,
-            format!(
-                "SKILL.md field 'name' must use lowercase letters, digits, and single hyphens: '{value}'"
-            ),
+        return Some(format!(
+            "must use lowercase letters, digits, and single hyphens: '{value}'"
         ));
     }
     if !value
         .bytes()
         .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
     {
-        return Err(skill_validation(
-            skill_path,
-            format!(
-                "SKILL.md field 'name' must use lowercase letters, digits, and hyphens only: '{value}'"
-            ),
+        return Some(format!(
+            "must use lowercase letters, digits, and hyphens only: '{value}'"
         ));
     }
 
-    Ok(())
+    None
 }
 
 fn validate_description(value: &str, skill_path: &Path) -> Result<(), AppError> {

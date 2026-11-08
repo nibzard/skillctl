@@ -232,11 +232,12 @@ fn rollback_reactivates_a_prior_effective_version_from_recorded_history() {
             .expect("effective version exists"),
         initial_effective_version
     );
-    assert_eq!(
-        lockfile["imports"]["release-notes"]["timestamps"]["last_updated_at"]
-            .as_str()
-            .expect("timestamp exists"),
-        "2026-02-02T03:21:08Z"
+    assert!(
+        !lockfile["imports"]["release-notes"]
+            .as_mapping()
+            .expect("import entry exists")
+            .contains_key("timestamps"),
+        "local timestamps stay out of the portable lockfile"
     );
 
     assert!(
@@ -325,6 +326,293 @@ fn rollback_reactivates_a_prior_effective_version_from_recorded_history() {
             "rollback".to_string(),
             "projection".to_string(),
         ]
+    );
+}
+
+/// `pin` and `rollback` in a workspace that holds a canonical local skill but
+/// no manifest.
+///
+/// Both commands act on an installed import, so the state store answers before
+/// the manifest is read. A name no install covers hears the resolution refusal
+/// `enable`, `disable`, and `remove` give it, not a raw manifest read error.
+#[test]
+fn pin_and_rollback_refuse_the_unmanaged_name_in_a_manifest_free_workspace() {
+    let workspace = TestWorkspace::new();
+    workspace.write_workspace_skill("bare", "Bare skill.", &[]);
+    let home = workspace.home_path();
+
+    for args in [
+        vec!["pin", "bare", "main"],
+        vec!["rollback", "bare", "abc123"],
+        vec!["--scope", "workspace", "pin", "bare", "main"],
+        vec!["--scope", "user", "rollback", "bare", "abc123"],
+    ] {
+        let output = Command::cargo_bin("skillctl")
+            .expect("binary exists")
+            .current_dir(workspace.path())
+            .env("HOME", &home)
+            .args(&args)
+            .output()
+            .expect("command runs");
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "{args:?} must refuse as a validation failure"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "{args:?} reports the refusal on stderr, not as a report"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            stderr.contains("skill 'bare' is not installed"),
+            "{args:?} must name the name no install covers: {stderr}"
+        );
+        assert!(
+            !stderr.contains("skillctl.yaml"),
+            "{args:?} must not report the manifest at all: {stderr}"
+        );
+        assert!(
+            !stderr.contains("os error"),
+            "{args:?} must not surface the raw filesystem error: {stderr}"
+        );
+    }
+
+    // The refusals leave the bare workspace bare: no manifest or lockfile is
+    // created for a command that never ran.
+    assert!(
+        !workspace.path().join(".agents/skillctl.yaml").exists(),
+        "no manifest may appear"
+    );
+    assert!(
+        !workspace.path().join(".agents/skillctl.lock").exists(),
+        "no lockfile may appear"
+    );
+    assert!(
+        workspace
+            .path()
+            .join(".agents/skills/bare/SKILL.md")
+            .is_file(),
+        "the canonical local skill stays untouched"
+    );
+
+    // The machine contract carries the same refusal.
+    let output = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", &home)
+        .args(["--json", "pin", "bare", "main"])
+        .output()
+        .expect("command runs");
+    assert_eq!(output.status.code(), Some(3), "the JSON run refuses too");
+    let body: Value = serde_json::from_slice(&output.stdout).expect("stdout is valid json");
+    assert_eq!(
+        body["ok"], false,
+        "the refusal must not claim success: {body:#?}"
+    );
+    assert!(
+        body["errors"]
+            .as_array()
+            .expect("errors array exists")
+            .iter()
+            .any(|error| error
+                .as_str()
+                .expect("error is a string")
+                .contains("skill 'bare' is not installed")),
+        "the JSON error must name the unmanaged skill: {body:#?}"
+    );
+}
+
+/// `pin` and `rollback` in a workspace that holds a real install but lost its
+/// manifest.
+///
+/// The state store resolves the name, so the refusal names the state that
+/// actually blocks the command: no declaration exists to rewrite. `skillctl
+/// init` and the committed manifest in a team checkout are both named repairs.
+#[test]
+fn pin_and_rollback_name_init_when_an_install_survives_a_lost_manifest() {
+    let workspace = TestWorkspace::new();
+    workspace.write_skill_source("shared-skills", "release-notes");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let lockfile_before = fs::read_to_string(workspace.path().join(".agents/skillctl.lock"))
+        .expect("the install pinned a lockfile");
+    fs::remove_file(workspace.path().join(".agents/skillctl.yaml"))
+        .expect("the manifest is removed");
+
+    for args in [
+        vec!["pin", "release-notes", "main"],
+        vec!["rollback", "release-notes", "abc123"],
+    ] {
+        let output = Command::cargo_bin("skillctl")
+            .expect("binary exists")
+            .current_dir(workspace.path())
+            .env("HOME", workspace.home_path())
+            .args(&args)
+            .output()
+            .expect("command runs");
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "{args:?} must refuse as a validation failure"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "{args:?} reports the refusal on stderr, not as a report"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let command = args[0];
+        assert!(
+            stderr.contains(".agents/skillctl.yaml"),
+            "{command} must name the missing manifest: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("'{command}'")),
+            "{command} must name the command that needs declared state: {stderr}"
+        );
+        assert!(
+            stderr.contains("skillctl init"),
+            "{command} must name the repair: {stderr}"
+        );
+        assert!(
+            !stderr.contains("os error"),
+            "{command} must not surface the raw filesystem error: {stderr}"
+        );
+    }
+
+    // A refused command changes nothing the lockfile pins.
+    assert_eq!(
+        fs::read_to_string(workspace.path().join(".agents/skillctl.lock"))
+            .expect("the lockfile survives"),
+        lockfile_before,
+        "the refusal must leave the pin exactly as it was"
+    );
+}
+
+/// `pin` and `rollback` in a workspace that holds a manifest and an install
+/// but lost its lockfile.
+///
+/// Both commands rewrite one lockfile entry, so the missing file is the state
+/// that blocks them. The refusal names both repairs: the committed lockfile
+/// for a team checkout, `skillctl init` for a workspace that pinned nothing
+/// yet. An empty lockfile from `init` would drop the pin instead of repairing
+/// it, so the raw read error never surfaces on its own.
+#[test]
+fn pin_and_rollback_name_both_repairs_when_the_manifest_survives_a_lost_lockfile() {
+    let workspace = TestWorkspace::new();
+    workspace.write_skill_source("shared-skills", "release-notes");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    fs::remove_file(workspace.path().join(".agents/skillctl.lock"))
+        .expect("the lockfile is removed");
+
+    for args in [
+        vec!["pin", "release-notes", "main"],
+        vec!["rollback", "release-notes", "abc123"],
+    ] {
+        let output = Command::cargo_bin("skillctl")
+            .expect("binary exists")
+            .current_dir(workspace.path())
+            .env("HOME", workspace.home_path())
+            .args(&args)
+            .output()
+            .expect("command runs");
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "{args:?} must refuse as a validation failure"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "{args:?} reports the refusal on stderr, not as a report"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let command = args[0];
+        assert!(
+            stderr.contains(".agents/skillctl.lock"),
+            "{command} must name the missing lockfile: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("'{command}'")),
+            "{command} must name the command that needs pinned state: {stderr}"
+        );
+        assert!(
+            stderr.contains("retrieve the committed .agents/skillctl.lock"),
+            "{command} must name the team-checkout repair: {stderr}"
+        );
+        assert!(
+            stderr.contains("skillctl init"),
+            "{command} must name the new-workspace repair: {stderr}"
+        );
+        assert!(
+            !stderr.contains("os error"),
+            "{command} must not surface the raw filesystem error: {stderr}"
+        );
+    }
+
+    // The refusal leaves the workspace as it found it: no lockfile appears for
+    // commands that never ran.
+    assert!(
+        !workspace.path().join(".agents/skillctl.lock").exists(),
+        "no lockfile may appear"
+    );
+    assert!(
+        workspace.path().join(".agents/skillctl.yaml").is_file(),
+        "the manifest survives untouched"
+    );
+
+    // The machine contract carries the same refusal.
+    let output = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--json", "pin", "release-notes", "main"])
+        .output()
+        .expect("command runs");
+    assert_eq!(output.status.code(), Some(3), "the JSON run refuses too");
+    let body: Value = serde_json::from_slice(&output.stdout).expect("stdout is valid json");
+    assert_eq!(
+        body["ok"], false,
+        "the refusal must not claim success: {body:#?}"
+    );
+    assert!(
+        body["errors"]
+            .as_array()
+            .expect("errors array exists")
+            .iter()
+            .any(|error| error
+                .as_str()
+                .expect("error is a string")
+                .contains("retrieve the committed .agents/skillctl.lock")),
+        "the JSON error must name the team-checkout repair: {body:#?}"
     );
 }
 
@@ -738,5 +1026,382 @@ fn list_and_path_report_managed_skill_inventory_and_filesystem_locations() {
     assert_eq!(
         path_body["data"]["projections"][0]["path"],
         ".claude/skills/release-notes"
+    );
+}
+
+/// Run one command with `--json` and return its assert and parsed payload.
+fn run_json(workspace: &TestWorkspace, args: &[&str]) -> (assert_cmd::assert::Assert, Value) {
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(args)
+        .assert();
+    let body: Value =
+        serde_json::from_slice(&assert.get_output().stdout).expect("stdout is valid json");
+    (assert, body)
+}
+
+/// Run one command without `--json` and return its stdout as text.
+fn run_human(workspace: &TestWorkspace, args: &[&str]) -> String {
+    let output = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(args)
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty())
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(output).expect("human stdout is valid utf-8")
+}
+
+#[test]
+fn path_reports_a_canonical_local_skill_that_was_never_installed() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!("version: 1\n", "\n", "targets:\n", "  - codex\n",));
+    workspace.write_workspace_skill("bare", "A first-party skill with no install.", &[]);
+
+    initialize_runtime_state(&workspace);
+
+    let (assert, body) = run_json(&workspace, &["--json", "path", "bare"]);
+    assert.success().stderr(predicate::str::is_empty());
+    assert_eq!(body["command"], "path");
+    assert_eq!(
+        body["ok"], true,
+        "a canonical local skill resolves: {body:#?}"
+    );
+    assert_eq!(body["data"]["skill"], "bare");
+    assert_eq!(body["data"]["scope"], "workspace");
+    assert_eq!(body["data"]["managed_import"], false);
+    assert_eq!(body["data"]["source"]["type"], "canonical-local");
+    assert_eq!(body["data"]["canonical_root"], ".agents/skills/bare");
+    assert_eq!(body["data"]["stored_source_root"], Value::Null);
+    assert_eq!(body["data"]["active_source_root"], Value::Null);
+    assert_eq!(body["data"]["overlay_root"], Value::Null);
+
+    // The neutral plan reuses the canonical root, so every target plans the
+    // authored directory itself.
+    let planned_roots = body["data"]["planned_roots"]
+        .as_array()
+        .expect("planned roots exist");
+    assert!(
+        !planned_roots.is_empty(),
+        "a canonical skill plans at least one root: {body:#?}",
+    );
+    for root in planned_roots {
+        assert_eq!(root["path"], ".agents/skills/bare", "{body:#?}");
+    }
+
+    let stdout = run_human(&workspace, &["path", "bare"]);
+    assert!(
+        stdout.contains("Resolved filesystem paths for bare."),
+        "path keeps its summary line: {stdout}",
+    );
+    assert!(
+        stdout.contains("  canonical: .agents/skills/bare"),
+        "the human output names the canonical root: {stdout}",
+    );
+    assert!(
+        stdout.contains("  source: canonical-local"),
+        "the human output names the source class: {stdout}",
+    );
+    assert!(
+        stdout.contains("  planned root (codex): .agents/skills/bare"),
+        "the human output names a planned root: {stdout}",
+    );
+
+    // `explain` resolves the same skill, so the two advertised debug commands
+    // must agree that the name resolves.
+    let (assert, explain) = run_json(&workspace, &["--json", "explain", "bare"]);
+    assert.success().stderr(predicate::str::is_empty());
+    assert_eq!(explain["data"]["status"], "selected", "{explain:#?}");
+    assert_eq!(explain["data"]["winner"]["root"], ".agents/skills/bare");
+}
+
+#[test]
+fn path_refusal_documents_what_it_consulted_and_hands_over_to_explain() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!("version: 1\n", "\n", "targets:\n", "  - codex\n",));
+    initialize_runtime_state(&workspace);
+
+    let (assert, body) = run_json(&workspace, &["--json", "path", "missing"]);
+    assert.failure().code(3).stderr(predicate::str::is_empty());
+    let message = body["errors"][0]
+        .as_str()
+        .expect("the refusal carries an error message");
+    assert!(
+        message.contains("skill 'missing' is not installed"),
+        "the refusal names the skill: {message}",
+    );
+    assert!(
+        message.contains("no canonical local skill exists at '.agents/skills/missing'"),
+        "the refusal names the canonical root it checked: {message}",
+    );
+    assert!(
+        message.contains("run 'skillctl explain missing'"),
+        "the refusal directs the user to explain: {message}",
+    );
+
+    // A user-scope selector narrows the request, and canonical local skills
+    // belong to the workspace, so the selector keeps its refusal.
+    workspace.write_workspace_skill("bare", "A first-party skill with no install.", &[]);
+    let (assert, body) = run_json(&workspace, &["--json", "--scope", "user", "path", "bare"]);
+    assert.failure().code(3).stderr(predicate::str::is_empty());
+    let message = body["errors"][0]
+        .as_str()
+        .expect("the refusal carries an error message");
+    assert!(
+        message.contains("not installed at user scope"),
+        "the refusal names the selected scope: {message}",
+    );
+    assert!(
+        message.contains("canonical local skills live in the workspace at '.agents/skills'"),
+        "the refusal says where canonical local skills live: {message}",
+    );
+}
+
+#[test]
+fn path_does_not_report_a_generated_projection_root_as_a_canonical_skill() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!("version: 1\n", "\n", "targets:\n", "  - codex\n",));
+    workspace.write_workspace_skill("generated", "A generated copy of an import.", &[]);
+    workspace.write_file(
+        ".agents/skills/generated/.skillctl-projection.json",
+        "{\n  \"tool\": \"skillctl\",\n  \"skill_name\": \"generated\"\n}\n",
+    );
+    initialize_runtime_state(&workspace);
+
+    let (assert, body) = run_json(&workspace, &["--json", "path", "generated"]);
+    assert.failure().code(3).stderr(predicate::str::is_empty());
+    let message = body["errors"][0]
+        .as_str()
+        .expect("the refusal carries an error message");
+    assert!(
+        message.contains("'.agents/skills/generated' is a generated projection"),
+        "the refusal says the directory is generated, not canonical: {message}",
+    );
+    assert!(
+        message.contains("run 'skillctl explain generated'"),
+        "the refusal directs the user to explain: {message}",
+    );
+}
+
+#[test]
+fn history_reports_an_empty_ledger_for_a_canonical_local_skill() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_workspace_skill("canon", "A first-party skill with no install.", &[]);
+    initialize_runtime_state(&workspace);
+
+    run_json(&workspace, &["--json", "sync"])
+        .0
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    // Sync materializes the canonical skill, but the ledger follows managed
+    // imports, so it records no event for it.
+    assert!(
+        workspace
+            .path()
+            .join(".claude/skills/canon/SKILL.md")
+            .is_file(),
+        "sync materializes the canonical skill",
+    );
+    let connection = Connection::open(workspace.home_path().join(".skillctl/state.db"))
+        .expect("state database opens");
+    let canon_events: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM history_events WHERE skill_id = ?1",
+            params!["canon"],
+            |row| row.get(0),
+        )
+        .expect("history count query succeeds");
+    assert_eq!(
+        canon_events, 0,
+        "sync records no ledger event for a canonical local skill",
+    );
+
+    let (assert, body) = run_json(&workspace, &["--json", "history", "canon"]);
+    assert.success().stderr(predicate::str::is_empty());
+    assert_eq!(
+        body["ok"], true,
+        "a canonical local skill resolves instead of refusing: {body:#?}"
+    );
+    assert_eq!(body["data"]["skill"], "canon");
+    assert_eq!(body["data"]["scope"], "workspace");
+    assert_eq!(body["data"]["source"], "canonical-local");
+    assert_eq!(body["data"]["canonical_root"], ".agents/skills/canon");
+    assert_eq!(
+        body["data"]["entries"]
+            .as_array()
+            .expect("entries exist")
+            .len(),
+        0,
+        "the canonical local report lists no events: {body:#?}",
+    );
+    let note = body["data"]["note"]
+        .as_str()
+        .expect("the empty report documents its scope");
+    assert!(
+        note.contains("managed imports"),
+        "the note names the ledger scope: {note}",
+    );
+    assert!(
+        note.contains("run 'skillctl explain canon'"),
+        "the note directs the user to explain: {note}",
+    );
+
+    let stdout = run_human(&workspace, &["history", "canon"]);
+    assert!(
+        stdout.contains("No history entries recorded for canon."),
+        "history keeps its summary line: {stdout}",
+    );
+    assert!(
+        stdout.contains("  canonical local skill at .agents/skills/canon"),
+        "the human output names the canonical root: {stdout}",
+    );
+    assert!(
+        stdout.contains("run 'skillctl explain canon' for its projections"),
+        "the human output says why sync records no event: {stdout}",
+    );
+
+    // `path` and `explain` resolve the same skill, so all three advertised
+    // debug commands agree that the name resolves.
+    run_json(&workspace, &["--json", "path", "canon"])
+        .0
+        .success()
+        .stderr(predicate::str::is_empty());
+    let (assert, explain) = run_json(&workspace, &["--json", "explain", "canon"]);
+    assert.success().stderr(predicate::str::is_empty());
+    assert_eq!(explain["data"]["status"], "selected", "{explain:#?}");
+}
+
+#[test]
+fn history_refusal_documents_the_ledger_scope_and_hands_over_to_explain() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!("version: 1\n", "\n", "targets:\n", "  - codex\n",));
+    initialize_runtime_state(&workspace);
+
+    let (assert, body) = run_json(&workspace, &["--json", "history", "missing"]);
+    assert.failure().code(3).stderr(predicate::str::is_empty());
+    let message = body["errors"][0]
+        .as_str()
+        .expect("the refusal carries an error message");
+    assert!(
+        message.contains("skill 'missing' has no recorded history"),
+        "the refusal names the skill: {message}",
+    );
+    assert!(
+        message.contains("no canonical local skill exists at '.agents/skills/missing'"),
+        "the refusal names the canonical root it checked: {message}",
+    );
+    assert!(
+        message.contains("the history ledger records lifecycle events for managed imports"),
+        "the refusal documents the ledger scope: {message}",
+    );
+    assert!(
+        message.contains("run 'skillctl explain missing'"),
+        "the refusal directs the user to explain: {message}",
+    );
+
+    // A user-scope selector narrows the request, and canonical local skills
+    // belong to the workspace, so the selector keeps its refusal.
+    workspace.write_workspace_skill("bare", "A first-party skill with no install.", &[]);
+    let (assert, body) = run_json(
+        &workspace,
+        &["--json", "--scope", "user", "history", "bare"],
+    );
+    assert.failure().code(3).stderr(predicate::str::is_empty());
+    let message = body["errors"][0]
+        .as_str()
+        .expect("the refusal carries an error message");
+    assert!(
+        message.contains("has no recorded history at user scope"),
+        "the refusal names the selected scope: {message}",
+    );
+    assert!(
+        message.contains("canonical local skills live in the workspace at '.agents/skills'"),
+        "the refusal says where canonical local skills live: {message}",
+    );
+    assert!(
+        message.contains("run 'skillctl explain bare'"),
+        "the refusal directs the user to explain: {message}",
+    );
+}
+
+#[test]
+fn history_does_not_treat_a_generated_projection_root_as_a_canonical_skill() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!("version: 1\n", "\n", "targets:\n", "  - codex\n",));
+    workspace.write_workspace_skill("generated", "A generated copy of an import.", &[]);
+    workspace.write_file(
+        ".agents/skills/generated/.skillctl-projection.json",
+        "{\n  \"tool\": \"skillctl\",\n  \"skill_name\": \"generated\"\n}\n",
+    );
+    initialize_runtime_state(&workspace);
+
+    let (assert, body) = run_json(&workspace, &["--json", "history", "generated"]);
+    assert.failure().code(3).stderr(predicate::str::is_empty());
+    let message = body["errors"][0]
+        .as_str()
+        .expect("the refusal carries an error message");
+    assert!(
+        message.contains("'.agents/skills/generated' is a generated projection"),
+        "the refusal says the directory is generated, not canonical: {message}",
+    );
+    assert!(
+        message.contains("run 'skillctl explain generated'"),
+        "the refusal directs the user to explain: {message}",
+    );
+}
+
+#[test]
+fn history_lists_ledger_events_recorded_for_a_canonical_local_skill() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(concat!(
+        "version: 1\n",
+        "\n",
+        "targets:\n",
+        "  - claude-code\n",
+    ));
+    workspace.write_workspace_skill("canon", "A first-party skill with no install.", &[]);
+    initialize_runtime_state(&workspace);
+    run_json(&workspace, &["--json", "sync"])
+        .0
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    // `clean` records a cleanup event that names the canonical skill, so the
+    // ledger itself starts covering the name.
+    run_json(&workspace, &["--json", "clean"])
+        .0
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let (assert, body) = run_json(&workspace, &["--json", "history", "canon"]);
+    assert.success().stderr(predicate::str::is_empty());
+    let entries = body["data"]["entries"]
+        .as_array()
+        .expect("entries exist")
+        .to_vec();
+    assert_eq!(
+        entries.len(),
+        1,
+        "the recorded cleanup event is the only canon row: {body:#?}",
+    );
+    assert_eq!(entries[0]["kind"], "cleanup");
+    assert_eq!(entries[0]["skill_id"], "canon");
+    assert_eq!(
+        body["data"]["source"],
+        Value::Null,
+        "a covered name reports its ledger rows, not the canonical fallback: {body:#?}",
     );
 }

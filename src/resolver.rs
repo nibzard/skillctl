@@ -148,7 +148,9 @@ pub struct ResolvedImport {
     pub locked_subpath: LockfilePath,
     /// Locked resolved revision.
     pub resolved_revision: String,
-    /// Last observed upstream revision, when available.
+    /// Last observed upstream revision, when the requested reference leaves
+    /// one to observe. A reference that pins an immutable revision withholds a
+    /// value an older lockfile recorded for it.
     pub upstream_revision: Option<String>,
     /// Locked content hash.
     pub content_hash: String,
@@ -256,6 +258,9 @@ pub struct EffectiveSkillGraph {
     pub candidates: Vec<ResolvedSkillCandidate>,
     /// One outcome per projected skill name.
     pub projections: Vec<EffectiveSkillProjection>,
+    /// Stored imports that resolved although their content no longer hashes to
+    /// the lockfile pin. Empty unless the request asked to report them.
+    pub store_divergences: Vec<ImportStoreDivergence>,
 }
 
 impl EffectiveSkillGraph {
@@ -297,6 +302,36 @@ impl EffectiveSkillGraph {
     }
 }
 
+/// How resolution treats a stored import that no longer hashes to its pin.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StoreDivergencePolicy {
+    /// Fail resolution with an error that names a repair that works.
+    #[default]
+    Fail,
+    /// Resolve the import from the stored content and report the divergence.
+    ///
+    /// Symlink mode needs this: a projected link points into the import
+    /// store, so an ordinary edit through the runtime copy writes the store
+    /// itself. The projection rebuild reports that divergence instead of
+    /// refusing to run, and the drift guard preserves the copy.
+    Report,
+}
+
+/// One stored import whose content no longer matches the lockfile pin.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportStoreDivergence {
+    /// Manifest import identifier whose stored content diverged.
+    pub import_id: String,
+    /// Scope the import is installed in.
+    pub scope: SkillScope,
+    /// Projected skill name the import resolves to.
+    pub skill_name: String,
+    /// Content digest the lockfile pins.
+    pub pinned_content_hash: String,
+    /// Content digest observed in the import store.
+    pub observed_content_hash: String,
+}
+
 /// Filesystem-backed request to build the effective-skill graph for one workspace.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolveWorkspaceRequest {
@@ -310,6 +345,8 @@ pub struct ResolveWorkspaceRequest {
     pub lockfile: WorkspaceLockfile,
     /// Optional explicit manifest priorities keyed by internal skill id.
     pub manifest_priorities: BTreeMap<InternalSkillId, i32>,
+    /// How a stored import that no longer hashes to its pin is treated.
+    pub store_divergence: StoreDivergencePolicy,
 }
 
 impl ResolveWorkspaceRequest {
@@ -326,6 +363,7 @@ impl ResolveWorkspaceRequest {
             manifest,
             lockfile,
             manifest_priorities: BTreeMap::new(),
+            store_divergence: StoreDivergencePolicy::Fail,
         }
     }
 
@@ -337,6 +375,12 @@ impl ResolveWorkspaceRequest {
         self.manifest_priorities = manifest_priorities;
         self
     }
+
+    /// Choose how a stored import that no longer hashes to its pin is treated.
+    pub fn with_store_divergence_policy(mut self, store_divergence: StoreDivergencePolicy) -> Self {
+        self.store_divergence = store_divergence;
+        self
+    }
 }
 
 /// Build the explainable effective-skill graph for the workspace inputs.
@@ -344,7 +388,8 @@ pub fn build_effective_skill_graph(
     request: &ResolveWorkspaceRequest,
 ) -> Result<EffectiveSkillGraph, AppError> {
     let mut candidates = discover_local_candidates(request)?;
-    candidates.extend(discover_import_candidates(request)?);
+    let mut store_divergences = Vec::new();
+    candidates.extend(discover_import_candidates(request, &mut store_divergences)?);
     candidates.sort_by(compare_candidates);
 
     let projections = build_projections(&candidates);
@@ -352,6 +397,7 @@ pub fn build_effective_skill_graph(
     Ok(EffectiveSkillGraph {
         candidates,
         projections,
+        store_divergences,
     })
 }
 
@@ -448,19 +494,21 @@ pub(crate) fn is_generated_projection_root(root: &Path) -> Result<bool, AppError
 
 fn discover_import_candidates(
     request: &ResolveWorkspaceRequest,
+    store_divergences: &mut Vec<ImportStoreDivergence>,
 ) -> Result<Vec<ResolvedSkillCandidate>, AppError> {
     request
         .manifest
         .imports
         .iter()
         .filter(|import| import.enabled)
-        .map(|import| load_import_candidate(request, import))
+        .map(|import| load_import_candidate(request, import, store_divergences))
         .collect()
 }
 
 fn load_import_candidate(
     request: &ResolveWorkspaceRequest,
     import: &ImportDefinition,
+    store_divergences: &mut Vec<ImportStoreDivergence>,
 ) -> Result<ResolvedSkillCandidate, AppError> {
     let Some(locked_import) = request.lockfile.imports.get(&import.id) else {
         return Err(AppError::ResolutionValidation {
@@ -479,6 +527,17 @@ fn load_import_candidate(
         &request.working_directory,
         &import.id,
     )?;
+    if !stored_source_root.is_dir() {
+        return Err(AppError::ResolutionValidation {
+            message: format!(
+                "enabled import '{}' has no stored source in '{}'. The import cache is local to \
+                 each checkout, so a fresh clone or a moved checkout must reconstruct it with \
+                 'skillctl restore --frozen' before sync or projection can use it",
+                import.id,
+                stored_source_root.display()
+            ),
+        });
+    }
     ensure_directory(
         &stored_source_root,
         "inspect stored import root",
@@ -489,22 +548,45 @@ fn load_import_candidate(
     ensure_directory(&skill_root, "inspect stored imported skill", "directory")?;
 
     let recomputed_content_hash = hash_directory_contents(&skill_root)?;
-    if recomputed_content_hash != locked_import.hashes.content {
-        return Err(AppError::ResolutionValidation {
-            message: format!(
-                "stored import '{}' content hash mismatch: lockfile pins {} but stored \
-                 content hashes to {}; the import store changed after install. Run \
-                 'skillctl update {}' to re-pin after you verify the change is expected, or \
-                 reinstall the skill",
-                import.id, locked_import.hashes.content, recomputed_content_hash, import.id
-            ),
-        });
-    }
+    let diverged_from_pin = if recomputed_content_hash == locked_import.hashes.content {
+        None
+    } else {
+        match request.store_divergence {
+            StoreDivergencePolicy::Fail => {
+                return Err(AppError::ResolutionValidation {
+                    message: store_divergence_error(
+                        &import.id,
+                        &locked_import.hashes.content,
+                        &recomputed_content_hash,
+                    ),
+                });
+            }
+            // The stored bytes still resolve, so the caller learns which skill
+            // carries them and decides itself what may read them.
+            StoreDivergencePolicy::Report => Some(recomputed_content_hash),
+        }
+    };
 
     let base_files = collect_file_map(&skill_root, "imported skill")?;
     let (files, overlay) = match request.manifest.overrides.get(&import.id) {
         Some(overlay_path) => {
             let overlay_root = request.working_directory.join(overlay_path.as_str());
+            if !overlay_root.is_dir() {
+                return Err(AppError::ResolutionValidation {
+                    message: format!(
+                        "the manifest declares an overlay at '{}' for import '{}' but that \
+                         directory does not exist in this checkout. Overlays are committable \
+                         portable state, so a fresh clone needs them committed next to \
+                         .agents/skillctl.yaml and .agents/skillctl.lock. Run 'skillctl override \
+                         {}' to create the overlay, or remove the 'overrides.{}' entry from the \
+                         manifest",
+                        overlay_path.as_str(),
+                        import.id,
+                        import.id,
+                        import.id
+                    ),
+                });
+            }
             apply_overlay(base_files, &overlay_root)?
         }
         None => (base_files, None),
@@ -535,6 +617,15 @@ fn load_import_candidate(
     )?;
 
     let scope = SkillScope::from(import.scope);
+    if let Some(observed_content_hash) = diverged_from_pin {
+        store_divergences.push(ImportStoreDivergence {
+            import_id: import.id.clone(),
+            scope,
+            skill_name: skill.name.as_str().to_string(),
+            pinned_content_hash: locked_import.hashes.content.clone(),
+            observed_content_hash,
+        });
+    }
     let internal_id = InternalSkillId::imported(
         scope,
         import.id.clone(),
@@ -563,12 +654,53 @@ fn load_import_candidate(
             source_url: locked_import.source.url.clone(),
             locked_subpath: locked_import.source.subpath.clone(),
             resolved_revision: locked_import.revision.resolved.clone(),
-            upstream_revision: locked_import.revision.upstream.clone(),
+            // A lockfile written before a commit pin stopped recording an
+            // upstream observation may still carry one, so the reference the
+            // import requests decides whether the value can be reported.
+            upstream_revision: crate::source::reportable_upstream_revision(
+                locked_import.revision.upstream.as_ref(),
+                &locked_import.revision.resolved,
+                Some(import.ref_spec.as_str()),
+            )
+            .cloned(),
             content_hash: locked_import.hashes.content.clone(),
             overlay_hash: locked_import.hashes.overlay.clone(),
             effective_version_hash: locked_import.hashes.effective_version.clone(),
         }),
     })
+}
+
+/// Repair advice for a stored import whose content no longer matches the pin.
+///
+/// One state keeps one command list, so the drift guard, the plan note, the
+/// apply skip reason, `doctor`, and this module all report the same repairs:
+/// a frozen restore replaces the content with the pinned bytes, and a
+/// reinstall fetches the source again and re-pins it. Both rebuild the store,
+/// so both drop the bytes the divergence carries, and the advice names the
+/// standalone `skillctl fork <skill>` that copies those bytes into local
+/// ownership first.
+pub(crate) fn store_divergence_repair(import_id: &str) -> String {
+    format!(
+        "run 'skillctl restore --frozen' to rebuild the pinned content, or reinstall the skill \
+         to pin the changed content after reviewing it; both drop the changed bytes, so run \
+         'skillctl fork {import_id}' first to keep them"
+    )
+}
+
+/// Error for a stored import whose content no longer matches the lockfile pin.
+///
+/// `skillctl update <import>` reads the same diverged store to plan a re-pin,
+/// so it fails with this very error under every strategy, `--strategy fork`
+/// included, and no update strategy may appear as the repair. The named
+/// repairs rebuild the store, and the fork that keeps the changed bytes is the
+/// standalone `skillctl fork <skill>` the shared repair advice names.
+pub(crate) fn store_divergence_error(import_id: &str, pinned: &str, observed: &str) -> String {
+    format!(
+        "stored import '{import_id}' content hash mismatch: lockfile pins {pinned} but stored \
+         content hashes to {observed}; the import store changed after install, so no update \
+         strategy can run through it; {}",
+        store_divergence_repair(import_id)
+    )
 }
 
 fn build_projections(candidates: &[ResolvedSkillCandidate]) -> Vec<EffectiveSkillProjection> {
@@ -952,10 +1084,7 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use crate::{
-        lockfile::{
-            LockedHashes, LockedImport, LockedRevision, LockedSource, LockedTimestamps,
-            LockfileTimestamp,
-        },
+        lockfile::{LockedHashes, LockedImport, LockedRevision, LockedSource},
         manifest::ImportSourceType,
         source::{SourceKind, stored_import_root},
         state::ManagedScope,
@@ -1190,6 +1319,55 @@ mod tests {
     }
 
     #[test]
+    fn a_well_known_import_resolves_and_projects_like_any_other_import() {
+        let fixture = ResolverFixture::new();
+        fixture.write_skill(
+            "imports/code-review/skills/code-review",
+            "code-review",
+            "Fetched from a well-known discovery index.",
+        );
+
+        let mut import = import_definition("code-review", "skills/code-review");
+        import.kind = ImportSourceType::WellKnown;
+        import.url = "https://skills.example.com/.well-known/agent-skills/index.json".to_string();
+        import.ref_spec =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+
+        let (_, mut locked) = locked_import(
+            "code-review",
+            "https://skills.example.com/.well-known/agent-skills/index.json",
+            "skills/code-review",
+        );
+        locked.source.kind = SourceKind::WellKnown;
+        locked.revision.resolved = import.ref_spec.clone();
+        locked.discovery = Some(crate::lockfile::LockedDiscoveryEntry {
+            skill: "code-review".to_string(),
+            artifact_type: crate::discovery::ArtifactType::SkillMd,
+            url: "https://skills.example.com/.well-known/agent-skills/code-review/SKILL.md"
+                .to_string(),
+            digest: import.ref_spec.clone(),
+        });
+
+        let request = fixture.request(vec![import], vec![("code-review".to_string(), locked)]);
+
+        let graph =
+            build_effective_skill_graph(&request).expect("effective skill graph should build");
+        graph
+            .ensure_conflict_free()
+            .expect("graph should be conflict free");
+
+        let projection = graph
+            .projection_for("code-review")
+            .expect("projection exists");
+        let winner = projection.winner().expect("winner exists");
+        assert_eq!(winner.source_class, SkillSourceClass::Imported);
+        assert_eq!(
+            winner.skill.description,
+            "Fetched from a well-known discovery index."
+        );
+    }
+
+    #[test]
     fn ignores_generated_projection_roots_when_discovering_canonical_local_skills() {
         let fixture = ResolverFixture::new();
         fixture.write_skill(
@@ -1385,15 +1563,12 @@ mod tests {
                     url: url.to_string(),
                     subpath: LockfilePath::new(subpath),
                 },
+                discovery: None,
                 revision: LockedRevision {
                     resolved: "0123456789abcdef0123456789abcdef01234567".to_string(),
                     upstream: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
                 },
-                timestamps: LockedTimestamps {
-                    fetched_at: LockfileTimestamp::new("2026-03-19T00:00:00Z"),
-                    first_installed_at: LockfileTimestamp::new("2026-03-19T00:00:00Z"),
-                    last_updated_at: LockfileTimestamp::new("2026-03-19T00:00:00Z"),
-                },
+                bundle: None,
                 hashes: LockedHashes {
                     content: format!("sha256:{id}:content"),
                     overlay: format!("sha256:{id}:overlay"),

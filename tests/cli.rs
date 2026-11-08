@@ -7,40 +7,68 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
+    sync::Arc,
+    sync::LazyLock,
     sync::atomic::{AtomicU64, Ordering},
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 static TEST_WORKSPACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-const MINIMAL_LOCKFILE: &str = concat!(
-    "version: 1\n",
-    "\n",
-    "state:\n",
-    "  manifest_version: 1\n",
-    "  local_state_version: 2\n",
-);
+/// Lockfile text `skillctl init` writes, pinned to the state schema version
+/// this build ships.
+static MINIMAL_LOCKFILE: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "version: 2\n\nstate:\n  manifest_version: 1\n  local_state_version: {}\n",
+        skillctl::state::CURRENT_LOCAL_STATE_VERSION,
+    )
+});
 
 #[path = "cli/bundled.rs"]
 mod bundled;
 #[path = "cli/cleanup.rs"]
 mod cleanup;
+#[path = "cli/diagnostics.rs"]
+mod diagnostics;
+#[path = "cli/discover.rs"]
+mod discover;
+#[path = "cli/drift.rs"]
+mod drift;
 #[path = "cli/help.rs"]
 mod help;
+#[path = "cli/human_output.rs"]
+mod human_output;
+#[path = "cli/import_repair.rs"]
+mod import_repair;
 #[path = "cli/init.rs"]
 mod init;
 #[path = "cli/install.rs"]
 mod install;
 #[path = "cli/inventory.rs"]
 mod inventory;
+#[path = "cli/local_source_apply.rs"]
+mod local_source_apply;
 #[path = "cli/override_cmd.rs"]
 mod override_cmd;
 #[path = "cli/projection.rs"]
 mod projection;
+#[path = "cli/restore.rs"]
+mod restore;
+#[path = "cli/review.rs"]
+mod review;
+#[path = "cli/state_recovery.rs"]
+mod state_recovery;
+#[path = "cli/trust_gate.rs"]
+mod trust_gate;
 #[path = "cli/update.rs"]
 mod update;
+#[path = "cli/update_apply.rs"]
+mod update_apply;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PathSnapshot {
@@ -48,6 +76,59 @@ enum PathSnapshot {
     File(Vec<u8>),
     Directory(BTreeMap<String, PathSnapshot>),
     Symlink(PathBuf),
+    /// SQLite databases are compared by table rows. A restored database is
+    /// written through SQLite, which always rewrites the file header change
+    /// counter, so identical rows do not produce identical bytes.
+    Database(BTreeMap<String, Vec<String>>),
+}
+
+/// Magic prefix of every SQLite 3 database file.
+const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+
+fn is_sqlite_database(path: &Path) -> bool {
+    use std::io::Read as _;
+
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0_u8; 16];
+    file.read_exact(&mut magic).is_ok() && &magic == SQLITE_MAGIC
+}
+
+fn snapshot_database_rows(path: &Path) -> BTreeMap<String, Vec<String>> {
+    let connection = Connection::open(path).expect("database opens");
+    let mut table_statement = connection
+        .prepare(
+            "SELECT name FROM sqlite_master \
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .expect("table query prepares");
+    let tables = table_statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("table query runs")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("table names read");
+
+    let mut dump = BTreeMap::new();
+    for table in tables {
+        let mut statement = connection
+            .prepare(&format!("SELECT * FROM \"{table}\""))
+            .expect("row query prepares");
+        let columns = statement.column_count();
+        let mut rows = statement
+            .query_map([], |row| {
+                (0..columns)
+                    .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(|values| format!("{values:?}"))
+            })
+            .expect("row query runs")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("rows read");
+        rows.sort();
+        dump.insert(table, rows);
+    }
+    dump
 }
 
 fn initialize_runtime_state(workspace: &TestWorkspace) {
@@ -100,6 +181,9 @@ fn snapshot_path(path: &Path) -> PathSnapshot {
     }
 
     if metadata.is_file() {
+        if is_sqlite_database(path) {
+            return PathSnapshot::Database(snapshot_database_rows(path));
+        }
         return PathSnapshot::File(
             fs::read(path)
                 .unwrap_or_else(|error| panic!("failed to read '{}': {error}", path.display())),
@@ -221,6 +305,18 @@ impl TestWorkspace {
             fs::create_dir_all(parent).expect("parent directory exists");
         }
         fs::write(path, contents).expect("file written");
+    }
+
+    /// Copy a file or a directory tree into the workspace at a relative path.
+    fn copy_path(&self, source: &Path, relative_path: &str) {
+        let destination = self.path.join(relative_path);
+        copy_tree(source, &destination).unwrap_or_else(|error| {
+            panic!(
+                "failed to copy '{}' into '{}': {error}",
+                source.display(),
+                destination.display()
+            )
+        });
     }
 
     fn write_skill_source(&self, source_dir: &str, skill_name: &str) {
@@ -372,4 +468,116 @@ impl Drop for TestWorkspace {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+/// Recursively copy a file or directory tree, following no symlinks.
+fn copy_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.is_dir() {
+        fs::create_dir_all(destination)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(source, destination)?;
+    Ok(())
+}
+
+/// One response a local test origin serves.
+struct Route {
+    path: &'static str,
+    status: u16,
+    body: Vec<u8>,
+}
+
+fn route(path: &'static str, status: u16, body: String) -> Route {
+    Route {
+        path,
+        status,
+        body: body.into_bytes(),
+    }
+}
+
+/// Route one binary body, such as a downloaded archive.
+fn route_bytes(path: &'static str, status: u16, body: Vec<u8>) -> Route {
+    Route { path, status, body }
+}
+
+/// Serve `routes` on a free localhost port and return the origin URL.
+///
+/// The server lives in the test process, so it stops with the test binary and
+/// needs no cleanup registration.
+fn serve(routes: Vec<Route>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test origin binds a free port");
+    let address = listener
+        .local_addr()
+        .expect("test origin reports its address");
+    let routes = Arc::new(routes);
+
+    thread::spawn(move || {
+        while let Ok((stream, _)) = listener.accept() {
+            handle_connection(stream, &routes);
+        }
+    });
+
+    format!("http://{address}")
+}
+
+fn handle_connection(mut stream: TcpStream, routes: &[Route]) {
+    let mut buffer = [0_u8; 8192];
+    let read = stream.read(&mut buffer).unwrap_or(0);
+    let request = String::from_utf8_lossy(&buffer[..read]);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or_default()
+        .split('?')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+
+    let (status, body) = match routes.iter().find(|route| route.path == path) {
+        Some(route) => (route.status, route.body.clone()),
+        None => (404, String::from("{\"error\":\"not found\"}").into_bytes()),
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        reason_phrase(status),
+        body.len(),
+    );
+
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.write_all(&body);
+    let _ = stream.flush();
+}
+
+const fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        _ => "Status",
+    }
+}
+
+/// Digest of one committed discovery fixture, computed at test time.
+fn fixture_digest(relative_path: &str) -> String {
+    let bytes = fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join(relative_path))
+        .unwrap_or_else(|error| panic!("fixture {relative_path} is readable: {error}"));
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+/// Bytes of one committed discovery fixture.
+fn fixture_bytes(relative_path: &str) -> Vec<u8> {
+    fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join(relative_path))
+        .unwrap_or_else(|error| panic!("fixture {relative_path} is readable: {error}"))
 }

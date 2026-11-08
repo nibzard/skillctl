@@ -11,15 +11,16 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     app::AppContext,
-    cli::Scope,
     error::AppError,
     history::{self, HistoryLedger},
-    lifecycle,
-    lockfile::{LockfileTimestamp, WorkspaceLockfile},
+    lockfile::WorkspaceLockfile,
     manifest::{ImportDefinition, ManifestPath, ManifestScope, WorkspaceManifest},
     materialize::{self, PROJECTION_METADATA_FILE},
     response::AppResponse,
-    skill::SKILL_MANIFEST_FILE,
+    skill::{
+        BundledRequest, ImportResolution, ManagedImportTarget, SKILL_MANIFEST_FILE,
+        classify_bundled_request,
+    },
     source::{compute_effective_version_hash, current_timestamp, stored_import_root},
     state::{LocalStateStore, ManagedScope, ManagedSkillRef},
 };
@@ -77,14 +78,73 @@ pub fn handle_override(
     context: &AppContext,
     request: OverrideRequest,
 ) -> Result<AppResponse, AppError> {
-    lifecycle::run_transaction("override", |transaction| {
+    let store = LocalStateStore::open_default_for(&context.working_directory)?;
+    gate_bundled_request(context, &store, &request.skill, CommandKind::Override)?;
+    // Resolution runs against the documented defaults, so a name nothing
+    // manages hears the same refusal `enable`, `disable`, and `remove` give it
+    // instead of a raw manifest read error.
+    let declared = crate::skill::load_manifest_or_default(&context.working_directory)?;
+    let pinned = crate::skill::load_lockfile_or_default(&context.working_directory)?;
+    let target = resolve_overlay_target(
+        context,
+        &declared,
+        &pinned,
+        &store,
+        &request.skill,
+        CommandKind::Override,
+    )?;
+    let managed_skill = target.skill;
+    // A resolution that survived the defaults still writes the import
+    // declaration, so the mutation needs the committed manifest.
+    let manifest = WorkspaceManifest::load_required_from_workspace(context, "override")?;
+    // An overlay re-pins the effective hashes in the lockfile, so a missing
+    // lockfile refuses with the repairs instead of the raw read error.
+    let lockfile = WorkspaceLockfile::load_required_from_workspace(context, "override")?;
+    let expected = crate::apply::capture_expected_imports(context, Some(managed_skill.scope))?;
+    let overlay_path = manifest
+        .overrides
+        .get(&request.skill)
+        .cloned()
+        .unwrap_or_else(|| default_overlay_path(&manifest, &request.skill));
+    let overlay_root = context.working_directory.join(overlay_path.as_str());
+    let plan = crate::apply::MutationPlanBuilder::new(
+        crate::apply::MutationOperation::Override,
+        &context.working_directory,
+    )
+    .skill(managed_skill.clone())
+    .expect_imports(expected)
+    .propose(crate::apply::ProposedImport {
+        import_id: managed_skill.skill_id,
+        revision: None,
+        bundle_digest: lockfile
+            .imports
+            .get(&request.skill)
+            .and_then(|entry| entry.bundle_digest().map(str::to_string)),
+        bundle_policy: crate::apply::BundlePolicy::Preserve,
+        summary: format!(
+            "create an overlay for '{}' and recompute its effective hashes",
+            request.skill
+        ),
+    })
+    .target(manifest.path, crate::apply::TargetAction::Update)
+    .target(lockfile.path, crate::apply::TargetAction::Update)
+    .target(overlay_root, crate::apply::TargetAction::Create)
+    .seal();
+
+    crate::apply::run_guarded(&plan, context, |transaction| {
+        transaction.track_state_database()?;
         let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
         let mut lockfile = WorkspaceLockfile::load_from_workspace(&context.working_directory)?;
         let mut store = LocalStateStore::open_default_for(&context.working_directory)?;
-        transaction.track_path(&manifest.path)?;
-        transaction.track_path(&lockfile.path)?;
-        transaction.track_state_database()?;
-        let managed_skill = resolve_managed_skill(&store, &request.skill, context.selector.scope)?;
+        let target = resolve_overlay_target(
+            context,
+            &manifest,
+            &lockfile,
+            &store,
+            &request.skill,
+            CommandKind::Override,
+        )?;
+        let managed_skill = target.skill;
         let scope = manifest_scope(managed_skill.scope);
         let import = managed_import(&manifest, &request.skill, scope)?;
         let overlay_path = manifest
@@ -162,7 +222,6 @@ pub fn handle_override(
 
         lockfile_entry.hashes.overlay = overlay_hash.clone();
         lockfile_entry.hashes.effective_version = effective_version_hash.clone();
-        lockfile_entry.timestamps.last_updated_at = LockfileTimestamp::new(timestamp.clone());
         lockfile.write_to_path()?;
 
         install_record.overlay_hash = overlay_hash.clone();
@@ -212,14 +271,89 @@ pub fn handle_override(
 
 /// Handle `skillctl fork`.
 pub fn handle_fork(context: &AppContext, request: ForkRequest) -> Result<AppResponse, AppError> {
-    lifecycle::run_transaction("fork", |transaction| {
+    let store = LocalStateStore::open_default_for(&context.working_directory)?;
+    gate_bundled_request(context, &store, &request.skill, CommandKind::Fork)?;
+    // Resolution runs against the documented defaults for the same reason as
+    // `override`: a name nothing manages hears the resolution refusal.
+    let declared = crate::skill::load_manifest_or_default(&context.working_directory)?;
+    let pinned = crate::skill::load_lockfile_or_default(&context.working_directory)?;
+    let target = resolve_overlay_target(
+        context,
+        &declared,
+        &pinned,
+        &store,
+        &request.skill,
+        CommandKind::Fork,
+    )?;
+    let managed_skill = target.skill;
+    // A fork removes the import declaration and its pin, so the mutation needs
+    // the committed manifest.
+    let manifest = WorkspaceManifest::load_required_from_workspace(context, "fork")?;
+    // A fork drops the pin from the lockfile, so a missing lockfile refuses
+    // with the repairs instead of the raw read error.
+    let lockfile = WorkspaceLockfile::load_required_from_workspace(context, "fork")?;
+    let expected = crate::apply::capture_expected_imports(context, Some(managed_skill.scope))?;
+    let local_root_relative = format!(
+        "{}/{}",
+        manifest.layout.skills_dir.as_str().trim_end_matches('/'),
+        request.skill
+    );
+    let local_root = context.working_directory.join(&local_root_relative);
+    let scoped_context = history::context_for_scope(context, managed_skill.scope);
+    let plan = crate::apply::MutationPlanBuilder::new(
+        crate::apply::MutationOperation::Fork,
+        &context.working_directory,
+    )
+    .skill(managed_skill.clone())
+    .expect_imports(expected)
+    .propose(crate::apply::ProposedImport {
+        import_id: managed_skill.skill_id,
+        revision: None,
+        bundle_digest: lockfile
+            .imports
+            .get(&request.skill)
+            .and_then(|entry| entry.bundle_digest().map(str::to_string)),
+        bundle_policy: crate::apply::BundlePolicy::Release,
+        summary: format!(
+            "fork '{}' into local canonical ownership at '{local_root_relative}'",
+            request.skill
+        ),
+    })
+    .retained_artifacts(
+        lockfile
+            .imports
+            .get(&request.skill)
+            .and_then(|entry| entry.bundle_digest().map(str::to_string))
+            .into_iter()
+            .collect(),
+    )
+    .targets(
+        materialize::sync_mutation_root_paths(
+            &scoped_context,
+            &manifest,
+            crate::adapter::TargetScope::Workspace,
+        )?,
+        crate::apply::TargetAction::Replace,
+    )
+    .target(manifest.path, crate::apply::TargetAction::Update)
+    .target(lockfile.path, crate::apply::TargetAction::Update)
+    .target(local_root, crate::apply::TargetAction::Create)
+    .seal();
+
+    crate::apply::run_guarded(&plan, context, |transaction| {
+        transaction.track_state_database()?;
         let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
         let mut lockfile = WorkspaceLockfile::load_from_workspace(&context.working_directory)?;
         let mut store = LocalStateStore::open_default_for(&context.working_directory)?;
-        transaction.track_path(&manifest.path)?;
-        transaction.track_path(&lockfile.path)?;
-        transaction.track_state_database()?;
-        let managed_skill = resolve_managed_skill(&store, &request.skill, context.selector.scope)?;
+        let target = resolve_overlay_target(
+            context,
+            &manifest,
+            &lockfile,
+            &store,
+            &request.skill,
+            CommandKind::Fork,
+        )?;
+        let managed_skill = target.skill;
         if managed_skill.scope != ManagedScope::Workspace {
             return Err(AppError::ResolutionValidation {
                 message: format!(
@@ -247,7 +381,7 @@ pub fn handle_fork(context: &AppContext, request: ForkRequest) -> Result<AppResp
         }
 
         let scoped_context = history::context_for_scope(context, managed_skill.scope);
-        for root in materialize::planned_physical_root_paths(
+        for root in materialize::sync_mutation_root_paths(
             &scoped_context,
             &manifest,
             crate::adapter::TargetScope::Workspace,
@@ -282,11 +416,7 @@ pub fn handle_fork(context: &AppContext, request: ForkRequest) -> Result<AppResp
                 .join(lockfile_entry.source.subpath.as_str());
         ensure_directory_path(&stored_skill_root, "inspect stored imported skill")?;
 
-        let local_root_relative = ManifestPath::new(format!(
-            "{}/{}",
-            manifest.layout.skills_dir.as_str().trim_end_matches('/'),
-            request.skill
-        ));
+        let local_root_relative = ManifestPath::new(local_root_relative.clone());
         let local_root = context.working_directory.join(local_root_relative.as_str());
         transaction.track_path(&local_root)?;
         prepare_local_root(&local_root, &request.skill)?;
@@ -365,36 +495,169 @@ pub fn handle_fork(context: &AppContext, request: ForkRequest) -> Result<AppResp
     })
 }
 
-fn resolve_managed_skill(
-    store: &LocalStateStore,
-    skill: &str,
-    scope: Option<Scope>,
-) -> Result<ManagedSkillRef, AppError> {
-    let scopes = match scope {
-        Some(Scope::Workspace) => vec![ManagedScope::Workspace],
-        Some(Scope::User) => vec![ManagedScope::User],
-        None => vec![ManagedScope::Workspace, ManagedScope::User],
-    };
-    let mut matches = Vec::new();
+/// The overlay workflow command a bundled-name refusal names.
+#[derive(Clone, Copy)]
+enum CommandKind {
+    /// `skillctl override`.
+    Override,
+    /// `skillctl fork`.
+    Fork,
+}
 
-    for managed_scope in scopes {
-        let candidate = ManagedSkillRef::new(managed_scope, skill);
-        if store.install_record(&candidate)?.is_some() {
-            matches.push(candidate);
+impl CommandKind {
+    /// Command name the refusal repeats.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Override => "override",
+            Self::Fork => "fork",
         }
     }
 
-    match matches.len() {
-        1 => Ok(matches.remove(0)),
-        0 => Err(AppError::ResolutionValidation {
-            message: format!("skill '{}' is not a managed imported skill", skill),
-        }),
-        _ => Err(AppError::ResolutionValidation {
+    /// What the command does to a managed import.
+    fn action(self) -> &'static str {
+        match self {
+            Self::Override => "overlay",
+            Self::Fork => "fork",
+        }
+    }
+}
+
+/// Refuse a request that names the bundled user-scope skill.
+///
+/// Override and fork act on managed imports, and the bundled skill is locally
+/// owned. The lockfile pins imports by name without a scope, so without this
+/// gate a checkout that also declares an import under the bundled skill's name
+/// resolves the request to the bundled install record and pairs it with that
+/// import's lockfile entry, which the guarded plan can never verify again.
+fn gate_bundled_request(
+    context: &AppContext,
+    store: &LocalStateStore,
+    skill: &str,
+    command: CommandKind,
+) -> Result<(), AppError> {
+    match classify_bundled_request(context, store, skill, context.selector.scope)? {
+        BundledRequest::Bundled => Err(bundled_skill_error(command, skill)),
+        BundledRequest::Ambiguous => Err(bundled_name_collision_error(command, skill)),
+        BundledRequest::Managed => Ok(()),
+    }
+}
+
+/// The refusal a request for the bundled skill itself gets.
+///
+/// No overlay or fork workflow applies to the bundled skill, so the refusal
+/// names the exits: stop projecting it, or manage a copy of the content as a
+/// workspace import those commands can act on.
+fn bundled_skill_error(command: CommandKind, skill: &str) -> AppError {
+    AppError::ResolutionValidation {
+        message: format!(
+            "skill '{skill}' is the bundled user-scope skill, which {} cannot act on because \
+             it is not a managed import; run 'skillctl --scope user remove {skill}' to stop \
+             projecting it, or 'skillctl install <source> --name {skill} --scope workspace' to \
+             manage a copy you can {}",
+            command.name(),
+            command.action(),
+        ),
+    }
+}
+
+/// The refusal an unscoped request gets when a declared workspace import shares
+/// the bundled skill's name.
+///
+/// The name is ambiguous, so the refusal keeps the shared scope-resolution
+/// sentence and adds which side of the collision the command can act on.
+fn bundled_name_collision_error(command: CommandKind, skill: &str) -> AppError {
+    AppError::ResolutionValidation {
+        message: format!(
+            "skill '{skill}' exists in multiple scopes; re-run with --scope: the bundled \
+             user-scope skill is not a managed import, so {} cannot act on it; run 'skillctl \
+             --scope workspace {} {skill}' to act on the declared workspace import",
+            command.name(),
+            command.name(),
+        ),
+    }
+}
+
+/// Resolve the managed import an override or a fork acts on.
+///
+/// An install record is the normal source of truth. A checkout that holds the
+/// committed manifest and lockfile but no record, such as a fresh clone before
+/// its first restore, still resolves the import those two files declare, so a
+/// request that names that import fails on the state that actually blocks the
+/// command instead of a claim that the checkout does not manage it. A caller
+/// may pass the documented defaults instead, which is how a workspace without a
+/// manifest hears the same refusal for a name nothing manages as `enable` and
+/// `remove` give it.
+fn resolve_overlay_target(
+    context: &AppContext,
+    manifest: &WorkspaceManifest,
+    lockfile: &WorkspaceLockfile,
+    store: &LocalStateStore,
+    skill: &str,
+    command: CommandKind,
+) -> Result<ManagedImportTarget, AppError> {
+    let target = crate::skill::resolve_managed_import(
+        context,
+        manifest,
+        lockfile,
+        store,
+        skill,
+        ImportResolution::Overlay,
+    )?;
+    let stored_skill_root = stored_skill_root(context, lockfile, &target.skill)?;
+    if !stored_skill_root.is_dir() || target.install.is_none() {
+        return Err(unrestored_import_error(command, skill, &stored_skill_root));
+    }
+    Ok(target)
+}
+
+/// The stored skill root an override or a fork reads content from.
+fn stored_skill_root(
+    context: &AppContext,
+    lockfile: &WorkspaceLockfile,
+    skill: &ManagedSkillRef,
+) -> Result<PathBuf, AppError> {
+    let subpath = lockfile
+        .imports
+        .get(&skill.skill_id)
+        .map(|entry| entry.source.subpath.as_str().to_string())
+        .unwrap_or_default();
+    Ok(stored_import_root(skill.scope, &context.working_directory, &skill.skill_id)?.join(subpath))
+}
+
+/// The refusal an import this checkout cannot read from its store gets.
+///
+/// Override and fork copy content out of the stored import source and update
+/// the local install record. The import cache and the state store are local to
+/// each machine, so a checkout may hold one layer without the other, and a
+/// missing cache also stops a checkout whose record survives it. The refusal
+/// names the layer that is missing, and `skillctl restore --frozen` as the
+/// repair that rebuilds both from the lockfile. A source the checkout cannot
+/// reconstruct again also names `remove`, which is the only other exit.
+fn unrestored_import_error(
+    command: CommandKind,
+    skill: &str,
+    stored_skill_root: &Path,
+) -> AppError {
+    if stored_skill_root.is_dir() {
+        return AppError::ResolutionValidation {
             message: format!(
-                "skill '{}' exists in multiple scopes; re-run with --scope",
-                skill
+                "import '{skill}' has a stored source at '{}' but no install record in this \
+                 checkout; the state store is local to each machine, so run 'skillctl restore \
+                 --frozen' before {command} can use the import",
+                stored_skill_root.display(),
+                command = command.name(),
             ),
-        }),
+        };
+    }
+
+    AppError::ResolutionValidation {
+        message: format!(
+            "import '{skill}' has no stored source in '{}'. The import cache is local to each \
+             checkout, so reconstruct it with 'skillctl restore --frozen', or clear the import \
+             with 'skillctl remove {skill}', before {command} can use it",
+            stored_skill_root.display(),
+            command = command.name(),
+        ),
     }
 }
 
