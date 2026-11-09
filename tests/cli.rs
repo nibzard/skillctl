@@ -20,7 +20,8 @@ use std::{
 mod support;
 
 pub use support::{
-    MINIMAL_LOCKFILE, PathSnapshot, TestWorkspace, is_sqlite_database, snapshot_path,
+    MINIMAL_LOCKFILE, PathSnapshot, TestWorkspace, file_url, is_sqlite_database, portable,
+    snapshot_path,
 };
 
 #[cfg(unix)]

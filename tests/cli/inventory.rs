@@ -1004,20 +1004,17 @@ fn list_and_path_report_managed_skill_inventory_and_filesystem_locations() {
         path_body["data"]["stored_source_root"]
             .as_str()
             .expect("stored source root exists")
-            == workspace
-                .workspace_import_root("release-notes")
-                .display()
-                .to_string(),
+            == portable(&workspace.workspace_import_root("release-notes")),
     );
     assert!(
         path_body["data"]["active_source_root"]
             .as_str()
             .expect("active source root exists")
-            == workspace
-                .workspace_import_root("release-notes")
-                .join(".agents/skills/release-notes")
-                .display()
-                .to_string(),
+            == portable(
+                &workspace
+                    .workspace_import_root("release-notes")
+                    .join(".agents/skills/release-notes")
+            ),
     );
     assert_eq!(
         path_body["data"]["planned_roots"][0]["path"],

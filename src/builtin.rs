@@ -451,7 +451,7 @@ fn inspect_projection_root(path: &Path) -> Result<RootStatus, AppError> {
         Ok(metadata) if !metadata.is_dir() => Ok(RootStatus::Conflict {
             message: format!(
                 "the bundled skillctl skill could not be projected because '{}' is not a directory",
-                path.display()
+                crate::planner::portable_path(path)
             ),
         }),
         Ok(_) => match builtin_projection_state(path)? {
@@ -462,14 +462,14 @@ fn inspect_projection_root(path: &Path) -> Result<RootStatus, AppError> {
                     "the projected bundled skill at '{}' holds edits skillctl did not record \
                      and was left untouched; move the edits into a canonical skill or remove the \
                      directory to let skillctl regenerate it",
-                    path.display()
+                    crate::planner::portable_path(path)
                 ),
             }),
             BundledProjectionState::Conflict => Ok(RootStatus::Conflict {
                 message: format!(
                     "the bundled skillctl skill is blocked by a hand-authored or user-managed \
 skill directory at '{}'",
-                    path.display()
+                    crate::planner::portable_path(path)
                 ),
             }),
         },

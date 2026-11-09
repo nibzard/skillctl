@@ -2652,10 +2652,30 @@ fn home_directory() -> Result<PathBuf, AppError> {
 }
 
 pub(crate) fn display_path(context: &AppContext, path: &Path) -> String {
-    path.strip_prefix(&context.working_directory).map_or_else(
-        |_| path.display().to_string(),
-        |relative| relative.display().to_string(),
-    )
+    match path.strip_prefix(&context.working_directory) {
+        Ok(relative) => portable_path(relative),
+        Err(_) => portable_path(path),
+    }
+}
+
+/// Render one path in the portable display form every report uses.
+///
+/// JSON payloads and human output spell paths with `/` separators on every
+/// platform, matching the portable relative paths the lockfile already pins.
+/// Windows joins produce `\` separators, and a joined path that carries a
+/// literal component such as `.agents/skills` even mixes both, so every path
+/// that leaves the process through a serde field or a message runs through
+/// this helper. The replacement runs only on Windows: on Linux and macOS `/`
+/// is already the separator, and a `\` inside a Unix filename must survive.
+///
+/// Filesystem operations keep the platform `Path` spelling; only the rendered
+/// string is normalized.
+pub(crate) fn portable_path(path: &Path) -> String {
+    if cfg!(windows) {
+        path.display().to_string().replace('\\', "/")
+    } else {
+        path.display().to_string()
+    }
 }
 
 fn deduplicate_notes(notes: Vec<String>) -> Vec<String> {

@@ -505,11 +505,11 @@ pub fn handle_list(context: &AppContext, _request: ListRequest) -> Result<AppRes
             "stored_source_root": lockfile_entry
                 .map(|_| stored_import_root(install.skill.scope, &context.working_directory, &install.skill.skill_id))
                 .transpose()?
-                .map(|root| root.display().to_string()),
+                .map(|root| crate::planner::portable_path(&root)),
             "active_source_root": lockfile_entry
                 .map(|entry| stored_import_root(install.skill.scope, &context.working_directory, &install.skill.skill_id).map(|root| root.join(entry.source.subpath.as_str())))
                 .transpose()?
-                .map(|path| path.display().to_string()),
+                .map(|path| crate::planner::portable_path(&path)),
             "pinned_reference": snapshot.pin.as_ref().map(|pin| pin.requested_reference.clone()),
             // The stored check can predate the apply that moved this install,
             // so the payload carries the fitted view instead of the raw row.
@@ -710,7 +710,7 @@ pub fn handle_remove(
             &stored_source_root,
             "remove stored import root",
         )? {
-            removed_paths.push(stored_source_root.display().to_string());
+            removed_paths.push(crate::planner::portable_path(&stored_source_root));
         }
 
         // Projection rebuild reads every enabled import, so a checkout that
@@ -1198,11 +1198,11 @@ pub fn handle_path(context: &AppContext, request: PathRequest) -> Result<AppResp
         "stored_source_root": lockfile_entry
             .map(|_| stored_import_root(managed_skill.scope, &context.working_directory, request.skill.as_str()))
             .transpose()?
-            .map(|root| root.display().to_string()),
+            .map(|root| crate::planner::portable_path(&root)),
         "active_source_root": lockfile_entry
             .map(|entry| stored_import_root(managed_skill.scope, &context.working_directory, request.skill.as_str()).map(|root| root.join(entry.source.subpath.as_str())))
             .transpose()?
-            .map(|path| path.display().to_string()),
+            .map(|path| crate::planner::portable_path(&path)),
         "overlay_root": managed_import
             .and_then(|import| manifest.overrides.get(&import.id))
             .map(|path| path.as_str().to_string()),
@@ -1970,7 +1970,7 @@ fn validate_directory_name(root: &Path, name: &str, skill_path: &Path) -> Result
                 skill_path,
                 format!(
                     "skill directory '{}' must end in a valid UTF-8 directory name",
-                    root.display()
+                    crate::planner::portable_path(root)
                 ),
             )
         })?;

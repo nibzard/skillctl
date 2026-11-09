@@ -563,7 +563,7 @@ fn hard_link_violation(metadata: &fs::Metadata, path: &Path) -> Option<String> {
             Err(source) => {
                 return Some(format!(
                     "file '{}' cannot be inspected for hard links: {source}",
-                    path.display()
+                    crate::planner::portable_path(path)
                 ));
             }
         }
@@ -633,7 +633,7 @@ mod windows_hard_links {
 fn hard_link_refusal(path: &Path) -> String {
     format!(
         "hard-linked file '{}' cannot be bundled; hard links hide independent content changes",
-        path.display()
+        crate::planner::portable_path(path)
     )
 }
 
@@ -689,7 +689,7 @@ fn collect_tree(
                 root,
                 format!(
                     "symlink '{}' is not supported inside a canonical bundle",
-                    path.display()
+                    crate::planner::portable_path(&path)
                 ),
             ));
         }
@@ -701,8 +701,8 @@ fn collect_tree(
                     .map_err(|_| AppError::BundleValidation {
                         message: format!(
                             "path '{}' escaped the bundle root '{}'",
-                            path.display(),
-                            root.display()
+                            crate::planner::portable_path(&path),
+                            crate::planner::portable_path(root)
                         ),
                     })?
                     .to_path_buf(),
@@ -715,7 +715,7 @@ fn collect_tree(
                 root,
                 format!(
                     "entry '{}' is not a regular file or directory and cannot be bundled",
-                    path.display()
+                    crate::planner::portable_path(&path)
                 ),
             ));
         }
@@ -729,8 +729,8 @@ fn collect_tree(
                 .map_err(|_| AppError::BundleValidation {
                     message: format!(
                         "path '{}' escaped the bundle root '{}'",
-                        path.display(),
-                        root.display()
+                        crate::planner::portable_path(&path),
+                        crate::planner::portable_path(root)
                     ),
                 })?
                 .to_path_buf(),
@@ -901,7 +901,11 @@ pub fn artifact_directory_name(digest: &str) -> Result<&str, AppError> {
 
 fn bundle_error(root: &Path, message: impl Into<String>) -> AppError {
     AppError::BundleValidation {
-        message: format!("{}: {}", root.display(), message.into()),
+        message: format!(
+            "{}: {}",
+            crate::planner::portable_path(root),
+            message.into()
+        ),
     }
 }
 

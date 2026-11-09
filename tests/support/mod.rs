@@ -354,7 +354,7 @@ impl TestWorkspace {
 
     pub fn git_repo_url(&self, relative_path: &str) -> String {
         let path = fs::canonicalize(self.path.join(relative_path)).expect("repo path exists");
-        format!("file://{}", path.display())
+        file_url(&path)
     }
 
     pub fn init_git_repo(&self, relative_path: &str) {
@@ -450,6 +450,32 @@ impl Drop for TestWorkspace {
 
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+}
+
+/// File URL for one path, spelled the way `url::Url` and skillctl spell it.
+///
+/// String concatenation cannot build a Windows file URL: the drive colon
+/// belongs after a third slash (`file:///C:/...`), and a canonicalized
+/// verbatim `\\?\` prefix must be dropped. `url::Url::from_file_path` renders
+/// both, matching the URLs skillctl records for local sources. The path is
+/// canonicalized first, because skillctl records the URL from its own
+/// canonicalized spelling (Windows short names such as `RUNNER~1` resolve to
+/// the long form there).
+pub fn file_url(path: &Path) -> String {
+    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    url::Url::from_file_path(&resolved)
+        .expect("path converts to a file URL")
+        .to_string()
+}
+
+/// Render one path the way skillctl output renders it: '/' separators.
+///
+/// JSON payloads and human output spell paths with '/' on every platform, so
+/// a test that compares a constructed path against payload text renders the
+/// expectation through this helper instead of `Path::display`, which Windows
+/// spells with '\'.
+pub fn portable(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
 }
 
 /// Resolve a fixture path to the spelling a child process observes.

@@ -432,8 +432,8 @@ fn discover_local_candidates(
                 |_| AppError::ResolutionValidation {
                     message: format!(
                         "canonical skill root '{}' is outside the workspace '{}'",
-                        root.display(),
-                        request.working_directory.display()
+                        crate::planner::portable_path(&root),
+                        crate::planner::portable_path(&request.working_directory)
                     ),
                 },
             )?)?;
@@ -494,7 +494,7 @@ fn load_import_candidate(
                  each checkout, so a fresh clone or a moved checkout must reconstruct it with \
                  'skillctl restore --frozen' before sync or projection can use it",
                 import.id,
-                stored_source_root.display()
+                crate::planner::portable_path(&stored_source_root)
             ),
         });
     }
@@ -802,8 +802,8 @@ fn collect_directory_files(
             return Err(AppError::ResolutionValidation {
                 message: format!(
                     "{kind} directory '{}' contains unsupported symlink '{}'",
-                    root.display(),
-                    path.display()
+                    crate::planner::portable_path(root),
+                    crate::planner::portable_path(&path)
                 ),
             });
         }
@@ -816,8 +816,8 @@ fn collect_directory_files(
                     AppError::ResolutionValidation {
                         message: format!(
                             "{kind} path '{}' escaped the root '{}'",
-                            path.display(),
-                            root.display()
+                            crate::planner::portable_path(&path),
+                            crate::planner::portable_path(root)
                         ),
                     }
                 })?)?;
@@ -833,8 +833,8 @@ fn collect_directory_files(
             return Err(AppError::ResolutionValidation {
                 message: format!(
                     "{kind} directory '{}' contains a non-file, non-directory entry '{}'",
-                    root.display(),
-                    path.display()
+                    crate::planner::portable_path(root),
+                    crate::planner::portable_path(&path)
                 ),
             });
         }
@@ -865,8 +865,8 @@ fn apply_overlay(
             return Err(AppError::ResolutionValidation {
                 message: format!(
                     "overlay '{}' file '{}' does not map to an imported file",
-                    overlay_root.display(),
-                    relative_path.display()
+                    crate::planner::portable_path(overlay_root),
+                    crate::planner::portable_path(&relative_path)
                 ),
             });
         };
@@ -931,8 +931,8 @@ fn read_child_directories(root: &Path, kind: &'static str) -> Result<Vec<PathBuf
             return Err(AppError::ResolutionValidation {
                 message: format!(
                     "{kind} '{}' contains unsupported symlink '{}'",
-                    root.display(),
-                    path.display()
+                    crate::planner::portable_path(root),
+                    crate::planner::portable_path(&path)
                 ),
             });
         }
@@ -942,8 +942,8 @@ fn read_child_directories(root: &Path, kind: &'static str) -> Result<Vec<PathBuf
             return Err(AppError::ResolutionValidation {
                 message: format!(
                     "{kind} '{}' contains a non-directory entry '{}'",
-                    root.display(),
-                    path.display()
+                    crate::planner::portable_path(root),
+                    crate::planner::portable_path(&path)
                 ),
             });
         }
@@ -964,7 +964,10 @@ fn ensure_directory(
     })?;
     if metadata.file_type().is_symlink() {
         return Err(AppError::ResolutionValidation {
-            message: format!("path '{}' must not be a symlink", path.display()),
+            message: format!(
+                "path '{}' must not be a symlink",
+                crate::planner::portable_path(path)
+            ),
         });
     }
     if !metadata.is_dir() {
@@ -1006,7 +1009,7 @@ fn normalize_relative_filesystem_path(path: &Path) -> Result<PathBuf, AppError> 
                 return Err(AppError::ResolutionValidation {
                     message: format!(
                         "relative filesystem path '{}' must not contain '.', '..', or absolute segments",
-                        path.display()
+                        crate::planner::portable_path(path)
                     ),
                 });
             }

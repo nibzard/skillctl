@@ -98,7 +98,7 @@ impl ArtifactStore {
                 if self.artifact_dir(digest)?.exists() {
                     return Err(self.validation(format!(
                         "artifact for {digest} is incomplete: '{}' is missing",
-                        manifest_path.display()
+                        crate::planner::portable_path(&manifest_path)
                     )));
                 }
                 return Ok(None);
@@ -126,7 +126,7 @@ impl ArtifactStore {
         if !content_dir.is_dir() {
             return Err(self.validation(format!(
                 "artifact for {digest} is incomplete: '{}' is missing",
-                content_dir.display()
+                crate::planner::portable_path(&content_dir)
             )));
         }
         let diff = manifest.diff_tree(&content_dir)?;

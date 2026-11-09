@@ -854,7 +854,7 @@ pub fn handle_sync(context: &AppContext, request: SyncRequest) -> Result<AppResp
         crate::apply::TargetAction::Remove,
     );
     if let Some(store) = &policy.store {
-        builder = builder.discard_root(store.root().display().to_string());
+        builder = builder.discard_root(crate::planner::portable_path(store.root()));
     }
     let plan = builder.seal();
 
@@ -1135,7 +1135,7 @@ fn clean_generated_projections_at(
                 context,
                 &drift,
                 &skill,
-                &root.display().to_string(),
+                &crate::planner::portable_path(root),
                 repair,
             ));
             continue;
@@ -1241,7 +1241,7 @@ fn clean_unused_import_state(
             cleaned.push(CleanedPath {
                 scope: None,
                 skill: None,
-                path: path.display().to_string(),
+                path: crate::planner::portable_path(&path),
             });
         }
     }
@@ -1631,7 +1631,7 @@ impl DriftReport<'_> {
                 .ok_or_else(|| AppError::MaterializationValidation {
                     message: format!(
                         "discarding edits at '{}' requires a discard store",
-                        target_dir.display()
+                        crate::planner::portable_path(target_dir)
                     ),
                 })?;
         let backup = store.retain(&discard_label(root_display, skill_name), target_dir)?;
@@ -1639,7 +1639,7 @@ impl DriftReport<'_> {
             path: planner::display_path(self.context, target_dir),
             skill: skill_name.to_string(),
             root: root_display.to_string(),
-            backup: backup.display().to_string(),
+            backup: crate::planner::portable_path(&backup),
         });
         Ok(false)
     }
@@ -1779,7 +1779,7 @@ fn prepare_target_directory(target_dir: &Path, skill_name: &str) -> Result<(), A
         Ok(_) => Err(AppError::MaterializationValidation {
             message: format!(
                 "refusing to overwrite hand-authored runtime skill directory '{}' for '{}'",
-                target_dir.display(),
+                crate::planner::portable_path(target_dir),
                 skill_name,
             ),
         }),
@@ -1893,7 +1893,7 @@ pub(crate) fn read_projection_metadata(dir: &Path) -> Result<Option<serde_json::
         AppError::MaterializationValidation {
             message: format!(
                 "projection metadata '{}' is invalid JSON: {source}",
-                metadata_path.display()
+                crate::planner::portable_path(&metadata_path)
             ),
         }
     })?;
@@ -2010,7 +2010,7 @@ fn projection_is_current(
         AppError::MaterializationValidation {
             message: format!(
                 "projection metadata '{}' is invalid JSON: {source}",
-                metadata_path.display()
+                crate::planner::portable_path(&metadata_path)
             ),
         }
     })?;
@@ -2273,7 +2273,9 @@ fn projection_source(winner: &ResolvedSkillCandidate) -> serde_json::Value {
             "content_hash": import.content_hash,
             "overlay_hash": import.overlay_hash,
             "effective_version_hash": import.effective_version_hash,
-            "overlay_path": overlay.as_ref().map(|overlay| overlay.root.display().to_string()),
+            "overlay_path": overlay
+                .as_ref()
+                .map(|overlay| crate::planner::portable_path(&overlay.root)),
         }),
         _ => json!({
             "kind": "unknown",

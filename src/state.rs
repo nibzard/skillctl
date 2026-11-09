@@ -2408,7 +2408,7 @@ pub fn repair_state(
                 RecoveryOutcome::Unreadable { directory, reason } => {
                     report.unresolved.push(format!(
                         "journal {} is unreadable: {reason}",
-                        directory.display()
+                        crate::planner::portable_path(&directory)
                     ));
                 }
             }
@@ -2607,7 +2607,7 @@ fn quarantine_unreadable_state_database(
         "moved the unreadable state database to '{}' and rebuilt an empty local state store; run \
          'skillctl restore --frozen' to rebuild the import records from .agents/skillctl.yaml \
          and .agents/skillctl.lock",
-        quarantined.display()
+        crate::planner::portable_path(&quarantined)
     ));
 
     Ok(())

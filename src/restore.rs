@@ -305,7 +305,7 @@ pub fn handle_restore(
             "frozen": request.frozen,
             "offline": request.offline,
             "lockfile": {
-                "path": lockfile.path.display().to_string(),
+                "path": crate::planner::portable_path(&lockfile.path),
                 "loaded_version": lockfile.loaded_version.unwrap_or(lockfile.version),
                 "version": lockfile.version,
                 "changed": lockfile_changed,
@@ -393,7 +393,7 @@ pub fn handle_verify(
             },
             "cache": {
                 "workspace_store": store_state.status(),
-                "path": target.stored_root.display().to_string(),
+                "path": crate::planner::portable_path(&target.stored_root),
                 "artifact": artifact_state,
             },
             "overlay": {
@@ -489,11 +489,12 @@ pub fn handle_verify(
                  .agents/skillctl.lock or remove its 'overrides.{}' entry",
                 target.import_id,
                 target.overlay.pinned_digest().unwrap_or(NO_OVERLAY_HASH),
-                target
-                    .overlay
-                    .root()
-                    .expect("a missing overlay is a declared one")
-                    .display(),
+                crate::planner::portable_path(
+                    target
+                        .overlay
+                        .root()
+                        .expect("a missing overlay is a declared one"),
+                ),
                 target.import_id
             )),
             OverlayState::Mismatch(observed) => warnings.push(format!(
@@ -576,7 +577,7 @@ pub fn handle_verify(
 
     let mut data = json!({
         "lockfile": {
-            "path": lockfile.path.display().to_string(),
+            "path": crate::planner::portable_path(&lockfile.path),
             "loaded_version": lockfile.loaded_version.unwrap_or(lockfile.version),
             "version": lockfile.version,
         },
@@ -632,7 +633,7 @@ fn restore_one(
                          verified retained artifact can replace it. Remove the cached import at \
                          '{}' and run 'skillctl restore --frozen' again, or reinstall the skill \
                          after reviewing the change",
-                        target.stored_root.display()
+                        crate::planner::portable_path(&target.stored_root)
                     ),
                 ));
             }
@@ -806,7 +807,7 @@ fn retain_artifact(artifacts: &ArtifactStore, skill_root: &Path) -> Result<Value
             ArtifactWrite::Created => "created",
             ArtifactWrite::AlreadyPresent => "already-present",
         },
-        "store_root": artifacts.root().display().to_string(),
+        "store_root": crate::planner::portable_path(artifacts.root()),
     }))
 }
 
@@ -958,11 +959,9 @@ fn validate_declared_overlays(targets: &[RestoreTarget]) -> Result<(), AppError>
                              state next to .agents/skillctl.yaml and .agents/skillctl.lock, so \
                              commit the overlay for '{}' or remove its 'overrides.{}' entry before \
                              restoring",
-                            target
-                                .overlay
-                                .root()
-                                .expect("a pinned overlay has a root")
-                                .display(),
+                            crate::planner::portable_path(
+                                target.overlay.root().expect("a pinned overlay has a root"),
+                            ),
                             target.import_id,
                             target.import_id
                         ),
@@ -998,11 +997,9 @@ fn validate_declared_overlays(targets: &[RestoreTarget]) -> Result<(), AppError>
                         "the overlay directory '{}' hashes to {observed} but the lockfile pins \
                          {digest}. Restore the committed overlay content for '{}' or, after \
                          reviewing the change, re-pin it with 'skillctl override {}'",
-                        target
-                            .overlay
-                            .root()
-                            .expect("a pinned overlay has a root")
-                            .display(),
+                        crate::planner::portable_path(
+                            target.overlay.root().expect("a pinned overlay has a root"),
+                        ),
                         target.import_id,
                         target.import_id
                     ),
@@ -1037,7 +1034,7 @@ fn restore_targets(
                 message: format!(
                     "enabled import '{}' is missing from '{}'; the lockfile cannot restore it",
                     import.id,
-                    lockfile.path.display()
+                    crate::planner::portable_path(&lockfile.path)
                 ),
             });
         };
@@ -1189,7 +1186,7 @@ fn report(target: &RestoreTarget, origin: RestoreOrigin, artifact: &Value) -> Va
         "restored_from": origin.as_str(),
         "verified": true,
         "artifact": artifact,
-        "store_path": target.skill_root.display().to_string(),
+        "store_path": crate::planner::portable_path(&target.skill_root),
     })
 }
 

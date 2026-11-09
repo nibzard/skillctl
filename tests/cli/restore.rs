@@ -715,10 +715,7 @@ fn fixture_with_rewritten_source_url(
             .unwrap_or_else(|error| panic!("{relative} is readable: {error}"));
         clone.write_file(
             relative,
-            &contents.replace(
-                &format!("file://{}", workspace.path().display()),
-                replacement,
-            ),
+            &contents.replace(&file_url(workspace.path()), replacement),
         );
     }
     clone
@@ -731,9 +728,12 @@ fn restore_reports_nonportable_local_path_sources_instead_of_guessing() {
     workspace.write_skill_source("shared-skills", "release-notes");
     install(&workspace, &workspace.home_path(), "shared-skills");
 
-    // Rewrite the recorded source URL so the path cannot exist here.
-    let clone =
-        fixture_with_rewritten_source_url(&workspace, "file:///nonexistent-skillctl-source");
+    // Rewrite the recorded source URL so the path cannot exist here. The
+    // replacement keeps a shape `Url::to_file_path` resolves on every
+    // platform, because the failure under test is the unreachable path, not
+    // an unresolvable URL.
+    let missing_source = workspace.path().join("nonexistent-skillctl-source");
+    let clone = fixture_with_rewritten_source_url(&workspace, &file_url(&missing_source));
     let fresh_home = clone.home_path();
     let before = lockfile_bytes(&clone);
 
@@ -742,9 +742,10 @@ fn restore_reports_nonportable_local_path_sources_instead_of_guessing() {
         .code(3);
     let failure = restore_text(&clone, &fresh_home, &["--frozen"]);
     assert!(
-        failure.contains(
-            "locked local source '/nonexistent-skillctl-source/shared-skills/' is not available"
-        ),
+        failure.contains(&format!(
+            "locked local source '{}/shared-skills/' is not available",
+            portable(&missing_source)
+        )),
         "expected a nonportable-source failure, found: {failure}"
     );
     assert!(
@@ -817,7 +818,7 @@ fn restore_keeps_retained_snapshots_for_archive_imports() {
         clone.write_file(
             relative,
             &contents.replace(
-                &format!("file://{}", archive.display()),
+                &file_url(&archive),
                 "file:///nonexistent-skillctl-archive.tar.gz",
             ),
         );
@@ -1172,7 +1173,7 @@ fn restore_frozen_names_the_missing_overlay_directory_and_its_pinned_digest() {
 
     let overlay_directory = clone.path().join(".agents/overlays/release-notes");
     assert!(
-        failure.contains(overlay_directory.to_string_lossy().as_ref()),
+        failure.contains(&portable(&overlay_directory)),
         "the failure must name the missing overlay directory, found: {failure}"
     );
     assert!(

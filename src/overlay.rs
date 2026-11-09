@@ -686,7 +686,7 @@ fn unrestored_import_error(
                 "import '{skill}' has a stored source at '{}' but no install record in this \
                  checkout; the state store is local to each machine, so run 'skillctl restore \
                  --frozen' before {command} can use the import",
-                stored_skill_root.display(),
+                crate::planner::portable_path(stored_skill_root),
                 command = command.name(),
             ),
         };
@@ -697,7 +697,7 @@ fn unrestored_import_error(
             "import '{skill}' has no stored source in '{}'. The import cache is local to each \
              checkout, so reconstruct it with 'skillctl restore --frozen', or clear the import \
              with 'skillctl remove {skill}', before {command} can use it",
-            stored_skill_root.display(),
+            crate::planner::portable_path(stored_skill_root),
             command = command.name(),
         ),
     }
@@ -843,8 +843,8 @@ fn validate_overlay_mapping(
                 message: format!(
                     "overlay '{}' file '{}' does not map to an imported file of '{}'; remove \
                      the unmatched overlay file or add the file upstream before overriding it",
-                    overlay_root.display(),
-                    relative_path.display(),
+                    crate::planner::portable_path(overlay_root),
+                    crate::planner::portable_path(&relative_path),
                     import_id,
                 ),
             });
@@ -875,7 +875,7 @@ fn prepare_local_root(path: &Path, skill: &str) -> Result<(), AppError> {
         Ok(_) => Err(AppError::ResolutionValidation {
             message: format!(
                 "refusing to overwrite hand-authored canonical skill directory '{}' for '{}'",
-                path.display(),
+                crate::planner::portable_path(path),
                 skill,
             ),
         }),
@@ -934,8 +934,8 @@ fn copy_tree_contents(source_root: &Path, destination_root: &Path) -> Result<(),
             return Err(AppError::ResolutionValidation {
                 message: format!(
                     "fork source '{}' contains unsupported symlink '{}'",
-                    source_root.display(),
-                    source_path.display()
+                    crate::planner::portable_path(source_root),
+                    crate::planner::portable_path(&source_path)
                 ),
             });
         }
@@ -992,7 +992,10 @@ pub(crate) fn hash_overlay_root(root: &Path) -> Result<String, AppError> {
     match fs::symlink_metadata(root) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(AppError::ResolutionValidation {
-                message: format!("overlay root '{}' must not be a symlink", root.display()),
+                message: format!(
+                    "overlay root '{}' must not be a symlink",
+                    crate::planner::portable_path(root)
+                ),
             });
         }
         Ok(metadata) if !metadata.is_dir() => {
@@ -1065,8 +1068,8 @@ fn collect_overlay_files(
             return Err(AppError::ResolutionValidation {
                 message: format!(
                     "overlay '{}' contains unsupported symlink '{}'",
-                    root.display(),
-                    path.display()
+                    crate::planner::portable_path(root),
+                    crate::planner::portable_path(&path)
                 ),
             });
         }
@@ -1079,8 +1082,8 @@ fn collect_overlay_files(
                     .map_err(|_| AppError::ResolutionValidation {
                         message: format!(
                             "overlay path '{}' escaped the overlay root '{}'",
-                            path.display(),
-                            root.display()
+                            crate::planner::portable_path(&path),
+                            crate::planner::portable_path(root)
                         ),
                     })?
                     .to_path_buf(),
@@ -1089,8 +1092,8 @@ fn collect_overlay_files(
             return Err(AppError::ResolutionValidation {
                 message: format!(
                     "overlay '{}' contains a non-file, non-directory entry '{}'",
-                    root.display(),
-                    path.display()
+                    crate::planner::portable_path(root),
+                    crate::planner::portable_path(&path)
                 ),
             });
         }

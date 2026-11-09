@@ -158,7 +158,7 @@ fn build_app(context: &AppContext) -> Result<TuiApp, AppError> {
     }
 
     Ok(TuiApp {
-        workspace: context.working_directory.display().to_string(),
+        workspace: crate::planner::portable_path(&context.working_directory),
         selected_skill,
         scope_filter: context.selector.scope.map(managed_scope_from_cli),
         target_filters: context.selector.targets.clone(),

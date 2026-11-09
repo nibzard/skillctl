@@ -1351,7 +1351,7 @@ fn validate_import(
             skill: Some(import.id.clone()),
             scope: Some(scope.as_str().to_string()),
             target: None,
-            path: Some(lockfile.path.display().to_string()),
+            path: Some(planner::portable_path(&lockfile.path)),
             trust: None,
             safety: None,
             message: format!(
@@ -1705,7 +1705,7 @@ fn script_risk_issues(
             skill: Some(candidate.skill.name.as_str().to_string()),
             scope: Some(scope.as_str().to_string()),
             target: None,
-            path: Some(candidate.skill.root.display().to_string()),
+            path: Some(planner::portable_path(&candidate.skill.root)),
             trust: Some(trust),
             safety: issue_safety(&candidate.skill.safety),
             message: format!(
@@ -1758,7 +1758,7 @@ fn missing_required_credential_issues(
             skill: Some(winner.skill.name.as_str().to_string()),
             scope: Some(scope.as_str().to_string()),
             target: None,
-            path: Some(winner.skill.root.display().to_string()),
+            path: Some(planner::portable_path(&winner.skill.root)),
             trust: Some(crate::trust::trust_for_candidate(
                 winner,
                 reviews.approved_for_candidate(winner),
@@ -1806,7 +1806,7 @@ fn missing_required_tool_issues(
             skill: Some(winner.skill.name.as_str().to_string()),
             scope: Some(scope.as_str().to_string()),
             target: None,
-            path: Some(winner.skill.root.display().to_string()),
+            path: Some(planner::portable_path(&winner.skill.root)),
             trust: Some(crate::trust::trust_for_candidate(
                 winner,
                 reviews.approved_for_candidate(winner),
@@ -1847,7 +1847,7 @@ fn declared_capability_risk_issues(
             skill: Some(candidate.skill.name.as_str().to_string()),
             scope: Some(scope.as_str().to_string()),
             target: None,
-            path: Some(candidate.skill.root.display().to_string()),
+            path: Some(planner::portable_path(&candidate.skill.root)),
             trust: Some(crate::trust::trust_for_candidate(
                 candidate,
                 reviews.approved_for_candidate(candidate),
@@ -2230,7 +2230,7 @@ fn stale_lockfile_issues(
             skill: Some(id.clone()),
             scope: None,
             target: None,
-            path: Some(lockfile.path.display().to_string()),
+            path: Some(planner::portable_path(&lockfile.path)),
             trust: None,
             safety: None,
             message: format!(
@@ -2994,7 +2994,7 @@ fn disabled_import_issue(
         skill: Some(skill_name.to_string()),
         scope: Some(import_scope.as_str().to_string()),
         target: None,
-        path: Some(manifest.path.display().to_string()),
+        path: Some(planner::portable_path(&manifest.path)),
         trust: None,
         safety: None,
         message,
@@ -3046,7 +3046,7 @@ fn missing_skill_issues(
             skill: Some(skill_name.to_string()),
             scope: Some(scope.as_str().to_string()),
             target: None,
-            path: Some(analysis.lockfile.path.display().to_string()),
+            path: Some(planner::portable_path(&analysis.lockfile.path)),
             trust: None,
             safety: None,
             message: format!(
@@ -3750,8 +3750,8 @@ fn collect_directory_files(
             return Err(AppError::ResolutionValidation {
                 message: format!(
                     "{kind} '{}' contains unsupported symlink '{}'",
-                    root.display(),
-                    path.display()
+                    planner::portable_path(root),
+                    planner::portable_path(&path)
                 ),
             });
         }
@@ -3764,8 +3764,8 @@ fn collect_directory_files(
                     AppError::ResolutionValidation {
                         message: format!(
                             "{kind} path '{}' escaped the root '{}'",
-                            path.display(),
-                            root.display()
+                            planner::portable_path(&path),
+                            planner::portable_path(root)
                         ),
                     }
                 })?)?;
@@ -3774,8 +3774,8 @@ fn collect_directory_files(
             return Err(AppError::ResolutionValidation {
                 message: format!(
                     "{kind} '{}' contains a non-file, non-directory entry '{}'",
-                    root.display(),
-                    path.display()
+                    planner::portable_path(root),
+                    planner::portable_path(&path)
                 ),
             });
         }
@@ -3792,12 +3792,18 @@ fn ensure_directory(path: &Path, label: &'static str) -> Result<(), AppError> {
     })?;
     if metadata.file_type().is_symlink() {
         return Err(AppError::ResolutionValidation {
-            message: format!("{label} '{}' must not be a symlink", path.display()),
+            message: format!(
+                "{label} '{}' must not be a symlink",
+                planner::portable_path(path)
+            ),
         });
     }
     if !metadata.is_dir() {
         return Err(AppError::ResolutionValidation {
-            message: format!("{label} '{}' must be a directory", path.display()),
+            message: format!(
+                "{label} '{}' must be a directory",
+                planner::portable_path(path)
+            ),
         });
     }
     Ok(())
@@ -3815,7 +3821,7 @@ fn normalize_relative_path(path: &Path) -> Result<PathBuf, AppError> {
                 return Err(AppError::ResolutionValidation {
                     message: format!(
                         "relative filesystem path '{}' must not contain '.', '..', or absolute segments",
-                        path.display()
+                        planner::portable_path(path)
                     ),
                 });
             }
@@ -4069,8 +4075,8 @@ fn collect_projection_files(
                 .map_err(|_| AppError::ResolutionValidation {
                     message: format!(
                         "projected path '{}' escaped the root '{}'",
-                        path.display(),
-                        root.display()
+                        planner::portable_path(&path),
+                        planner::portable_path(root)
                     ),
                 })?
                 .to_path_buf(),

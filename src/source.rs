@@ -1070,7 +1070,7 @@ fn validate_install_selection(
                         format!(
                             "workspace skill '{}' already exists at '{}'",
                             candidate.name,
-                            existing_path.display()
+                            crate::planner::portable_path(&existing_path)
                         ),
                     ));
                 }
@@ -1125,7 +1125,7 @@ fn build_install_operation(
             scope: scope_label(scope).to_string(),
             source_path: candidate.source_path.clone(),
             selected_subpath: candidate.selected_subpath.clone(),
-            stored_source_root: stored_source_root.display().to_string(),
+            stored_source_root: crate::planner::portable_path(&stored_source_root),
             resolved_revision: revision.resolved.clone(),
             upstream_revision: revision.upstream.clone(),
             content_hash: content_hash.clone(),
@@ -1285,7 +1285,7 @@ fn copy_directory_contents(source_root: &Path, destination_root: &Path) -> Resul
 
         if metadata.file_type().is_symlink() {
             return Err(source_validation(
-                source_path.display().to_string(),
+                crate::planner::portable_path(&source_path),
                 "symlinked install source entries are not supported for stored imports",
             ));
         }
@@ -1576,7 +1576,7 @@ fn resolve_install_source(
                     raw: raw.to_string(),
                     kind: SourceKind::LocalPath,
                     url,
-                    display: canonical_path.display().to_string(),
+                    display: crate::planner::portable_path(&canonical_path),
                 },
                 local_path: Some(canonical_path),
             })
@@ -1587,7 +1587,7 @@ fn resolve_install_source(
                     raw,
                     format!(
                         "local file '{}' is not a supported archive ({})",
-                        candidate_path.display(),
+                        crate::planner::portable_path(&candidate_path),
                         SUPPORTED_ARCHIVE_EXTENSIONS.join(", ")
                     ),
                 ));
@@ -1609,7 +1609,7 @@ fn resolve_install_source(
                     raw: raw.to_string(),
                     kind: SourceKind::Archive,
                     url,
-                    display: canonical_path.display().to_string(),
+                    display: crate::planner::portable_path(&canonical_path),
                 },
                 local_path: Some(canonical_path),
             })
@@ -2383,7 +2383,7 @@ fn stage_locked_local_source(kind: SourceKind, url: &str) -> Result<PreparedSour
                  portable source such as a Git URL, restore the artifact cache under \
                  ~/.skillctl/store/artifacts, or fetch the source path from the machine that \
                  produced the lockfile",
-                local_path.display()
+                crate::planner::portable_path(&local_path)
             ),
         )
     })?;
@@ -2402,7 +2402,7 @@ fn stage_locked_local_source(kind: SourceKind, url: &str) -> Result<PreparedSour
             url,
             format!(
                 "locked source '{}' is {actual}, but the recorded source kind expects {expected}",
-                local_path.display()
+                crate::planner::portable_path(&local_path)
             ),
         ));
     }
@@ -2412,7 +2412,7 @@ fn stage_locked_local_source(kind: SourceKind, url: &str) -> Result<PreparedSour
             raw: url.to_string(),
             kind,
             url: url.to_string(),
-            display: local_path.display().to_string(),
+            display: crate::planner::portable_path(&local_path),
         },
         local_path: Some(local_path),
     };
@@ -3206,7 +3206,7 @@ fn normalized_extraction_root(extract_root: &Path) -> Result<PathBuf, AppError> 
     entries.sort();
     if entries.is_empty() {
         return Err(source_validation(
-            extract_root.display().to_string(),
+            crate::planner::portable_path(extract_root),
             "archive did not contain any files",
         ));
     }
@@ -3261,7 +3261,7 @@ pub(crate) fn hash_directory_contents(root: &Path) -> Result<String, AppError> {
                 source,
             })?;
         let relative_string = relative_path_for_hash(&relative)
-            .map_err(|message| source_validation(root.display().to_string(), message))?;
+            .map_err(|message| source_validation(crate::planner::portable_path(root), message))?;
 
         if metadata.is_dir() {
             hasher.update(b"dir\0");
@@ -3281,7 +3281,9 @@ pub(crate) fn hash_directory_contents(root: &Path) -> Result<String, AppError> {
             hasher.update(b"\0");
             hasher.update(
                 relative_path_for_hash(&target)
-                    .map_err(|message| source_validation(root.display().to_string(), message))?
+                    .map_err(|message| {
+                        source_validation(crate::planner::portable_path(root), message)
+                    })?
                     .as_bytes(),
             );
             hasher.update(b"\0");
@@ -3348,11 +3350,11 @@ fn collect_relative_paths(
         let relative = path
             .strip_prefix(root)
             .map_err(|_| AppError::SourceValidation {
-                input: root.display().to_string(),
+                input: crate::planner::portable_path(root),
                 message: format!(
                     "path '{}' escaped the hashed source root '{}'",
-                    path.display(),
-                    root.display()
+                    crate::planner::portable_path(&path),
+                    crate::planner::portable_path(root)
                 ),
             })?
             .to_path_buf();
@@ -3378,8 +3380,8 @@ fn relative_path_string(root: &Path, path: &Path, raw_source: &str) -> Result<St
             raw_source,
             format!(
                 "detected skill path '{}' escaped the staged source root '{}'",
-                path.display(),
-                root.display()
+                crate::planner::portable_path(path),
+                crate::planner::portable_path(root)
             ),
         )
     })?;

@@ -297,7 +297,7 @@ impl MutationPlanBuilder {
         Self {
             operation,
             created_at: current_timestamp(),
-            workspace: working_directory.display().to_string(),
+            workspace: crate::planner::portable_path(working_directory),
             skill: None,
             expected: Vec::new(),
             proposed: Vec::new(),
@@ -338,7 +338,7 @@ impl MutationPlanBuilder {
     /// Declare one filesystem target by path.
     pub fn target(mut self, path: impl AsRef<Path>, action: TargetAction) -> Self {
         self.targets.push(PlanTarget {
-            path: path.as_ref().display().to_string(),
+            path: crate::planner::portable_path(path.as_ref()),
             action,
         });
         self
@@ -352,7 +352,7 @@ impl MutationPlanBuilder {
     ) -> Self {
         for path in paths {
             self.targets.push(PlanTarget {
-                path: path.display().to_string(),
+                path: crate::planner::portable_path(&path),
                 action,
             });
         }
@@ -707,7 +707,7 @@ impl PlanDocument {
         Self {
             schema_version: PLAN_SCHEMA_VERSION,
             created_at: current_timestamp(),
-            workspace: working_directory.display().to_string(),
+            workspace: crate::planner::portable_path(working_directory),
             strategy: strategy.to_string(),
             plans,
         }
@@ -1861,7 +1861,9 @@ pub fn build_update_mutation_plan(
             );
 
     if strategy == ApplyStrategy::Discard {
-        builder = builder.discard_root(DiscardStore::open_default()?.root().display().to_string());
+        builder = builder.discard_root(crate::planner::portable_path(
+            DiscardStore::open_default()?.root(),
+        ));
     }
 
     Ok(builder.seal())
@@ -1928,7 +1930,9 @@ pub(crate) fn build_edit_repair_mutation_plan(
             );
 
     if strategy == ApplyStrategy::Discard {
-        builder = builder.discard_root(DiscardStore::open_default()?.root().display().to_string());
+        builder = builder.discard_root(crate::planner::portable_path(
+            DiscardStore::open_default()?.root(),
+        ));
     }
 
     Ok(builder.seal())
@@ -3129,7 +3133,7 @@ fn preserve_edits_as_overlay(
                 preservation.replaced.push(DiscardedCopy {
                     path: crate::planner::display_path(context, &destination),
                     skill: skill.skill_id.clone(),
-                    backup: backup.display().to_string(),
+                    backup: crate::planner::portable_path(&backup),
                 });
             }
         }

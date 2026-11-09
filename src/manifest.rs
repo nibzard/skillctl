@@ -976,10 +976,8 @@ fn append_generated_root_excludes(
 /// the file lives inside it, absolute when it resolves outside, as worktree
 /// and submodule metadata can.
 fn display_exclude_path(working_directory: &Path, actual_path: &Path) -> String {
-    actual_path.strip_prefix(working_directory).map_or_else(
-        |_| actual_path.display().to_string(),
-        |relative| relative.display().to_string(),
-    )
+    let relative_to_workspace = actual_path.strip_prefix(working_directory);
+    crate::planner::portable_path(relative_to_workspace.unwrap_or(actual_path))
 }
 
 fn resolve_git_exclude_path(working_directory: &Path) -> Result<Option<PathBuf>, AppError> {

@@ -310,11 +310,7 @@ fn clean_removes_generated_projections_and_unused_import_state_without_touching_
             .as_array()
             .expect("cleaned state exists")
             .iter()
-            .any(|entry| entry["path"]
-                == workspace
-                    .workspace_import_root("stale-skill")
-                    .display()
-                    .to_string()),
+            .any(|entry| entry["path"] == portable(&workspace.workspace_import_root("stale-skill"))),
     );
 
     assert!(
