@@ -168,7 +168,9 @@ impl TestWorkspace {
             std::process::id()
         ));
         fs::create_dir_all(&path).expect("workspace exists");
-        Self { path }
+        Self {
+            path: physical_path(&path),
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -448,6 +450,25 @@ impl Drop for TestWorkspace {
 
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+}
+
+/// Resolve a fixture path to the spelling a child process observes.
+///
+/// `std::env::temp_dir` may spell its result through a symlink: macOS reports
+/// `/var/folders/...`, while `getcwd` in the spawned `skillctl` process
+/// resolves the same directory as `/private/var/folders/...`. Every path the
+/// harness builds from the workspace root must share that resolved spelling,
+/// or the commands under test cannot strip the working-directory prefix from
+/// HOME-derived roots and lockfile rewrites miss the recorded source URL.
+///
+/// Windows `fs::canonicalize` returns verbatim `\\?\` paths that no command
+/// line or display path accepts, and the Windows temp directory carries no
+/// symlink, so the raw spelling stays there.
+fn physical_path(path: &Path) -> PathBuf {
+    match fs::canonicalize(path) {
+        Ok(resolved) if !resolved.to_string_lossy().starts_with(r"\\?\") => resolved,
+        _ => path.to_path_buf(),
+    }
 }
 
 /// Recursively copy a file or directory tree, preserving symlinks as symlinks.

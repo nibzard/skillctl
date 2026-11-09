@@ -1618,7 +1618,17 @@ fn resolve_install_source(
             raw,
             "source path exists but is neither a file nor a directory",
         )),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+        // A raw string that cannot name a local path at all is classified the
+        // same way as a missing one. On Windows, a URL-shaped source joined
+        // onto the working directory keeps its scheme colon inside a path
+        // component, and metadata reports that as InvalidFilename instead of
+        // NotFound.
+        Err(source)
+            if matches!(
+                source.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::InvalidFilename
+            ) =>
+        {
             if let Some(target) = well_known_target(raw)? {
                 return Ok(ResolvedInstallSource {
                     normalized: NormalizedInstallSource {

@@ -1065,21 +1065,27 @@ mod tests {
 
     #[test]
     fn symlinks_and_hard_links_are_rejected() {
-        let symlinked = BundleFixture::new("symlink");
-        symlinked.write("SKILL.md", "# skill\n");
+        // Creating a symlink needs developer mode or elevation on Windows,
+        // so the symlink arm runs only where every user can make one. The
+        // hard-link arm runs everywhere: `fs::hard_link` needs no privilege,
+        // and the Windows link-count lookup makes the refusal observable.
         #[cfg(unix)]
-        std::os::unix::fs::symlink(
-            symlinked.root.join("SKILL.md"),
-            symlinked.root.join("linked.md"),
-        )
-        .expect("symlink created");
+        {
+            let symlinked = BundleFixture::new("symlink");
+            symlinked.write("SKILL.md", "# skill\n");
+            std::os::unix::fs::symlink(
+                symlinked.root.join("SKILL.md"),
+                symlinked.root.join("linked.md"),
+            )
+            .expect("symlink created");
 
-        let error = BundleManifest::capture(&symlinked.root)
-            .expect_err("symlinks are rejected inside a bundle");
-        assert!(
-            error.to_string().contains("symlink"),
-            "unexpected error: {error}"
-        );
+            let error = BundleManifest::capture(&symlinked.root)
+                .expect_err("symlinks are rejected inside a bundle");
+            assert!(
+                error.to_string().contains("symlink"),
+                "unexpected error: {error}"
+            );
+        }
 
         let hardlinked = BundleFixture::new("hardlink");
         let original = hardlinked.write("SKILL.md", "# skill\n");
@@ -1344,29 +1350,38 @@ mod tests {
             ]
         );
         assert_eq!(
-            manifest
-                .entries
-                .iter()
-                .find(|entry| entry.path == "scripts/run.sh")
-                .expect("script is inventoried")
-                .mode,
-            BundleEntryMode::Executable,
-            "the executable bit is part of the inventory"
-        );
-        assert_eq!(
             manifest.digest(),
             "sha256:367c651e157b6b28646d3627d147b67b66da58bb5b0692ae3fabba35caaf937b",
             "version 2 normalizes regular files to one payload tag, so the digest no \
              longer depends on platform permission bits"
         );
 
-        // Version 1 digests keep their payload rules so retained version 1
-        // artifacts stay verifiable under their recorded digest.
-        let mut version_one = manifest;
-        version_one.format_version = 1;
-        assert_eq!(
-            version_one.digest(),
-            "sha256:0766869ba27a516348be813c39a52a8ca862ce7338708117a1b0044e9d86bc0f"
-        );
+        // The committed fixture's executable bit, and the version 1 payload
+        // tag that consumed it, are observable only where the filesystem
+        // records permission bits. Windows captures the script as a plain
+        // file, so those two pins stay on Unix; the version 2 digest above
+        // is the platform-independent boundary and runs everywhere.
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                manifest
+                    .entries
+                    .iter()
+                    .find(|entry| entry.path == "scripts/run.sh")
+                    .expect("script is inventoried")
+                    .mode,
+                BundleEntryMode::Executable,
+                "the executable bit is part of the inventory"
+            );
+
+            // Version 1 digests keep their payload rules so retained version 1
+            // artifacts stay verifiable under their recorded digest.
+            let mut version_one = manifest;
+            version_one.format_version = 1;
+            assert_eq!(
+                version_one.digest(),
+                "sha256:0766869ba27a516348be813c39a52a8ca862ce7338708117a1b0044e9d86bc0f"
+            );
+        }
     }
 }

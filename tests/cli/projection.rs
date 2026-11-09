@@ -124,8 +124,15 @@ fn sync_blocks_materialization_when_stored_import_content_is_tampered() {
         .success()
         .stdout(predicate::str::contains("Installed 1 skill"));
 
-    let stored_manifest = find_stored_import_manifest(&workspace.home_path().join(".skillctl"))
-        .expect("stored import manifest exists under HOME/.skillctl");
+    // The store retains two copies of the skill: the import under
+    // `store/imports` that sync hashes against the pin, and an immutable
+    // snapshot under `store/artifacts` that only a frozen restore reads.
+    // Both hold a `SKILL.md`, and directory iteration order is
+    // filesystem-specific, so the search must start at the imports root to
+    // tamper the copy sync verifies.
+    let stored_manifest =
+        find_stored_import_manifest(&workspace.home_path().join(".skillctl/store/imports"))
+            .expect("stored import manifest exists under HOME/.skillctl/store/imports");
     let original =
         fs::read_to_string(&stored_manifest).expect("stored import manifest is readable");
     fs::write(

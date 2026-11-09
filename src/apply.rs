@@ -797,7 +797,7 @@ impl DiscardStore {
     /// the discard it is asked to back up.
     pub fn retain(&self, label: &str, source: &Path) -> Result<PathBuf, AppError> {
         let label_root = self.root.join(sanitize_component(label));
-        let base_name = format!("{}-{}", current_timestamp(), std::process::id());
+        let base_name = retained_backup_base_name();
         let mut destination = label_root.join(&base_name);
         let mut attempt = 1;
         while destination.exists() {
@@ -922,6 +922,15 @@ fn sanitize_component(value: &str) -> String {
     } else {
         sanitized
     }
+}
+
+/// The base name every retained backup directory derives its identity from.
+///
+/// The runtime stamp is sanitized before it becomes a path component,
+/// because its RFC 3339 colons are legal on Unix but rejected by Windows
+/// everywhere except the drive-letter position.
+fn retained_backup_base_name() -> String {
+    sanitize_component(&format!("{}-{}", current_timestamp(), std::process::id()))
 }
 
 // ---------------------------------------------------------------------------
@@ -3623,7 +3632,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "skillctl-retain-test-{}-{}",
             std::process::id(),
-            current_timestamp()
+            sanitize_component(&current_timestamp())
         ));
         let store = DiscardStore { root: root.clone() };
 
@@ -3633,11 +3642,10 @@ mod tests {
 
         // Occupy the exact name the first retain would compute, the way a
         // pinned clock (SOURCE_DATE_EPOCH) plus a repeated process id does.
-        let occupied = store.root.join("test-skill").join(format!(
-            "{}-{}",
-            current_timestamp(),
-            std::process::id()
-        ));
+        let occupied = store
+            .root
+            .join("test-skill")
+            .join(retained_backup_base_name());
         fs::create_dir_all(&occupied).expect("colliding backup name exists");
 
         let backup = store
