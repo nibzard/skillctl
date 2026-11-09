@@ -43,7 +43,7 @@ Install a specific version or custom destination:
 
 ```bash
 curl -fsSL https://github.com/nibzard/skillctl/releases/latest/download/skillctl-install.sh | \
-  SKILLCTL_VERSION=v0.1.0 SKILLCTL_INSTALL_DIR="$HOME/.local/bin" bash
+  SKILLCTL_VERSION=v0.2.0 SKILLCTL_INSTALL_DIR="$HOME/.local/bin" bash
 ```
 
 Published release artifacts currently cover:
