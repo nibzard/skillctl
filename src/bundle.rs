@@ -746,7 +746,7 @@ fn collect_tree(
 /// UTF-8, relative `/`-separated segments, no reserved device names, and no
 /// characters that are not portable. The path length, segment length, and
 /// depth bounds are enforced separately at capture time, where the active
-/// [`BundleLimits`] are known; see [`check_path_bounds`].
+/// [`BundleLimits`] are known; see `check_path_bounds`.
 pub fn normalize_relative_path(path: &Path) -> Result<String, String> {
     let mut segments = Vec::new();
     for component in path.components() {
@@ -909,6 +909,7 @@ fn bundle_error(root: &Path, message: impl Into<String>) -> AppError {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     struct BundleFixture {
@@ -999,6 +1000,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn executable_files_are_recorded_in_the_inventory() {
         let fixture = BundleFixture::new("executable");
         let script = fixture.write("scripts/run.sh", "#!/bin/sh\nexit 0\n");
@@ -1091,6 +1093,9 @@ mod tests {
     }
 
     #[test]
+    // The fixture writes both spellings into the real workspace directory,
+    // which only a case-sensitive filesystem can hold as two entries.
+    #[cfg(target_os = "linux")]
     fn case_and_unicode_folds_are_rejected_as_collisions() {
         let fixture = BundleFixture::new("case-fold");
         fixture.write("SKILL.md", "# skill\n");
@@ -1203,18 +1208,17 @@ mod tests {
         );
         assert_eq!(at_limit.len(), 1024);
 
-        let fixture = BundleFixture::new("path-at-limit");
-        fixture.write(&at_limit, "content\n");
-        BundleManifest::capture(&fixture.root)
+        // The bound is checked on the relative path, so the test calls the
+        // checker directly: a workspace-rooted path this long exceeds the
+        // operating system path limit on some platforms (macOS caps the whole
+        // path at 1024 bytes including the workspace prefix).
+        check_path_bounds(&at_limit, &BundleLimits::default())
             .expect("a path of exactly 1024 bytes is at the documented limit");
 
         let over_limit = format!("{at_limit}x");
         assert_eq!(over_limit.len(), 1025);
-        let fixture = BundleFixture::new("path-over-limit");
-        fixture.write(&over_limit, "content\n");
-        let error = BundleManifest::capture(&fixture.root)
+        let message = check_path_bounds(&over_limit, &BundleLimits::default())
             .expect_err("a path beyond the byte limit is rejected");
-        let message = error.to_string();
         assert!(
             message.contains("path limit"),
             "unexpected error: {message}"
@@ -1272,6 +1276,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn diff_tree_reports_missing_unexpected_modified_and_mode_changes() {
         let fixture = BundleFixture::new("diff");
         fixture.write("SKILL.md", "# skill\n");

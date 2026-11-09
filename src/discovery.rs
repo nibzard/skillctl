@@ -437,7 +437,7 @@ pub trait DiscoveryTransport {
 ///
 /// The transport never lets the HTTP library follow a redirect by itself.
 /// Every hop is re-evaluated against the origin-trust policy through
-/// [`ensure_redirect_permitted`] before the next request is made, so a
+/// `ensure_redirect_permitted` before the next request is made, so a
 /// `Location` header cannot move a read onto a transport the policy refuses or
 /// onto a host the URL skillctl records never described.
 #[derive(Clone, Copy, Debug)]
