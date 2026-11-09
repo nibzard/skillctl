@@ -1,5 +1,10 @@
 # skillctl: What Still Needs To Happen For Broader Product Completion
 
+Status: Historical snapshot, written 2026-11-05. Section 2.1 is partially
+superseded: the update-apply workflow it asks for has shipped. Read this note
+as the state of that date, and check `spec.md` and
+[docs/user-guide.md](./user-guide.md) for current behavior.
+
 This note captures the current state of `skillctl` after a fresh pass over the draft spec, the current implementation, the docs, and the test surface.
 
 The short version:
@@ -35,7 +40,17 @@ These are the items that matter most if the goal is to move from "strong v1" to 
 
 ### 2.1 Finish The Update Story Beyond Planning
 
-The biggest functional gap is the update workflow.
+Status as of 2026-11-09: this section is largely superseded. The guarded apply
+engine now ships. `skillctl update [skill] --apply` carries a planner result
+through one transactional apply, `--strategy` selects `clean`, `overlay`,
+`fork`, or `discard` as first-class outcomes, and `update --plan` plus
+`update --apply --plan-file` form a durable planner-to-executor contract with
+self-digest and staleness checks. The apply engine rolls back on failure and
+keeps local edits, overlay variants, and discarded content in durable backups
+instead of dropping them. The text below records the gap as it stood when this
+note was written.
+
+The biggest functional gap was the update workflow.
 
 The spec says `skillctl update [skill]` should:
 
@@ -44,23 +59,21 @@ The spec says `skillctl update [skill]` should:
 - propose the next action
 - apply or defer explicitly
 
-The current implementation is intentionally more conservative than that. The CLI help and docs state that `update` reports plans and follow-up actions instead of blindly overwriting local changes.
+The implementation of that date was intentionally more conservative than that. The CLI help and docs stated that `update` reports plans and follow-up actions instead of blindly overwriting local changes.
 
-That is the right safe default, but it still leaves a product gap:
+That was the right safe default, but it still left a product gap:
 
-- there is no complete end-to-end "apply this recommended update" workflow
-- there is no explicit staged update execution model that takes the planner result and carries it through
-- there is no integrated path for "apply", "create overlay", "detach", or "skip" as first-class update outcomes
+- there was no complete end-to-end "apply this recommended update" workflow
+- there was no explicit staged update execution model that takes the planner result and carries it through
+- there was no integrated path for "apply", "create overlay", "detach", or "skip" as first-class update outcomes
 
-To close this gap, the product still needs:
+To close that gap, the product needed:
 
 - an explicit update-apply flow
 - a durable planner-to-executor contract
 - safe conflict handling for overlay, drift, and detached states
 - clear rollback points when update application fails mid-flight
 - UX that keeps the conservative safety model while reducing manual follow-up
-
-Without that, `update` is useful, but the lifecycle is still split between diagnosis and manual execution.
 
 ### 2.2 Harden Local State Migration And Repair
 

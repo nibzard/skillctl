@@ -943,6 +943,266 @@ fn doctor_reports_pending_recoverable_operations() {
     );
 }
 
+/// Spawn one child that parks mid-install while it holds the coordination
+/// lock, on the pattern of
+/// `a_second_process_waits_for_the_state_lock_and_cannot_erase_committed_history`.
+fn hold_install_mid_transaction(
+    shared: &TestWorkspace,
+    home: &Path,
+    workspace: &Path,
+) -> (HeldChild, PathBuf, PathBuf, HeldOutput) {
+    let sentinel = shared.path().join("release-holder");
+    let held_output = HeldOutput::new(shared.path());
+    let binary = env!("CARGO_BIN_EXE_skillctl");
+    let held = HeldChild::new(
+        std::process::Command::new(binary)
+            .current_dir(workspace)
+            .env("HOME", home)
+            .env("SKILLCTL_LIFECYCLE_HOLD", &sentinel)
+            .env("SKILLCTL_LIFECYCLE_HOLD_AT", "install:after-state")
+            .env(
+                "SKILLCTL_LIFECYCLE_HOLD_TIMEOUT_MS",
+                HELD_HOLD_TIMEOUT_MS.to_string(),
+            )
+            .env("SKILLCTL_FAILPOINT", "install:after-state")
+            .args([
+                "--no-input",
+                "--name",
+                "release-notes",
+                "install",
+                "shared-skills",
+            ])
+            .stdout(capture_stream(&held_output.stdout))
+            .stderr(capture_stream(&held_output.stderr))
+            .spawn()
+            .unwrap_or_else(|error| panic!("the held process spawns: {error}")),
+        sentinel,
+    );
+
+    let state_root = home.join(".skillctl");
+    let lock_file = state_root.join("state.db.lock");
+    (held, state_root, lock_file, held_output)
+}
+
+/// Run one `skillctl` command and return its combined output text.
+fn run_text(home: &Path, workspace: &Path, envs: &[(&str, &str)], args: &[&str]) -> (bool, String) {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_skillctl"));
+    command.current_dir(workspace).env("HOME", home);
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    let output = command.args(args).output().expect("command launches");
+    let message = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (output.status.success(), message)
+}
+
+/// A live lifecycle transaction holds the coordination lock and keeps an
+/// active journal on disk for its whole duration.
+///
+/// While one runs, a read command stays available instead of timing out on the
+/// lock, `doctor` must not report the healthy operation as interrupted, and a
+/// check-mode update must wait for the lock like every other writer instead of
+/// committing beside the holder.
+#[test]
+fn a_live_lifecycle_writer_keeps_readers_available_and_is_not_reported_interrupted() {
+    let shared = TestWorkspace::new();
+    let home = shared.home_path();
+    let workspace_a = shared.path().join("ws-a");
+    let workspace_b = shared.path().join("ws-b");
+    for workspace in [&workspace_a, &workspace_b] {
+        fs::create_dir_all(workspace).expect("workspace exists");
+    }
+    write_workspace_skill_at(
+        &workspace_b,
+        "shared-skills/.agents/skills/release-notes",
+        "release-notes",
+    );
+
+    // Workspace A tracks a git import, so a check-mode update has a row to
+    // persist behind the lock.
+    shared.write_skill_source("git-source", "release-notes");
+    shared.init_git_repo("git-source");
+    install_skill(
+        &home,
+        &workspace_a,
+        &shared.git_repo_url("git-source"),
+        "release-notes",
+    );
+
+    let (mut held, state_root, lock_file, held_output) =
+        hold_install_mid_transaction(&shared, &home, &workspace_b);
+    wait_for_hold_boundary(
+        &mut held.child,
+        &state_root,
+        &lock_file,
+        &held_output,
+        hold_boundary_wait_bound(),
+    );
+
+    // A reader opens the store without the coordination lock, so even a one
+    // second lock timeout cannot fail it while the writer is healthy.
+    let (ok, message) = run_text(
+        &home,
+        &workspace_a,
+        &[("SKILLCTL_LOCK_TIMEOUT_MS", "1000")],
+        &["--json", "list"],
+    );
+    assert!(ok, "list stays available while the lock is held: {message}");
+
+    // Doctor reads the journal directory without the lock, so it must tell the
+    // live operation from an interrupted one instead of advising a repair.
+    let (ok, doctor) = run_json(&home, &workspace_a, &["doctor"]);
+    assert!(
+        ok,
+        "doctor succeeds while a lifecycle writer runs: {doctor}"
+    );
+    assert!(
+        !doctor["data"]["issues"]
+            .as_array()
+            .is_some_and(|issues| issues
+                .iter()
+                .any(|issue| issue["code"] == "state-recovery-pending")),
+        "a live operation is not an interrupted one: {doctor}"
+    );
+    let (ok, preview) = run_json(&home, &workspace_a, &["doctor", "--repair-state"]);
+    assert!(ok, "repair preview succeeds: {preview}");
+    assert_eq!(
+        preview["data"]["pending_operations"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "the live operation is not offered for repair: {preview}"
+    );
+
+    // A check-mode update persists its rows through the coordination lock, so
+    // it waits for the live writer instead of committing beside it.
+    let (ok, message) = run_text(
+        &home,
+        &workspace_a,
+        &[("SKILLCTL_LOCK_TIMEOUT_MS", "1000")],
+        &["--no-input", "update"],
+    );
+    assert!(
+        !ok,
+        "the check-mode update must not commit beside the lock holder: {message}"
+    );
+    assert!(
+        message.contains("timed out") && message.contains("record update check"),
+        "the refusal names the coordinated write it waited for: {message}"
+    );
+
+    // Release the holder, which fails at its failpoint and rolls back its own
+    // work, so no journal survives for a repair to find.
+    let status = held.release_and_wait();
+    assert!(
+        !status.success(),
+        "the held process fails at its failpoint: {status}; {}",
+        held_output.report()
+    );
+    let (ok, preview) = run_json(&home, &workspace_a, &["doctor", "--repair-state"]);
+    assert!(ok, "a follow-up preview succeeds: {preview}");
+    assert_eq!(
+        preview["data"]["pending_operations"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "the rolled-back operation left no journal: {preview}"
+    );
+}
+
+/// `pin` clones its git source before the guarded transaction opens, so the
+/// clone failure is reported even while another process holds the
+/// coordination lock, instead of the command timing out on a lock it never
+/// reached.
+#[test]
+fn pin_clones_the_pinned_source_before_it_waits_for_the_state_lock() {
+    let shared = TestWorkspace::new();
+    let home = shared.home_path();
+    let workspace_a = shared.path().join("ws-a");
+    let workspace_b = shared.path().join("ws-b");
+    for workspace in [&workspace_a, &workspace_b] {
+        fs::create_dir_all(workspace).expect("workspace exists");
+    }
+    write_workspace_skill_at(
+        &workspace_b,
+        "shared-skills/.agents/skills/release-notes",
+        "release-notes",
+    );
+
+    shared.write_skill_source("git-source", "release-notes");
+    shared.init_git_repo("git-source");
+    install_skill(
+        &home,
+        &workspace_a,
+        &shared.git_repo_url("git-source"),
+        "release-notes",
+    );
+    // A second commit gives the pin a revision to move to.
+    shared.write_skill_source_at(
+        "git-source",
+        ".agents/skills/release-notes",
+        "release-notes",
+        "Pinned release notes helper.",
+    );
+    shared.commit_all("git-source", "pin release notes");
+    let pinned_commit = shared.git_head("git-source");
+
+    let (mut held, state_root, lock_file, held_output) =
+        hold_install_mid_transaction(&shared, &home, &workspace_b);
+    wait_for_hold_boundary(
+        &mut held.child,
+        &state_root,
+        &lock_file,
+        &held_output,
+        hold_boundary_wait_bound(),
+    );
+
+    // The pinned source disappears, so the pin's clone fails fast no matter
+    // where it runs. A clone inside the guarded transaction would instead
+    // report the lock timeout, because the holder never releases.
+    let source = shared.path().join("git-source");
+    let hidden = shared.path().join("git-source-hidden");
+    fs::rename(&source, &hidden).expect("git source hides");
+    let (ok, message) = run_text(
+        &home,
+        &workspace_a,
+        &[("SKILLCTL_LOCK_TIMEOUT_MS", "1000")],
+        &["--no-input", "pin", "release-notes", pinned_commit.as_str()],
+    );
+    assert!(!ok, "the pin fails without its source: {message}");
+    assert!(
+        message.contains("clone pinned git source"),
+        "the pin reports the clone it ran before the lock: {message}"
+    );
+    assert!(
+        !message.contains("timed out"),
+        "the pin never spent its lock timeout waiting to clone: {message}"
+    );
+
+    // Restore the source, release the holder, and the same pin succeeds.
+    fs::rename(&hidden, &source).expect("git source returns");
+    let status = held.release_and_wait();
+    assert!(
+        !status.success(),
+        "the held process fails at its failpoint: {status}; {}",
+        held_output.report()
+    );
+    let (ok, payload) = run_json(
+        &home,
+        &workspace_a,
+        &["--no-input", "pin", "release-notes", pinned_commit.as_str()],
+    );
+    assert!(ok, "the pin succeeds once the source is back: {payload}");
+    assert_eq!(
+        payload["data"]["resolved_revision"], pinned_commit,
+        "the pin moved to the second commit: {payload}"
+    );
+}
+
 /// Write one skill into a directory that lives outside the test workspace root.
 fn write_workspace_skill_at(root: &Path, relative: &str, skill_name: &str) {
     let skill_root = root.join(relative);

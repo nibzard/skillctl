@@ -40,7 +40,8 @@ jobs:
             target: x86_64-pc-windows-msvc
             binary: skillctl.exe
     steps:
-      - uses: actions/checkout@v4
+      # actions/checkout v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
       - name: Validate release ref
@@ -50,10 +51,12 @@ jobs:
             echo "release builds must target an existing v* tag" >&2
             exit 1
           fi
-      - uses: dtolnay/rust-toolchain@stable
+      # dtolnay/rust-toolchain branch stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      # Swatinem/rust-cache v2.8.0
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0
       - name: Build release binary
         shell: bash
         run: cargo build --release --locked --target "${{ matrix.target }}"
@@ -64,7 +67,7 @@ jobs:
           work_dir="$RUNNER_TEMP/skillctl-work"
           rm -rf "$home_dir" "$work_dir"
           mkdir -p "$home_dir" "$work_dir"
-          HOME="$home_dir" bash scripts/release-smoke-test.sh \
+          bash scripts/release-smoke-test.sh \
             --binary "target/${{ matrix.target }}/release/${{ matrix.binary }}" \
             --home "$home_dir" \
             --workdir "$work_dir"
@@ -77,7 +80,8 @@ jobs:
             --version "${RELEASE_TAG}" \
             --target "${{ matrix.target }}" \
             --output dist
-      - uses: actions/upload-artifact@v4
+      # actions/upload-artifact v4.6.2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: release-${{ matrix.target }}
           path: dist/*
@@ -90,7 +94,8 @@ jobs:
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      # actions/checkout v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
       - name: Validate release ref
@@ -100,7 +105,8 @@ jobs:
             echo "release publish must target an existing v* tag" >&2
             exit 1
           fi
-      - uses: actions/download-artifact@v4
+      # actions/download-artifact v4.3.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           path: dist
           pattern: release-*
@@ -113,7 +119,8 @@ jobs:
             sha256sum skillctl-v* > "skillctl-${RELEASE_TAG}-checksums.txt"
           )
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        # softprops/action-gh-release v2.6.2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           files: dist/*

@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     app::AppContext,
     error::AppError,
-    history::{self, HistoryLedger},
+    history::{self, HistoryEventKind, HistoryLedger},
     lockfile::WorkspaceLockfile,
     manifest::{ImportDefinition, ManifestPath, ManifestScope, WorkspaceManifest},
     materialize::{self, PROJECTION_METADATA_FILE},
@@ -22,28 +22,13 @@ use crate::{
         classify_bundled_request,
     },
     source::{compute_effective_version_hash, current_timestamp, stored_import_root},
-    state::{LocalStateStore, ManagedScope, ManagedSkillRef},
+    state::{HistoryDetails, HistoryEntry, LocalStateStore, ManagedScope, ManagedSkillRef},
 };
 
 /// Default relative path to the overlay root.
 pub const DEFAULT_OVERLAYS_DIR: &str = ".agents/overlays";
 /// Hash token used when no overlay files are present.
 pub(crate) const NO_OVERLAY_HASH: &str = "sha256:none";
-
-/// Placeholder overlay root definition.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OverlayRoot {
-    /// Filesystem path to the overlay root.
-    pub path: PathBuf,
-}
-
-impl Default for OverlayRoot {
-    fn default() -> Self {
-        Self {
-            path: PathBuf::from(DEFAULT_OVERLAYS_DIR),
-        }
-    }
-}
 
 /// Typed request for `skillctl override`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -201,6 +186,13 @@ pub fn handle_override(
             &mut skipped,
         );
 
+        // Every consumer that resolves the workspace refuses an overlay file
+        // without a matching file in the stored import, and that refusal
+        // aborts resolution for every skill. The pinning command enforces the
+        // same rule before it writes any hash, so it cannot pin content the
+        // next `sync` or `update` rejects.
+        validate_overlay_mapping(&overlay_root, &stored_skill_root, &import.id)?;
+
         let manifest_updated = match manifest.overrides.get(&import.id) {
             Some(existing) if existing == &overlay_path => false,
             _ => {
@@ -219,6 +211,7 @@ pub fn handle_override(
             &lockfile_entry.hashes.content,
             &overlay_hash,
         );
+        let previous_overlay_hash = lockfile_entry.hashes.overlay.clone();
 
         lockfile_entry.hashes.overlay = overlay_hash.clone();
         lockfile_entry.hashes.effective_version = effective_version_hash.clone();
@@ -234,9 +227,28 @@ pub fn handle_override(
             store.upsert_pin_record(pin_record)?;
         }
 
+        // The hashes are rewritten on every run, so the creation gate alone
+        // would leave a re-pin that moves the pinned overlay digest without a
+        // ledger entry. Every sibling mutation records its change, so a moved
+        // pin records an overlay event of its own.
+        let overlay_re_pinned = previous_overlay_hash != overlay_hash;
         if overlay_root_created || overlay_manifest_created || manifest_updated {
             let mut ledger = HistoryLedger::new(&mut store);
             ledger.record_overlay_created(&managed_skill, overlay_path.as_str(), &timestamp)?;
+        } else if overlay_re_pinned {
+            store.append_history_entry(&HistoryEntry {
+                id: None,
+                kind: HistoryEventKind::OverlayCreated,
+                scope: Some(managed_skill.scope),
+                skill_id: Some(managed_skill.skill_id.clone()),
+                target: None,
+                occurred_at: timestamp,
+                summary: format!("Re-pinned overlay for {}", managed_skill.skill_id),
+                details: HistoryDetails::from([
+                    ("overlay_root".to_string(), json!(overlay_path.as_str())),
+                    ("overlay_hash".to_string(), json!(overlay_hash)),
+                ]),
+            })?;
         }
         transaction.checkpoint("after-state")?;
 
@@ -271,6 +283,21 @@ pub fn handle_override(
 
 /// Handle `skillctl fork`.
 pub fn handle_fork(context: &AppContext, request: ForkRequest) -> Result<AppResponse, AppError> {
+    run_fork(context, request).map(|(response, _)| response)
+}
+
+/// Run one fork and report the edits its preservation moved or replaced.
+///
+/// Both fork entries — `skillctl fork <skill>` and `update --apply --strategy
+/// fork` — share this path, so the conflict-aware edit preservation, the
+/// deletion refusal, the overlay writes, and the manifest release all commit
+/// in one guarded transaction. A fork that fails rolls the overlay writes back
+/// with the transaction, so no declared overlay survives to dead-end workspace
+/// resolution.
+pub(crate) fn run_fork(
+    context: &AppContext,
+    request: ForkRequest,
+) -> Result<(AppResponse, crate::apply::ForkEditPreservation), AppError> {
     let store = LocalStateStore::open_default_for(&context.working_directory)?;
     gate_bundled_request(context, &store, &request.skill, CommandKind::Fork)?;
     // Resolution runs against the documented defaults for the same reason as
@@ -419,6 +446,16 @@ pub fn handle_fork(context: &AppContext, request: ForkRequest) -> Result<AppResp
         let local_root_relative = ManifestPath::new(local_root_relative.clone());
         let local_root = context.working_directory.join(local_root_relative.as_str());
         transaction.track_path(&local_root)?;
+        // The fork rebuilds every generated copy from the stored import, so the
+        // unrecorded edits of those copies move into the overlay first, inside
+        // this transaction. The overlay then flows into the local canonical
+        // copy, which keeps the edits instead of dropping them.
+        let preservation = crate::apply::preserve_edits_for_fork(
+            context,
+            transaction,
+            &mut manifest,
+            &managed_skill,
+        )?;
         prepare_local_root(&local_root, &request.skill)?;
         copy_tree_contents(&stored_skill_root, &local_root)?;
 
@@ -480,18 +517,23 @@ pub fn handle_fork(context: &AppContext, request: ForkRequest) -> Result<AppResp
         )?;
         transaction.checkpoint("after-state")?;
 
-        Ok(AppResponse::success("fork")
-            .with_summary(format!(
-                "Forked {} into {}",
-                request.skill,
-                local_root_relative.as_str()
-            ))
-            .with_data(json!({
-                "skill": request.skill,
-                "scope": managed_skill.scope.as_str(),
-                "local_root": local_root_relative.as_str(),
-                "projection": sync_report,
-            })))
+        Ok((
+            AppResponse::success("fork")
+                .with_summary(format!(
+                    "Forked {} into {}",
+                    request.skill,
+                    local_root_relative.as_str()
+                ))
+                .with_data(json!({
+                    "skill": request.skill,
+                    "scope": managed_skill.scope.as_str(),
+                    "local_root": local_root_relative.as_str(),
+                    "preserved_edits": &preservation.preserved,
+                    "replaced_edits": &preservation.replaced,
+                    "projection": sync_report,
+                })),
+            preservation,
+        ))
     })
 }
 
@@ -781,13 +823,44 @@ fn join_relative_path(root: &str, child: &str) -> String {
     format!("{}/{}", root.trim_end_matches('/'), child)
 }
 
+/// Refuse an overlay file the resolver cannot map onto the stored import.
+///
+/// Resolution applies every overlay file the manifest maps, and a file without
+/// a counterpart in the stored import aborts workspace resolution for every
+/// skill. Doctor reports the same state as `invalid-overlay-mapping`, so the
+/// pinning command refuses it before any hash records it.
+fn validate_overlay_mapping(
+    overlay_root: &Path,
+    stored_skill_root: &Path,
+    import_id: &str,
+) -> Result<(), AppError> {
+    let mut files = Vec::new();
+    collect_overlay_files(overlay_root, overlay_root, &mut files)?;
+    for relative_path in files {
+        let mapped = stored_skill_root.join(&relative_path);
+        if !mapped.is_file() {
+            return Err(AppError::ResolutionValidation {
+                message: format!(
+                    "overlay '{}' file '{}' does not map to an imported file of '{}'; remove \
+                     the unmatched overlay file or add the file upstream before overriding it",
+                    overlay_root.display(),
+                    relative_path.display(),
+                    import_id,
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 fn prepare_local_root(path: &Path, skill: &str) -> Result<(), AppError> {
     match fs::metadata(path) {
         Ok(metadata) if !metadata.is_dir() => Err(AppError::PathConflict {
             path: path.to_path_buf(),
             expected: "directory",
         }),
-        Ok(_) if is_generated_skill_directory(path)? => {
+        Ok(_) if materialize::is_skillctl_generated_directory(path)? => {
             fs::remove_dir_all(path).map_err(|source| AppError::FilesystemOperation {
                 action: "remove generated workspace skill projection",
                 path: path.to_path_buf(),
@@ -837,10 +910,6 @@ fn copy_tree_contents(source_root: &Path, destination_root: &Path) -> Result<(),
 
     for entry in entries {
         let source_path = entry.path();
-        if entry.file_name() == PROJECTION_METADATA_FILE {
-            continue;
-        }
-
         let destination_path = destination_root.join(entry.file_name());
         let metadata =
             fs::symlink_metadata(&source_path).map_err(|source| AppError::FilesystemOperation {
@@ -901,30 +970,6 @@ fn remove_projection_metadata(root: &Path) -> Result<(), AppError> {
             source,
         }),
     }
-}
-
-fn is_generated_skill_directory(path: &Path) -> Result<bool, AppError> {
-    let metadata_path = path.join(PROJECTION_METADATA_FILE);
-    let contents = match fs::read_to_string(&metadata_path) {
-        Ok(contents) => contents,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(source) => {
-            return Err(AppError::FilesystemOperation {
-                action: "read local projection metadata",
-                path: metadata_path,
-                source,
-            });
-        }
-    };
-    let parsed = serde_json::from_str::<serde_json::Value>(&contents).map_err(|source| {
-        AppError::MaterializationValidation {
-            message: format!(
-                "projection metadata '{}' is invalid JSON: {source}",
-                metadata_path.display()
-            ),
-        }
-    })?;
-    Ok(parsed.get("tool").and_then(|value| value.as_str()) == Some("skillctl"))
 }
 
 fn ensure_directory_path(path: &Path, action: &'static str) -> Result<(), AppError> {

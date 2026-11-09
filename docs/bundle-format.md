@@ -2,6 +2,7 @@
 
 Status: Active
 Date: 2026-11-05
+Updated: 2026-11-09, format version 2
 Owner: `src/bundle.rs`, `src/artifact.rs`
 
 This document specifies the canonical bundle format and hashing rules that
@@ -78,6 +79,11 @@ Each entry records a path, a mode, a digest, and a size.
 
 - Modes are `file`, `executable`, and `directory`.
 - `executable` means the file has at least one execute permission bit.
+- The mode is part of the stored inventory only. Since format version 2, the
+  digest payload hashes `file` and `executable` entries with the same
+  `file` tag, because platforms without permission bits, such as Windows,
+  cannot observe the bit. A tree therefore digests identically on every
+  platform.
 - Directories carry no digest and a size of zero. Explicit directory entries
   make empty directories portable.
 - A file digest is the SHA-256 of the file bytes, rendered as
@@ -122,9 +128,23 @@ The bundle digest is the SHA-256 of a deterministic payload:
    `path`, NUL, `mode`, NUL, `digest`, NUL, `size`, NUL, newline. Directories
    use an empty digest field and `0` as the size.
 
+The `mode` field of the payload is a versioned tag, not the stored mode:
+
+- Version 2, the current version, writes `file` for both `file` and
+  `executable` entries and `directory` for directories.
+- Version 1 wrote the stored mode, so `executable` entries carried an
+  `executable` tag.
+
 The digest is rendered as `sha256:<64 lowercase hex>`.
 
-The committed fixture `tests/fixtures/bundle/canonical/` pins this value:
+The committed fixture `tests/fixtures/bundle/canonical/` pins both values. A
+current version 2 capture digests to:
+
+```text
+sha256:367c651e157b6b28646d3627d147b67b66da58bb5b0692ae3fabba35caaf937b
+```
+
+The same tree under the version 1 payload rules digests to:
 
 ```text
 sha256:0766869ba27a516348be813c39a52a8ca862ce7338708117a1b0044e9d86bc0f
@@ -133,6 +153,14 @@ sha256:0766869ba27a516348be813c39a52a8ca862ce7338708117a1b0044e9d86bc0f
 The assertion in `src/bundle.rs` is the compatibility boundary. Changing the
 fixture or the rules changes the digest and requires a version bump.
 
+### Format version migration
+
+Version 1 manifests remain readable, and a version 1 manifest digests with the
+version 1 payload, so retained artifacts stay verifiable under the digest they
+recorded. A lockfile pin recorded under version 1 no longer matches a fresh
+capture of the same tree, because a fresh capture records version 2. Reinstall
+the import to record a version 2 pin.
+
 ## Stored manifest
 
 A retained artifact stores the inventory as deterministic JSON at
@@ -140,7 +168,7 @@ A retained artifact stores the inventory as deterministic JSON at
 
 ```json
 {
-  "format_version": 1,
+  "format_version": 2,
   "entries": [
     {
       "path": "SKILL.md",
@@ -189,7 +217,7 @@ is acceptable.
 version: 2
 state:
   manifest_version: 1
-  local_state_version: 4
+  local_state_version: 6
 imports:
   release-notes:
     source:
@@ -199,7 +227,7 @@ imports:
     revision:
       resolved: 0123456789abcdef0123456789abcdef01234567
     bundle:
-      format_version: 1
+      format_version: 2
       digest: sha256:...
       files: 3
       bytes: 1200

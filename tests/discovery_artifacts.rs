@@ -29,22 +29,25 @@ const TAR_GZ_DIGEST: &str =
 /// Digest of the committed `code-review.zip` fixture.
 const ZIP_DIGEST: &str = "sha256:c0caadb7b04227bd0a12e5a740d3aa262fe5e6b5ab0b4832337db81d2f1eb0b7";
 
-/// Serve one artifact per URL path, or fail the way an origin does.
+/// Serve one artifact per full URL, or fail the way an origin does.
+///
+/// Matching the full URL lets a test declare an entry on another origin and
+/// observe whether the artifact URL was fetched at all.
 struct FixtureTransport {
     artifacts: Vec<(String, Result<Vec<u8>, String>)>,
 }
 
 impl FixtureTransport {
-    fn serving(path: &str, artifact: &str) -> Self {
+    fn serving(url: &str, artifact: &str) -> Self {
         let bytes = fs::read(fixture_path(artifact)).expect("fixture artifact is readable");
         Self {
-            artifacts: vec![(path.to_string(), Ok(bytes))],
+            artifacts: vec![(url.to_string(), Ok(bytes))],
         }
     }
 
     fn lookup(&self, url: &Url) -> Result<Vec<u8>, AppError> {
-        for (path, body) in &self.artifacts {
-            if url.path() == path {
+        for (served_url, body) in &self.artifacts {
+            if url.as_str() == served_url {
                 return match body {
                     Ok(bytes) => Ok(bytes.clone()),
                     Err(message) => Err(AppError::DiscoveryFetch {
@@ -109,14 +112,14 @@ fn a_skill_md_entry_fetches_verifies_and_stages() {
         SKILL_MD_DIGEST,
     );
     let transport = FixtureTransport::serving(
-        "/.well-known/agent-skills/code-review/SKILL.md",
+        "https://skills.example.com/.well-known/agent-skills/code-review/SKILL.md",
         "code-review-SKILL.md",
     );
 
     let fetched = fetch_artifact(&entry, &transport).expect("verified bytes are fetched");
     assert_eq!(fetched.artifact_type, ArtifactType::SkillMd);
     assert_eq!(fetched.digest.as_str(), SKILL_MD_DIGEST);
-    assert_eq!(fetched.byte_size(), 268);
+    assert_eq!(fetched.bytes.len(), 268);
 
     let staged = fetch_and_stage_artifact(&entry, &transport).expect("the artifact stages");
     let manifest = fs::read_to_string(staged.root.join("skills/code-review/SKILL.md"))
@@ -135,7 +138,10 @@ fn a_tar_gz_archive_entry_fetches_verifies_and_stages() {
         "/download/code-review.tar.gz",
         TAR_GZ_DIGEST,
     );
-    let transport = FixtureTransport::serving("/download/code-review.tar.gz", "code-review.tar.gz");
+    let transport = FixtureTransport::serving(
+        "https://skills.example.com/download/code-review.tar.gz",
+        "code-review.tar.gz",
+    );
 
     let staged = fetch_and_stage_artifact(&entry, &transport).expect("the archive stages");
     assert_eq!(staged.artifact_type, ArtifactType::Archive);
@@ -166,7 +172,10 @@ fn a_zip_archive_entry_fetches_verifies_and_stages() {
         "/download/code-review.zip",
         ZIP_DIGEST,
     );
-    let transport = FixtureTransport::serving("/download/code-review.zip", "code-review.zip");
+    let transport = FixtureTransport::serving(
+        "https://skills.example.com/download/code-review.zip",
+        "code-review.zip",
+    );
 
     let staged = fetch_and_stage_artifact(&entry, &transport).expect("the archive stages");
     assert!(
@@ -189,8 +198,10 @@ fn an_artifact_that_does_not_match_its_declared_digest_is_refused() {
         "/download/code-review.tar.gz",
         TAR_GZ_DIGEST,
     );
-    let transport =
-        FixtureTransport::serving("/download/code-review.tar.gz", "code-review-SKILL.md");
+    let transport = FixtureTransport::serving(
+        "https://skills.example.com/download/code-review.tar.gz",
+        "code-review-SKILL.md",
+    );
 
     let error = fetch_and_stage_artifact(&entry, &transport)
         .expect_err("unverified content is never staged");
@@ -218,7 +229,10 @@ fn a_failed_artifact_download_is_an_operational_error() {
         "/download/missing.tar.gz",
         TAR_GZ_DIGEST,
     );
-    let transport = FixtureTransport::serving("/download/code-review.tar.gz", "code-review.tar.gz");
+    let transport = FixtureTransport::serving(
+        "https://skills.example.com/download/code-review.tar.gz",
+        "code-review.tar.gz",
+    );
 
     let error = fetch_and_stage_artifact(&entry, &transport).expect_err("a missing artifact fails");
     assert!(
@@ -270,7 +284,7 @@ fn a_traversal_archive_is_refused_at_the_public_boundary() {
         &format!("sha256:{}", sha256_hex(&bytes)),
     );
     let transport = ServingTransport {
-        path: "/download/hostile.tar",
+        url: "https://skills.example.com/download/hostile.tar",
         bytes,
     };
 
@@ -299,7 +313,7 @@ fn a_symlink_archive_entry_is_refused_at_the_public_boundary() {
         &format!("sha256:{}", sha256_hex(&bytes)),
     );
     let transport = ServingTransport {
-        path: "/download/linked.tar",
+        url: "https://skills.example.com/download/linked.tar",
         bytes,
     };
 
@@ -312,9 +326,9 @@ fn a_symlink_archive_entry_is_refused_at_the_public_boundary() {
     );
 }
 
-/// Transport that serves one fixed body at one path.
+/// Transport that serves one fixed body at one full URL.
 struct ServingTransport {
-    path: &'static str,
+    url: &'static str,
     bytes: Vec<u8>,
 }
 
@@ -324,7 +338,7 @@ impl DiscoveryTransport for ServingTransport {
     }
 
     fn fetch_artifact(&self, url: &Url) -> Result<Vec<u8>, AppError> {
-        if url.path() == self.path {
+        if url.as_str() == self.url {
             return Ok(self.bytes.clone());
         }
 
@@ -333,6 +347,43 @@ impl DiscoveryTransport for ServingTransport {
             message: "origin responded with HTTP 404".to_string(),
         })
     }
+}
+
+#[test]
+fn a_plain_http_artifact_origin_is_refused_before_any_bytes_are_read() {
+    // An index read from a permitted HTTPS origin may still declare its
+    // artifact on a plain-HTTP one. The transport serves digest-matching bytes
+    // at that exact URL, so only the origin-trust gate can produce this
+    // refusal: the digest the same document declares cannot vouch for the
+    // transport the artifact arrives over.
+    let entry = index_entry(
+        "code-review",
+        "archive",
+        "http://mirror.example.com/download/code-review.tar.gz",
+        TAR_GZ_DIGEST,
+    );
+    let transport = ServingTransport {
+        url: "http://mirror.example.com/download/code-review.tar.gz",
+        bytes: fs::read(fixture_path("code-review.tar.gz")).expect("fixture artifact is readable"),
+    };
+
+    let error = fetch_and_stage_artifact(&entry, &transport)
+        .expect_err("an artifact origin the policy refuses is never read");
+
+    assert!(
+        matches!(error, AppError::DiscoveryValidation { .. }),
+        "unexpected error: {error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("origin trust policy refuses this discovery origin"),
+        "the refusal names the policy: {error}"
+    );
+    assert_eq!(
+        error.exit_status(),
+        skillctl::error::ExitStatus::ValidationFailure
+    );
 }
 
 /// SHA-256 of `bytes` as 64 lowercase hexadecimal characters.

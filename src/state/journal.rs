@@ -239,8 +239,8 @@ impl OperationJournal {
         }
 
         let snapshot_path = self.directory.join(DATABASE_SNAPSHOT_FILE);
-        let snapshot = snapshot_state_database(database_path, &snapshot_path)?;
-        self.record.state_database_version = Some(snapshot.user_version);
+        let user_version = snapshot_state_database(database_path, &snapshot_path)?;
+        self.record.state_database_version = Some(user_version);
         self.record.tracked_paths.push(TrackedPath {
             path: recorded,
             kind: "file".to_string(),
@@ -921,24 +921,12 @@ pub fn write_file_atomically(path: &Path, contents: &[u8]) -> Result<(), AppErro
     Ok(())
 }
 
-/// Schema facts captured with a database snapshot.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DatabaseSnapshot {
-    /// `user_version` of the snapshotted database.
-    pub user_version: u32,
-    /// Sorted list of snapshotted table names.
-    pub tables: Vec<String>,
-}
-
-/// Copy one database into a fresh snapshot file.
+/// Copy one database into a fresh snapshot file and read its schema version.
 ///
 /// The copy uses SQLite's online backup API, so it is consistent even if the
 /// source is open, and it captures the schema version marker as well as the
 /// rows. The caller holds the coordination lock while this runs.
-pub(crate) fn snapshot_state_database(
-    source: &Path,
-    destination: &Path,
-) -> Result<DatabaseSnapshot, AppError> {
+pub(crate) fn snapshot_state_database(source: &Path, destination: &Path) -> Result<u32, AppError> {
     if !source.exists() {
         return Err(AppError::LocalStateValidation {
             path: source.to_path_buf(),
@@ -964,13 +952,10 @@ pub(crate) fn snapshot_state_database(
         .map_err(|source_error| query_error(source, "back up state database", source_error))?;
 
     let snapshot = open_database(destination)?;
-    let facts = DatabaseSnapshot {
-        user_version: pragma_user_version(&snapshot, "main", destination)?,
-        tables: user_tables(&snapshot, "main")?,
-    };
+    let user_version = pragma_user_version(&snapshot, "main", destination)?;
     verify_database(&snapshot, destination)?;
 
-    Ok(facts)
+    Ok(user_version)
 }
 
 /// Restore one database from a snapshot file.
@@ -1019,12 +1004,12 @@ pub(crate) fn record_migration_backup(
     database_path: &Path,
     from: u32,
     to: u32,
-) -> Result<Option<PathBuf>, AppError> {
+) -> Result<(), AppError> {
     let Some(state_root) = database_path.parent().map(migration_backup_root) else {
-        return Ok(None);
+        return Ok(());
     };
     if !database_path.exists() {
-        return Ok(None);
+        return Ok(());
     }
 
     fs::create_dir_all(&state_root).map_err(|source| AppError::FilesystemOperation {
@@ -1044,19 +1029,18 @@ pub(crate) fn record_migration_backup(
     })?;
     let _ = fs::File::open(&destination).and_then(|file| file.sync_all());
 
-    prune_migration_backups(&state_root)?;
-    Ok(Some(destination))
+    prune_migration_backups(&state_root)
 }
 
 /// Keep only the newest migration backups.
-pub(crate) fn prune_migration_backups(backup_root: &Path) -> Result<Vec<String>, AppError> {
+pub(crate) fn prune_migration_backups(backup_root: &Path) -> Result<(), AppError> {
     let mut backups: Vec<PathBuf> = match fs::read_dir(backup_root) {
         Ok(entries) => entries
             .filter_map(std::result::Result::ok)
             .map(|entry| entry.path())
             .filter(|path| path.is_file())
             .collect(),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(source) => {
             return Err(AppError::FilesystemOperation {
                 action: "list migration backups",
@@ -1074,17 +1058,15 @@ pub(crate) fn prune_migration_backups(backup_root: &Path) -> Result<Vec<String>,
         std::cmp::Reverse(name)
     });
 
-    let mut pruned = Vec::new();
     for stale in backups.iter().skip(MIGRATION_BACKUP_RETENTION) {
         fs::remove_file(stale).map_err(|source| AppError::FilesystemOperation {
             action: "prune old migration backup",
             path: stale.to_path_buf(),
             source,
         })?;
-        pruned.push(stale.to_string_lossy().into_owned());
     }
 
-    Ok(pruned)
+    Ok(())
 }
 
 /// List retained migration backups for diagnostics.
@@ -1129,27 +1111,6 @@ fn open_database(path: &Path) -> Result<Connection, AppError> {
     })?;
     super::configure_connection(&connection, path)?;
     Ok(connection)
-}
-
-fn user_tables(connection: &Connection, schema: &str) -> Result<Vec<String>, AppError> {
-    let sql = format!(
-        "SELECT name FROM {schema}.sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
-    );
-    let snapshot_path = Path::new(":snapshot:");
-    let mut statement = connection.prepare(&sql).map_err(|source_error| {
-        query_error(snapshot_path, "prepare journal table query", source_error)
-    })?;
-    let rows = statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|source_error| query_error(snapshot_path, "query journal tables", source_error))?;
-
-    let mut tables = Vec::new();
-    for row in rows {
-        tables.push(row.map_err(|source_error| {
-            query_error(snapshot_path, "read journal table name", source_error)
-        })?);
-    }
-    Ok(tables)
 }
 
 fn pragma_user_version(

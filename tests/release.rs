@@ -391,6 +391,105 @@ fn release_workflow_manual_dispatch_requires_explicit_release_tag_checkout() {
     );
 }
 
+#[test]
+fn workflows_pin_every_action_reference_to_a_commit_sha() {
+    for workflow_name in [".github/workflows/ci.yml", ".github/workflows/release.yml"] {
+        let workflow_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(workflow_name);
+        let workflow_source =
+            fs::read_to_string(&workflow_path).expect("workflow source is readable");
+
+        let references: Vec<&str> = workflow_source
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                trimmed
+                    .strip_prefix("- uses:")
+                    .or_else(|| trimmed.strip_prefix("uses:"))
+            })
+            .map(str::trim)
+            .collect();
+        assert!(
+            !references.is_empty(),
+            "{workflow_name} should reference at least one action"
+        );
+
+        for reference in references {
+            let (action, version) = reference
+                .split_once('@')
+                .unwrap_or_else(|| panic!("{workflow_name} references '{reference}' with no pin"));
+            let is_commit_sha =
+                version.len() == 40 && version.bytes().all(|byte| byte.is_ascii_hexdigit());
+            assert!(
+                is_commit_sha,
+                "{workflow_name} must pin '{action}' to a full commit SHA, found '{version}'"
+            );
+        }
+    }
+}
+
+#[test]
+fn install_script_names_a_flag_that_has_no_value() {
+    let output = ProcessCommand::new("bash")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .arg("scripts/install.sh")
+        .arg("--version")
+        .output()
+        .expect("installer script launches");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a valueless flag should fail with a usage error: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("error: --version requires a value"),
+        "the failure should name the malformed argument instead of exiting silently: {stderr}"
+    );
+}
+
+#[test]
+fn release_smoke_test_routes_home_into_the_binary() {
+    let workspace = TestWorkspace::new();
+    let binary_path = cargo_bin("skillctl");
+    let isolated_home = workspace.path().join("isolated-home");
+    let work_dir = workspace.path().join("work");
+    let decoy_home = workspace.path().join("decoy-home");
+    fs::create_dir_all(&decoy_home).expect("decoy home exists");
+
+    let output = ProcessCommand::new("bash")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .arg("scripts/release-smoke-test.sh")
+        .arg("--binary")
+        .arg(&binary_path)
+        .arg("--home")
+        .arg(&isolated_home)
+        .arg("--workdir")
+        .arg(&work_dir)
+        .env("HOME", &decoy_home)
+        .output()
+        .expect("smoke test script launches");
+
+    assert!(
+        output.status.success(),
+        "smoke test should pass by routing --home itself: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        isolated_home
+            .join(".agents/skills/skillctl/SKILL.md")
+            .exists(),
+        "the binary should bootstrap the bundled skill inside the --home directory"
+    );
+    assert!(
+        !decoy_home.join(".agents").exists(),
+        "the caller's HOME must stay untouched"
+    );
+}
+
 fn package_release(binary_path: &Path, output_dir: &Path, target: &str) -> PathBuf {
     fs::create_dir_all(output_dir).expect("output dir exists");
 
@@ -512,9 +611,9 @@ fn checkout_step<'a>(job: &'a Mapping, job_name: &str) -> &'a Mapping {
         .find_map(|step| {
             let step = step.as_mapping()?;
             let uses = step.get(YamlValue::String("uses".to_owned()))?.as_str()?;
-            (uses == "actions/checkout@v4").then_some(step)
+            uses.starts_with("actions/checkout@").then_some(step)
         })
-        .unwrap_or_else(|| panic!("{job_name} should include actions/checkout@v4"))
+        .unwrap_or_else(|| panic!("{job_name} should include actions/checkout"))
 }
 
 fn is_windows_target(target: &str) -> bool {

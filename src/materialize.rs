@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs, io,
+    fs, io,
     path::{Component, Path, PathBuf},
 };
 
@@ -21,7 +21,7 @@ use crate::{
     planner::{self, ProjectionPlan},
     resolver::{self, InternalSkillId, ProjectionOutcome, ResolvedSkillCandidate, SkillScope},
     response::AppResponse,
-    source::{current_timestamp, imports_scope_root, stored_import_root},
+    source::{current_timestamp, deterministic_timestamp, imports_scope_root, stored_import_root},
     state::{
         LocalStateStore, ManagedScope, ManagedSkillRef, ProjectionMode as RecordedProjectionMode,
         ProjectionRecord,
@@ -31,7 +31,6 @@ use crate::{
 /// Metadata file written into generated projection directories.
 pub const PROJECTION_METADATA_FILE: &str = ".skillctl-projection.json";
 
-const IMPORTS_STORE_RELATIVE_PATH: &str = ".skillctl/store/imports";
 const UNUSED_IMPORTS_PLACEHOLDER_DIR: &str = ".agents/.skillctl-unused-imports";
 
 /// Structured report for one completed `sync` operation.
@@ -224,6 +223,9 @@ pub(crate) fn sync_workspace_with_policy(
     let targets = selected_targets(context, &manifest)?;
     let registry = AdapterRegistry::new();
     let mut warnings = symlink_risk_warnings(&registry, &targets, &manifest)?;
+    if manifest.projection.mode == ProjectionMode::Symlink {
+        ensure_symlink_capability()?;
+    }
     let plan = planner::plan_target_roots(
         &registry,
         scope,
@@ -231,10 +233,8 @@ pub(crate) fn sync_workspace_with_policy(
         &targets,
         &manifest.adapters,
     )?;
-    let imports_directory = resolve_imports_directory(context, &manifest)?;
     let request = resolver::ResolveWorkspaceRequest::new(
         &context.working_directory,
-        imports_directory,
         manifest.clone(),
         lockfile,
     )
@@ -631,10 +631,7 @@ pub(crate) fn unrestored_imports(
 ) -> Result<Vec<String>, AppError> {
     let mut names = Vec::new();
     for import in manifest.imports.iter().filter(|import| import.enabled) {
-        let scope = match import.scope {
-            crate::manifest::ManifestScope::Workspace => ManagedScope::Workspace,
-            crate::manifest::ManifestScope::User => ManagedScope::User,
-        };
+        let scope = ManagedScope::from(import.scope);
         if !stored_import_root(scope, &context.working_directory, &import.id)?.is_dir() {
             names.push(import.id.clone());
         }
@@ -1171,45 +1168,24 @@ fn clean_unused_import_state(
     lockfile: &WorkspaceLockfile,
 ) -> Result<Vec<CleanedPath>, AppError> {
     let mut cleaned = Vec::new();
+    // The lockfile pins imports by name without a scope, so a remaining pin
+    // keeps the retained copies of that name at every scope: clean never
+    // deletes bytes a committed pin still references, and `skillctl remove`
+    // is the explicit command that clears a pin and its copy together.
+    let pinned: BTreeSet<_> = lockfile.imports.keys().cloned().collect();
     let workspace_referenced: BTreeSet<_> = manifest
         .imports
         .iter()
         .filter(|import| import.scope == crate::manifest::ManifestScope::Workspace)
         .map(|import| import.id.clone())
-        .chain(
-            lockfile
-                .imports
-                .keys()
-                .filter(|id| {
-                    manifest
-                        .imports
-                        .iter()
-                        .find(|import| &import.id == *id)
-                        .is_some_and(|import| {
-                            import.scope == crate::manifest::ManifestScope::Workspace
-                        })
-                })
-                .cloned(),
-        )
+        .chain(pinned.iter().cloned())
         .collect();
     let user_referenced: BTreeSet<_> = manifest
         .imports
         .iter()
         .filter(|import| import.scope == crate::manifest::ManifestScope::User)
         .map(|import| import.id.clone())
-        .chain(
-            lockfile
-                .imports
-                .keys()
-                .filter(|id| {
-                    manifest
-                        .imports
-                        .iter()
-                        .find(|import| &import.id == *id)
-                        .is_some_and(|import| import.scope == crate::manifest::ManifestScope::User)
-                })
-                .cloned(),
-        )
+        .chain(pinned)
         .collect();
 
     for (root, referenced) in [
@@ -1285,7 +1261,14 @@ fn clean_unused_import_state(
     Ok(cleaned)
 }
 
-fn remove_directory_if_exists(path: &Path, action: &'static str) -> Result<bool, AppError> {
+/// Remove one directory, reporting whether anything was removed.
+///
+/// A path that exists but is not a directory is a conflict, so a file that
+/// appeared where a directory was expected is never silently deleted.
+pub(crate) fn remove_directory_if_exists(
+    path: &Path,
+    action: &'static str,
+) -> Result<bool, AppError> {
     match fs::metadata(path) {
         Ok(metadata) if !metadata.is_dir() => Err(AppError::PathConflict {
             path: path.to_path_buf(),
@@ -1424,19 +1407,6 @@ fn ensure_scope_conflict_free(
     }
 }
 
-fn resolve_imports_directory(
-    context: &AppContext,
-    manifest: &WorkspaceManifest,
-) -> Result<PathBuf, AppError> {
-    if manifest.imports.iter().any(|import| import.enabled) {
-        Ok(home_directory()?.join(IMPORTS_STORE_RELATIVE_PATH))
-    } else {
-        Ok(context
-            .working_directory
-            .join(UNUSED_IMPORTS_PLACEHOLDER_DIR))
-    }
-}
-
 fn canonical_root_path(
     scope: TargetScope,
     context: &AppContext,
@@ -1469,12 +1439,9 @@ fn resolve_runtime_root_path(context: &AppContext, root: &str) -> Result<PathBuf
 }
 
 fn home_directory() -> Result<PathBuf, AppError> {
-    env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .ok_or_else(|| AppError::MaterializationValidation {
-            message: "unable to resolve the home directory for sync".into(),
-        })
+    crate::state::resolve_home_directory().ok_or_else(|| AppError::MaterializationValidation {
+        message: "unable to resolve the home directory for sync".into(),
+    })
 }
 
 fn materialize_generated_root(
@@ -1510,7 +1477,7 @@ fn materialize_generated_root(
             .as_ref()
             .and_then(|import| diverged_stores.get(&(import.scope, import.id.as_str())))
         {
-            if drift.preserve_diverged_store(divergence, &skill_name, root_display, &target_dir) {
+            if drift.preserve_diverged_store(divergence, &skill_name, root_display, &target_dir)? {
                 report.preserved.push(skill_name.clone());
             }
             desired_names.insert(skill_name);
@@ -1571,16 +1538,19 @@ impl DriftReport<'_> {
     /// Returns `true` when a generated copy exists, because that copy is
     /// preserved untouched: its links are exactly what skillctl last wrote, so
     /// replacing them relinks to the same diverged bytes, and the drift
-    /// policies for edited copies do not apply. Without a copy there is
-    /// nothing to preserve and the divergence is still reported as a warning,
-    /// so the user learns the store needs a repair before anything projects.
+    /// policies for edited copies do not apply. A directory skillctl never
+    /// generated is not that copy: preserving it would claim ownership of a
+    /// directory no named repair touches, so it falls through to the same
+    /// warning a missing copy earns. Without a copy there is nothing to
+    /// preserve and the divergence is still reported as a warning, so the
+    /// user learns the store needs a repair before anything projects.
     fn preserve_diverged_store(
         &mut self,
         divergence: &resolver::ImportStoreDivergence,
         skill_name: &str,
         root_display: &str,
         target_dir: &Path,
-    ) -> bool {
+    ) -> Result<bool, AppError> {
         let reason = crate::apply::DriftReason::DivergedImportStore;
         // The command classification is irrelevant for this reason: every
         // update strategy resolves through the store it would have to repair.
@@ -1589,7 +1559,7 @@ impl DriftReport<'_> {
             crate::apply::RepairCommands::DiscardOnly,
             self.scope,
         );
-        let copy_exists = target_dir.is_dir();
+        let copy_exists = is_skillctl_generated_directory(target_dir)?;
         let digests = format!(
             "the lockfile pins {} but the store holds {}",
             divergence.pinned_content_hash, divergence.observed_content_hash
@@ -1604,16 +1574,22 @@ impl DriftReport<'_> {
                 detail: format!("{}; {digests}", reason.detail()),
                 repair,
             });
-            return true;
+            return Ok(true);
         }
 
-        self.warnings.push(format!(
+        let warning = format!(
             "import '{}' no longer matches its pinned content, so no projection was written \
              for '{}'; {digests}; {repair}",
             divergence.import_id, skill_name
-        ));
+        );
+        // The same import can back the copies of several planned roots, and
+        // this line names the import instead of a path, so it is reported
+        // once per import rather than once per root.
+        if !self.warnings.contains(&warning) {
+            self.warnings.push(warning);
+        }
 
-        false
+        Ok(false)
     }
 
     /// Handle one drifted copy. Returns `true` when it was preserved.
@@ -1892,11 +1868,18 @@ fn prune_stale_projections(
     Ok(pruned)
 }
 
-fn is_skillctl_generated_directory(path: &Path) -> Result<bool, AppError> {
-    let metadata_path = path.join(PROJECTION_METADATA_FILE);
+/// Read and parse one directory's projection metadata.
+///
+/// `None` means the directory holds no projection metadata. An unreadable or
+/// invalid metadata file is an error on every surface, because projection
+/// ownership decides whether a directory may be replaced or pruned, and one
+/// directory must not count as skillctl-generated on one code path and fail
+/// on another.
+pub(crate) fn read_projection_metadata(dir: &Path) -> Result<Option<serde_json::Value>, AppError> {
+    let metadata_path = dir.join(PROJECTION_METADATA_FILE);
     let contents = match fs::read_to_string(&metadata_path) {
         Ok(contents) => contents,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(source) => {
             return Err(AppError::FilesystemOperation {
                 action: "read projection metadata",
@@ -1915,10 +1898,17 @@ fn is_skillctl_generated_directory(path: &Path) -> Result<bool, AppError> {
         }
     })?;
 
-    Ok(parsed
-        .get("tool")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|tool| tool == "skillctl"))
+    Ok(Some(parsed))
+}
+
+/// Whether a directory's projection metadata names skillctl as its tool.
+///
+/// This is the one check of skillctl-generated ownership: every surface that
+/// decides whether a directory may be replaced, pruned, or kept calls it.
+pub(crate) fn is_skillctl_generated_directory(path: &Path) -> Result<bool, AppError> {
+    Ok(read_projection_metadata(path)?.is_some_and(|parsed| {
+        parsed.get("tool").and_then(serde_json::Value::as_str) == Some("skillctl")
+    }))
 }
 
 /// Whether one skillctl-generated directory holds the bundled `skillctl`
@@ -1928,29 +1918,7 @@ fn is_skillctl_generated_directory(path: &Path) -> Result<bool, AppError> {
 /// projection metadata, which stays readable even where no install record
 /// exists.
 pub(crate) fn is_bundled_projection_directory(path: &Path) -> Result<bool, AppError> {
-    let metadata_path = path.join(PROJECTION_METADATA_FILE);
-    let contents = match fs::read_to_string(&metadata_path) {
-        Ok(contents) => contents,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(source) => {
-            return Err(AppError::FilesystemOperation {
-                action: "read projection metadata",
-                path: metadata_path,
-                source,
-            });
-        }
-    };
-
-    let parsed = serde_json::from_str::<serde_json::Value>(&contents).map_err(|source| {
-        AppError::MaterializationValidation {
-            message: format!(
-                "projection metadata '{}' is invalid JSON: {source}",
-                metadata_path.display()
-            ),
-        }
-    })?;
-
-    Ok(parsed["source"]["kind"] == "bundled")
+    Ok(read_projection_metadata(path)?.is_some_and(|parsed| parsed["source"]["kind"] == "bundled"))
 }
 
 fn write_projection_metadata(
@@ -1975,10 +1943,11 @@ fn write_projection_metadata(
 
 /// Metadata one materialization records for a generated copy.
 ///
-/// `generated_at` is the only field that changes between two runs over the
-/// same content by one build, and `version` is the only one that changes
-/// across a release, so [`projection_is_current`] compares the metadata
-/// without either. `generated_at` is RFC3339, the format
+/// `generated_at` comes from [`deterministic_timestamp`], so two runs of one
+/// build over the same content record the same instant while an ordinary run
+/// records the real clock, and `version` is the only field that changes
+/// across a release; [`projection_is_current`] compares the metadata without
+/// either. `generated_at` is RFC3339, the format
 /// [`ProjectionRecord::generated_at`] already uses, so one field name never
 /// carries two timestamp formats.
 fn projection_metadata(
@@ -1990,7 +1959,7 @@ fn projection_metadata(
     json!({
         "tool": "skillctl",
         "version": env!("CARGO_PKG_VERSION"),
-        "generated_at": current_timestamp(),
+        "generated_at": deterministic_timestamp(),
         "generation_mode": projection_mode_label(mode),
         "content_digest": content_digest,
         "physical_root": root_display,
@@ -2114,6 +2083,74 @@ fn create_projection_symlink(source_path: &Path, destination: &Path) -> Result<(
             source,
         }
     })
+}
+
+/// Confirm this process may create the symlinks symlink mode projects.
+///
+/// Windows grants symlink creation only to elevated processes and Developer
+/// Mode sessions, so an ordinary account fails every projected file with raw
+/// OS error 1314 after earlier projections were already written. One
+/// throwaway symlink inside a staging directory probes the capability before
+/// any projection is written, so a run that cannot finish refuses to start
+/// and names the requirement and the copy-mode alternative. The staging
+/// directory removes itself, so the probe leaves nothing behind.
+fn ensure_symlink_capability() -> Result<(), AppError> {
+    let staging = tempfile::tempdir().map_err(|source| AppError::FilesystemOperation {
+        action: "create symlink capability staging directory",
+        path: std::env::temp_dir(),
+        source,
+    })?;
+    let probe = staging.path().join("skillctl-symlink-capability");
+    // The link target never needs to exist: the probe measures whether the
+    // operating system lets this process create the link at all.
+    if let Err(source) = create_probe_symlink(Path::new("skillctl-capability"), &probe) {
+        if is_symlink_privilege_error(&source) {
+            return Err(AppError::MaterializationValidation {
+                message: format!(
+                    "projection.mode 'symlink' requires a process that may create symlinks, but \
+                     the operating system denied the capability probe ({source}); enable Windows \
+                     Developer Mode or run from an elevated shell, or use projection.mode 'copy'"
+                ),
+            });
+        }
+        return Err(AppError::FilesystemOperation {
+            action: "probe symlink capability",
+            path: probe,
+            source,
+        });
+    }
+
+    Ok(())
+}
+
+/// Whether symlink creation failed because the process lacks the privilege
+/// the operating system requires for it.
+///
+/// Windows reports `ERROR_PRIVILEGE_NOT_HELD` (1314) unless the process is
+/// elevated or Developer Mode is enabled. Other platforms do not gate symlink
+/// creation on a privilege, so the probe never reports this cause there.
+#[cfg(windows)]
+fn is_symlink_privilege_error(source: &io::Error) -> bool {
+    const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+    source.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD)
+}
+
+/// Create the probe link with the same operating-system call projection
+/// materialization uses, keeping the raw error so the capability cause stays
+/// readable.
+#[cfg(unix)]
+fn create_probe_symlink(target: &Path, destination: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, destination)
+}
+
+#[cfg(windows)]
+fn create_probe_symlink(target: &Path, destination: &Path) -> io::Result<()> {
+    std::os::windows::fs::symlink_file(target, destination)
+}
+
+#[cfg(not(windows))]
+fn is_symlink_privilege_error(_source: &io::Error) -> bool {
+    false
 }
 
 /// How a projection rebuild treats a stored import that no longer hashes to

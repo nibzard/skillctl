@@ -13,11 +13,11 @@ use crate::{
     adapter::TargetRuntime,
     app::AppContext,
     error::AppError,
-    lockfile::{DEFAULT_LOCKFILE_PATH, WorkspaceLockfile},
+    lockfile::{DEFAULT_LOCKFILE_PATH, WorkspaceLockfile, portable},
     overlay::DEFAULT_OVERLAYS_DIR,
     response::AppResponse,
     skill::DEFAULT_SKILLS_DIR,
-    state::{CURRENT_MANIFEST_VERSION, MANIFEST_SCHEMA_POLICY, VersionDisposition},
+    state::{CURRENT_MANIFEST_VERSION, MANIFEST_SCHEMA_POLICY, ManagedScope, VersionDisposition},
 };
 
 /// Default relative path to the workspace manifest.
@@ -25,7 +25,6 @@ pub const DEFAULT_MANIFEST_PATH: &str = ".agents/skillctl.yaml";
 /// Current supported manifest schema version.
 pub const DEFAULT_MANIFEST_VERSION: u32 = CURRENT_MANIFEST_VERSION;
 
-const DEFAULT_GIT_EXCLUDE_PATH: &str = ".git/info/exclude";
 const GENERATED_RUNTIME_ROOT_EXCLUDES: &[&str] = &[
     "/.claude/skills/",
     "/.github/skills/",
@@ -201,7 +200,12 @@ impl WorkspaceManifest {
     }
 
     /// Serialize the manifest using an explicit, stable field order.
-    pub fn to_yaml_string(&self) -> Result<String, AppError> {
+    ///
+    /// Only this module's tests read the explicit form: every workspace write
+    /// goes through [`WorkspaceManifest::write_to_path`], which serializes the
+    /// minimal form that omits fully default sections.
+    #[cfg(test)]
+    pub(crate) fn to_yaml_string(&self) -> Result<String, AppError> {
         render_manifest_yaml(self, &self.path)
     }
 
@@ -463,6 +467,15 @@ pub enum ManifestScope {
     User,
 }
 
+impl From<ManifestScope> for ManagedScope {
+    fn from(scope: ManifestScope) -> Self {
+        match scope {
+            ManifestScope::Workspace => Self::Workspace,
+            ManifestScope::User => Self::User,
+        }
+    }
+}
+
 /// Immutable imported source definition.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -489,13 +502,7 @@ pub struct ImportDefinition {
 impl ImportDefinition {
     fn validate(&self, manifest_path: &Path) -> Result<(), AppError> {
         validate_identifier("imports[].id", &self.id, manifest_path)?;
-        validate_non_empty_trimmed("imports[].url", &self.url, manifest_path)?;
-        if self.url.chars().any(char::is_whitespace) {
-            return Err(manifest_validation(
-                manifest_path,
-                format!("imports[].url must not contain whitespace: '{}'", self.url),
-            ));
-        }
+        validate_token("imports[].url", &self.url, manifest_path)?;
         validate_non_empty_trimmed("imports[].ref", &self.ref_spec, manifest_path)?;
         validate_relative_manifest_path("imports[].path", self.path.as_str(), manifest_path)?;
 
@@ -716,7 +723,11 @@ pub fn handle_init(context: &AppContext, _request: InitRequest) -> Result<AppRes
         &mut skipped,
     );
 
-    let git_exclude = ensure_local_git_excludes(&context.working_directory)?;
+    // The manifest exists now, so init honors the Git exclusion mode it
+    // declares (spec section 11.3) instead of assuming the default.
+    let manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
+    let git_exclude =
+        ensure_git_excludes(&context.working_directory, manifest.projection.git_exclude)?;
     let outcome = InitOutcome {
         created,
         skipped,
@@ -750,6 +761,26 @@ struct GitExcludeOutcome {
     path: Option<String>,
     created: Vec<String>,
     skipped: Vec<String>,
+}
+
+impl GitExcludeOutcome {
+    /// Outcome for a workspace whose manifest opts out of Git exclusions.
+    fn no_exclusions() -> Self {
+        Self {
+            path: None,
+            created: Vec::new(),
+            skipped: Vec::new(),
+        }
+    }
+
+    /// Outcome for a workspace that has no Git repository metadata.
+    fn without_git_metadata() -> Self {
+        Self {
+            path: None,
+            created: Vec::new(),
+            skipped: vec!["no Git repository metadata found".to_string()],
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -799,20 +830,7 @@ fn ensure_manifest(path: &Path) -> Result<PathAction, AppError> {
             }
         }
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|source| AppError::FilesystemOperation {
-                    action: "create manifest parent directory",
-                    path: parent.to_path_buf(),
-                    source,
-                })?;
-            }
-            let contents =
-                WorkspaceManifest::default_at(path.to_path_buf()).to_minimal_yaml_string()?;
-            fs::write(path, contents).map_err(|source| AppError::FilesystemOperation {
-                action: "write manifest",
-                path: path.to_path_buf(),
-                source,
-            })?;
+            WorkspaceManifest::default_at(path.to_path_buf()).write_to_path()?;
             Ok(PathAction::Created)
         }
         Err(source) => Err(AppError::FilesystemOperation {
@@ -847,42 +865,68 @@ fn ensure_lockfile(path: &Path) -> Result<PathAction, AppError> {
     }
 }
 
-fn ensure_local_git_excludes(working_directory: &Path) -> Result<GitExcludeOutcome, AppError> {
-    let Some(actual_path) = resolve_git_exclude_path(working_directory)? else {
-        return Ok(GitExcludeOutcome {
-            path: None,
-            created: Vec::new(),
-            skipped: vec!["no Git repository metadata found".to_string()],
-        });
-    };
+/// Add the generated runtime root excludes the way the manifest declares.
+///
+/// `local` (the default) appends to the repository-local exclude file Git
+/// never commits, `gitignore` appends to `.gitignore`, and `none` adds no
+/// exclusions so generated roots stay visible to Git.
+fn ensure_git_excludes(
+    working_directory: &Path,
+    mode: GitExcludeMode,
+) -> Result<GitExcludeOutcome, AppError> {
+    match mode {
+        GitExcludeMode::None => Ok(GitExcludeOutcome::no_exclusions()),
+        GitExcludeMode::Gitignore => {
+            append_generated_root_excludes(&working_directory.join(".gitignore"), ".gitignore")
+        }
+        GitExcludeMode::Local => {
+            let Some(actual_path) = resolve_git_exclude_path(working_directory)? else {
+                return Ok(GitExcludeOutcome::without_git_metadata());
+            };
+            append_generated_root_excludes(
+                &actual_path,
+                &display_exclude_path(working_directory, &actual_path),
+            )
+        }
+    }
+}
 
+/// Append the missing generated runtime root excludes to one exclude file.
+///
+/// The outcome reports the file through `display_path`, because worktree and
+/// submodule metadata can resolve the local exclude file outside the
+/// workspace.
+fn append_generated_root_excludes(
+    actual_path: &Path,
+    display_path: &str,
+) -> Result<GitExcludeOutcome, AppError> {
     if let Some(parent) = actual_path.parent() {
         fs::create_dir_all(parent).map_err(|source| AppError::FilesystemOperation {
-            action: "create git info directory",
+            action: "create exclude file parent directory",
             path: parent.to_path_buf(),
             source,
         })?;
     }
 
-    let existing_content = match fs::metadata(&actual_path) {
+    let existing_content = match fs::metadata(actual_path) {
         Ok(metadata) => {
             if !metadata.is_file() {
                 return Err(AppError::PathConflict {
-                    path: actual_path,
+                    path: actual_path.to_path_buf(),
                     expected: "file",
                 });
             }
-            fs::read_to_string(&actual_path).map_err(|source| AppError::FilesystemOperation {
-                action: "read git exclude file",
-                path: actual_path.clone(),
+            fs::read_to_string(actual_path).map_err(|source| AppError::FilesystemOperation {
+                action: "read exclude file",
+                path: actual_path.to_path_buf(),
                 source,
             })?
         }
         Err(source) if source.kind() == io::ErrorKind::NotFound => String::new(),
         Err(source) => {
             return Err(AppError::FilesystemOperation {
-                action: "inspect git exclude file",
-                path: actual_path,
+                action: "inspect exclude file",
+                path: actual_path.to_path_buf(),
                 source,
             });
         }
@@ -912,20 +956,30 @@ fn ensure_local_git_excludes(working_directory: &Path) -> Result<GitExcludeOutco
             updated_content.push_str(entry);
             updated_content.push('\n');
         }
-        fs::write(&actual_path, updated_content).map_err(|source| {
+        fs::write(actual_path, updated_content).map_err(|source| {
             AppError::FilesystemOperation {
-                action: "write git exclude file",
-                path: actual_path.clone(),
+                action: "write exclude file",
+                path: actual_path.to_path_buf(),
                 source,
             }
         })?;
     }
 
     Ok(GitExcludeOutcome {
-        path: Some(DEFAULT_GIT_EXCLUDE_PATH.to_string()),
+        path: Some(display_path.to_string()),
         created,
         skipped,
     })
+}
+
+/// Exclude file path as reported to the user: relative to the workspace when
+/// the file lives inside it, absolute when it resolves outside, as worktree
+/// and submodule metadata can.
+fn display_exclude_path(working_directory: &Path, actual_path: &Path) -> String {
+    actual_path.strip_prefix(working_directory).map_or_else(
+        |_| actual_path.display().to_string(),
+        |relative| relative.display().to_string(),
+    )
 }
 
 fn resolve_git_exclude_path(working_directory: &Path) -> Result<Option<PathBuf>, AppError> {
@@ -1080,38 +1134,16 @@ fn validate_adapters(
 }
 
 fn validate_identifier(field: &str, value: &str, manifest_path: &Path) -> Result<(), AppError> {
-    if value.is_empty() {
-        return Err(manifest_validation(
-            manifest_path,
-            format!("{field} must not be empty"),
-        ));
+    if let Some(message) = portable::identifier_error(field, value) {
+        return Err(manifest_validation(manifest_path, message));
     }
+    Ok(())
+}
 
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return Err(manifest_validation(
-            manifest_path,
-            format!("{field} must not be empty"),
-        ));
-    };
-    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
-        return Err(manifest_validation(
-            manifest_path,
-            format!("{field} must start with a lowercase ASCII letter or digit: '{value}'"),
-        ));
+fn validate_token(field: &str, value: &str, manifest_path: &Path) -> Result<(), AppError> {
+    if let Some(message) = portable::token_error(field, value) {
+        return Err(manifest_validation(manifest_path, message));
     }
-
-    if !chars
-        .all(|char| char.is_ascii_lowercase() || char.is_ascii_digit() || matches!(char, '-' | '_'))
-    {
-        return Err(manifest_validation(
-            manifest_path,
-            format!(
-                "{field} must contain only lowercase ASCII letters, digits, '-' or '_': '{value}'"
-            ),
-        ));
-    }
-
     Ok(())
 }
 
@@ -1120,19 +1152,9 @@ fn validate_non_empty_trimmed(
     value: &str,
     manifest_path: &Path,
 ) -> Result<(), AppError> {
-    if value.trim().is_empty() {
-        return Err(manifest_validation(
-            manifest_path,
-            format!("{field} must not be empty"),
-        ));
+    if let Some(message) = portable::non_empty_trimmed_error(field, value) {
+        return Err(manifest_validation(manifest_path, message));
     }
-    if value.trim() != value {
-        return Err(manifest_validation(
-            manifest_path,
-            format!("{field} must not contain leading or trailing whitespace"),
-        ));
-    }
-
     Ok(())
 }
 
@@ -1141,48 +1163,9 @@ fn validate_relative_manifest_path(
     value: &str,
     manifest_path: &Path,
 ) -> Result<(), AppError> {
-    validate_non_empty_trimmed(field, value, manifest_path)?;
-
-    if value.starts_with('/') {
-        return Err(manifest_validation(
-            manifest_path,
-            format!("{field} must be relative, found absolute path '{value}'"),
-        ));
+    if let Some(message) = portable::relative_path_error(field, value) {
+        return Err(manifest_validation(manifest_path, message));
     }
-    if value.contains('\\') {
-        return Err(manifest_validation(
-            manifest_path,
-            format!("{field} must use '/' separators: '{value}'"),
-        ));
-    }
-    if value.contains(':') {
-        return Err(manifest_validation(
-            manifest_path,
-            format!("{field} must not contain ':' so it remains portable: '{value}'"),
-        ));
-    }
-    if value.ends_with('/') {
-        return Err(manifest_validation(
-            manifest_path,
-            format!("{field} must not end with '/': '{value}'"),
-        ));
-    }
-
-    for segment in value.split('/') {
-        if segment.is_empty() {
-            return Err(manifest_validation(
-                manifest_path,
-                format!("{field} must not contain empty path segments: '{value}'"),
-            ));
-        }
-        if matches!(segment, "." | "..") {
-            return Err(manifest_validation(
-                manifest_path,
-                format!("{field} must not contain '.' or '..' segments: '{value}'"),
-            ));
-        }
-    }
-
     Ok(())
 }
 
@@ -1194,50 +1177,7 @@ where
         path: path.to_path_buf(),
         source,
     })?;
-    Ok(format_manifest_yaml(&raw))
-}
-
-fn format_manifest_yaml(raw: &str) -> String {
-    let raw = raw.strip_prefix("---\n").unwrap_or(raw);
-    let mut formatted = String::new();
-    let mut saw_top_level_key = false;
-    let mut in_top_level_sequence = false;
-
-    for line in raw.lines() {
-        let is_top_level_key = !line.is_empty()
-            && !line.starts_with(' ')
-            && !line.starts_with("- ")
-            && line.contains(':');
-        if is_top_level_key && saw_top_level_key {
-            formatted.push('\n');
-        }
-        if is_top_level_key {
-            saw_top_level_key = true;
-            in_top_level_sequence = false;
-            formatted.push_str(line);
-            formatted.push('\n');
-            continue;
-        }
-
-        if line.starts_with("- ") {
-            in_top_level_sequence = true;
-            formatted.push_str("  ");
-            formatted.push_str(line);
-            formatted.push('\n');
-            continue;
-        }
-
-        if in_top_level_sequence && line.starts_with("  ") {
-            formatted.push_str("  ");
-        } else if !line.starts_with(' ') {
-            in_top_level_sequence = false;
-        }
-
-        formatted.push_str(line);
-        formatted.push('\n');
-    }
-
-    formatted
+    Ok(portable::format_document_yaml(&raw))
 }
 
 fn manifest_validation(path: &Path, message: impl Into<String>) -> AppError {
@@ -1301,7 +1241,12 @@ fn render_summary(outcome: &InitOutcome) -> String {
         }
         if !outcome.git_exclude.created.is_empty() {
             lines.push(format!(
-                "Updated local git excludes: {}",
+                "Updated git excludes in {}: {}",
+                outcome
+                    .git_exclude
+                    .path
+                    .as_deref()
+                    .unwrap_or("git exclude file"),
                 outcome.git_exclude.created.join(", ")
             ));
         }
@@ -1316,7 +1261,7 @@ fn render_summary(outcome: &InitOutcome) -> String {
 
     if !outcome.git_exclude.skipped.is_empty() {
         lines.push(format!(
-            "Skipped local git excludes: {}",
+            "Skipped git excludes: {}",
             outcome.git_exclude.skipped.join(", ")
         ));
     }
@@ -1738,6 +1683,202 @@ mod tests {
                 .to_yaml_string()
                 .expect("symlink override manifest serializes"),
             SYMLINK_OVERRIDE_MANIFEST
+        );
+    }
+
+    /// Round-trip one non-default `projection.git_exclude` mode.
+    fn git_exclude_mode_roundtrips(mode: &str) {
+        let manifest_text = format!(
+            concat!(
+                "version: 1\n",
+                "\n",
+                "projection:\n",
+                "  policy: prefer-neutral\n",
+                "  mode: copy\n",
+                "  prune: true\n",
+                "  git_exclude: {mode}\n",
+                "\n",
+                "layout:\n",
+                "  skills_dir: .agents/skills\n",
+                "  overlays_dir: .agents/overlays\n",
+                "\n",
+                "targets:\n",
+                "  - codex\n",
+                "\n",
+                "telemetry:\n",
+                "  enabled: true\n",
+                "  mode: public-only\n",
+            ),
+            mode = mode,
+        );
+
+        let manifest = WorkspaceManifest::from_yaml_str(DEFAULT_MANIFEST_PATH, &manifest_text)
+            .unwrap_or_else(|error| panic!("git_exclude: {mode} parses: {error}"));
+
+        let expected_mode = match mode {
+            "none" => GitExcludeMode::None,
+            "gitignore" => GitExcludeMode::Gitignore,
+            other => panic!("test does not know the mode '{other}'"),
+        };
+        assert_eq!(
+            manifest.projection.git_exclude, expected_mode,
+            "the declared mode must parse",
+        );
+        assert_eq!(
+            manifest.to_yaml_string().expect("explicit form serializes"),
+            manifest_text
+        );
+    }
+
+    #[test]
+    fn non_default_git_exclude_modes_roundtrip() {
+        git_exclude_mode_roundtrips("none");
+        git_exclude_mode_roundtrips("gitignore");
+    }
+
+    #[test]
+    fn validation_rejects_windows_reserved_import_ids() {
+        let manifest = concat!(
+            "version: 1\n",
+            "\n",
+            "imports:\n",
+            "  - id: con\n",
+            "    type: git\n",
+            "    url: https://github.com/vercel/ai.git\n",
+            "    ref: main\n",
+            "    path: skills/con\n",
+            "    scope: workspace\n",
+            "\n",
+            "targets:\n",
+            "  - codex\n",
+        );
+
+        let error = WorkspaceManifest::from_yaml_str(DEFAULT_MANIFEST_PATH, manifest)
+            .expect_err("a reserved device name cannot name an import");
+
+        assert!(
+            error
+                .to_string()
+                .contains("imports[].id must not use a Windows reserved device name: 'con'"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_control_characters_in_import_urls() {
+        let manifest = concat!(
+            "version: 1\n",
+            "\n",
+            "imports:\n",
+            "  - id: ai-sdk\n",
+            "    type: git\n",
+            "    url: \"https://github.com/vercel/\\x07ai.git\"\n",
+            "    ref: main\n",
+            "    path: skills/ai-sdk\n",
+            "    scope: workspace\n",
+            "\n",
+            "targets:\n",
+            "  - codex\n",
+        );
+
+        let error = WorkspaceManifest::from_yaml_str(DEFAULT_MANIFEST_PATH, manifest)
+            .expect_err("a control character in a URL is refused like in the lockfile");
+
+        assert!(
+            error
+                .to_string()
+                .contains("imports[].url must not contain control characters"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Manifest that opts out of Git exclusions for one `handle_init` test.
+    const NONE_EXCLUDE_MANIFEST: &str = concat!(
+        "version: 1\n",
+        "\n",
+        "projection:\n",
+        "  git_exclude: none\n",
+        "\n",
+        "targets:\n",
+        "  - codex\n",
+    );
+
+    /// Manifest that routes Git exclusions into `.gitignore`.
+    const GITIGNORE_EXCLUDE_MANIFEST: &str = concat!(
+        "version: 1\n",
+        "\n",
+        "projection:\n",
+        "  git_exclude: gitignore\n",
+        "\n",
+        "targets:\n",
+        "  - codex\n",
+    );
+
+    #[test]
+    fn init_writes_no_excludes_when_the_manifest_opts_out() {
+        let workspace = TempWorkspace::new("skillctl-init-none-mode");
+        workspace.write_manifest(NONE_EXCLUDE_MANIFEST);
+        fs::create_dir_all(workspace.path().join(".git/info")).expect("git info directory exists");
+        let exclude_path = workspace.path().join(".git/info/exclude");
+        fs::write(&exclude_path, "# existing rule\n").expect("exclude file exists");
+        let context = context_in(workspace.path());
+
+        let response = handle_init(&context, InitRequest).expect("init runs");
+
+        assert_eq!(
+            response.data["git_exclude"],
+            json!({"path": null, "created": [], "skipped": []}),
+            "opting out reports no exclude work: {}",
+            response.data
+        );
+        assert_eq!(
+            fs::read_to_string(&exclude_path).expect("exclude readable"),
+            "# existing rule\n",
+            "the local exclude file must stay untouched",
+        );
+        assert!(
+            !workspace.path().join(".gitignore").exists(),
+            "opting out must not create .gitignore either",
+        );
+    }
+
+    #[test]
+    fn init_updates_gitignore_when_the_manifest_asks_for_it() {
+        let workspace = TempWorkspace::new("skillctl-init-gitignore-mode");
+        workspace.write_manifest(GITIGNORE_EXCLUDE_MANIFEST);
+        fs::create_dir_all(workspace.path().join(".git/info")).expect("git info directory exists");
+        let exclude_path = workspace.path().join(".git/info/exclude");
+        fs::write(&exclude_path, "# local rule\n").expect("exclude file exists");
+        fs::write(workspace.path().join(".gitignore"), "node_modules/\n")
+            .expect("gitignore exists");
+        let context = context_in(workspace.path());
+
+        let response = handle_init(&context, InitRequest).expect("init runs");
+
+        assert_eq!(response.data["git_exclude"]["path"], json!(".gitignore"));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join(".gitignore")).expect("gitignore readable"),
+            concat!(
+                "node_modules/\n",
+                "/.claude/skills/\n",
+                "/.github/skills/\n",
+                "/.gemini/skills/\n",
+                "/.opencode/skills/\n",
+            ),
+        );
+        assert_eq!(
+            fs::read_to_string(&exclude_path).expect("exclude readable"),
+            "# local rule\n",
+            "gitignore mode must leave the local exclude file alone",
+        );
+        assert!(
+            response
+                .summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Updated git excludes in .gitignore"),
+            "the summary names the file it updated: {:?}",
+            response.summary,
         );
     }
 

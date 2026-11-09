@@ -93,6 +93,12 @@ pub fn classify_source_visibility(source: &NormalizedInstallSource) -> SourceVis
 /// public, the same way the verified Git repository list does, so a well-known
 /// origin is never guessed at: a loopback index is local, a verified publisher
 /// is public, and every other remote origin stays suppressed.
+///
+/// The URL classified is the one the user supplied and the lockfile records,
+/// and it names the origin that served the bytes: acquisition never follows a
+/// redirect that changes the origin-trust classification
+/// ([`crate::discovery::ensure_redirect_permitted`]), so a verified publisher
+/// cannot lend its public classification to another host.
 fn classify_well_known_source_visibility(source: &NormalizedInstallSource) -> SourceVisibility {
     match crate::trust::discovery_origin_trust(&source.url) {
         // A loopback origin serves a local index, which is local-only content.
@@ -295,7 +301,7 @@ fn install_event(
     RemoteTelemetryEvent {
         kind: "install",
         skill: skill.name.clone(),
-        emitted: suppression_reason.is_none(),
+        emitted: allows_remote_emission(effective, source),
         source_visibility: visibility,
         suppression_reason,
         public_source: matches!(visibility, SourceVisibility::Public)
@@ -328,7 +334,7 @@ fn update_event(
     RemoteTelemetryEvent {
         kind: "update",
         skill: plan.skill.clone(),
-        emitted: suppression_reason.is_none(),
+        emitted: allows_remote_emission(effective, &source),
         source_visibility: visibility,
         suppression_reason,
         public_source: matches!(visibility, SourceVisibility::Public)
@@ -384,7 +390,10 @@ fn update_consent(
         notice_seen_at: Some(notice_seen_at),
         updated_at: timestamp,
     };
-    let changed = current.as_ref() != Some(&next);
+    // `next.updated_at` is always fresh, so only consent decides whether the
+    // command changed anything. A redundant toggle must not record a consent
+    // change in history or report `changed`.
+    let changed = current.as_ref().map(|settings| settings.consent) != Some(consent);
 
     if changed {
         let mut ledger = HistoryLedger::new(&mut store);
@@ -595,9 +604,12 @@ fn is_local_host(host: &str) -> bool {
 
 fn is_verified_public_git_repository(host: &str, path: &str) -> bool {
     let normalized_host = host.to_ascii_lowercase();
-    let normalized_path = path
-        .trim_matches('/')
-        .trim_end_matches(".git")
+    // Strip one ".git" suffix only. A repeated suffix such as "ai.git.git"
+    // names a different path that the allowlist never verified.
+    let trimmed_path = path.trim_matches('/');
+    let normalized_path = trimmed_path
+        .strip_suffix(".git")
+        .unwrap_or(trimmed_path)
         .to_ascii_lowercase();
 
     VERIFIED_PUBLIC_GIT_REPOSITORIES
@@ -670,6 +682,27 @@ mod tests {
             SourceVisibility::Public
         );
         assert!(allows_remote_emission(settings, &public));
+    }
+
+    #[test]
+    fn repeated_git_suffixes_do_not_match_the_verified_public_allowlist() {
+        let settings = TelemetrySettings {
+            enabled: true,
+            mode: TelemetryMode::PublicOnly,
+        };
+        let doubled = source(
+            SourceKind::Git,
+            "https://github.com/vercel/ai.git.git",
+            "https://github.com/vercel/ai.git.git",
+        );
+
+        // Only one ".git" suffix is stripped, so "ai.git.git" stays a path the
+        // allowlist never verified instead of matching the "vercel/ai" entry.
+        assert_eq!(
+            classify_source_visibility(&doubled),
+            SourceVisibility::SuppressedPrivate
+        );
+        assert!(!allows_remote_emission(settings, &doubled));
     }
 
     #[test]
@@ -804,6 +837,35 @@ mod tests {
     }
 
     #[test]
+    fn a_public_classification_never_lands_on_a_host_the_policy_did_not_verify() {
+        // A verified publisher that redirects to another HTTPS host would move
+        // the read off the origin telemetry names. Acquisition refuses that
+        // hop, so the classified URL always describes the origin that served
+        // the bytes and the Public label never transfers.
+        let requested =
+            url::Url::parse("https://www.russ.cloud/.well-known/agent-skills/index.json")
+                .expect("url parses");
+        let mirror =
+            url::Url::parse("https://private.internal.example.net/index.json").expect("url parses");
+        let error = crate::discovery::ensure_redirect_permitted(&requested, &mirror)
+            .expect_err("a verified origin cannot lend its classification");
+        assert!(
+            error.to_string().contains("verified-public-https"),
+            "unexpected refusal: {error}"
+        );
+
+        let verified = source(
+            SourceKind::WellKnown,
+            "https://www.russ.cloud",
+            "https://www.russ.cloud/.well-known/agent-skills/index.json",
+        );
+        assert_eq!(
+            classify_source_visibility(&verified),
+            SourceVisibility::Public
+        );
+    }
+
+    #[test]
     fn disabled_or_off_settings_suppress_even_public_sources() {
         let public_source = source(
             SourceKind::Git,
@@ -841,6 +903,11 @@ mod tests {
         let effective = effective_settings(&workspace, Some(&persisted));
         let public_source = source(
             SourceKind::Git,
+            "https://github.com/vercel/ai.git",
+            "https://github.com/vercel/ai.git",
+        );
+        let private_source = source(
+            SourceKind::Git,
             "https://github.com/example/release-notes.git",
             "https://github.com/example/release-notes.git",
         );
@@ -860,7 +927,7 @@ mod tests {
             trust: crate::trust::SkillTrust::local(false),
         };
 
-        let install_event = install_event(
+        let public_event = install_event(
             &workspace,
             &persisted,
             effective,
@@ -869,11 +936,29 @@ mod tests {
             &installed,
         );
 
-        assert!(install_event.emitted);
+        assert!(public_event.emitted);
         assert_eq!(
-            install_event.public_source.as_deref(),
-            Some("https://github.com/example/release-notes.git")
+            public_event.public_source.as_deref(),
+            Some("https://github.com/vercel/ai.git")
         );
+
+        // The emitted flag comes from allows_remote_emission, so a source the
+        // allowlist never verified stays suppressed even with consent enabled.
+        let suppressed_event = install_event(
+            &workspace,
+            &persisted,
+            effective,
+            SourceVisibility::SuppressedPrivate,
+            &private_source,
+            &installed,
+        );
+
+        assert!(!suppressed_event.emitted);
+        assert_eq!(
+            suppressed_event.suppression_reason,
+            Some(TelemetrySuppressionReason::PrivateSource)
+        );
+        assert_eq!(suppressed_event.public_source, None);
     }
 
     #[test]

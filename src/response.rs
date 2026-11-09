@@ -80,12 +80,6 @@ impl AppResponse {
         self
     }
 
-    /// Override the process exit status while preserving the response payload.
-    pub fn with_exit_status(mut self, status: ExitStatus) -> Self {
-        self.status_override = Some(status);
-        self
-    }
-
     /// Attach a warning and preserve success semantics.
     pub fn with_warning(mut self, warning: impl Into<String>) -> Self {
         self.warnings.push(warning.into());

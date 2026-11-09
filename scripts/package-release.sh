@@ -14,22 +14,35 @@ version=""
 target=""
 output_dir=""
 
+require_flag_value() {
+  local flag="$1"
+  if [[ $# -lt 2 || -z "${2:-}" ]]; then
+    printf 'error: %s requires a value\n' "$flag" >&2
+    usage >&2
+    exit 1
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --binary)
-      binary_path="${2:-}"
+      require_flag_value "$@"
+      binary_path="$2"
       shift 2
       ;;
     --version)
-      version="${2:-}"
+      require_flag_value "$@"
+      version="$2"
       shift 2
       ;;
     --target)
-      target="${2:-}"
+      require_flag_value "$@"
+      target="$2"
       shift 2
       ;;
     --output)
-      output_dir="${2:-}"
+      require_flag_value "$@"
+      output_dir="$2"
       shift 2
       ;;
     -h|--help)

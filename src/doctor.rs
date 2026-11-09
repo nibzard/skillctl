@@ -14,8 +14,8 @@ use crate::{
     cli::Scope,
     error::{AppError, ExitStatus},
     lockfile::WorkspaceLockfile,
-    manifest::{ManifestScope, ProjectionMode, ProjectionPolicy, WorkspaceManifest},
-    materialize::PROJECTION_METADATA_FILE,
+    manifest::{ProjectionMode, ProjectionPolicy, WorkspaceManifest},
+    materialize::{self, PROJECTION_METADATA_FILE},
     planner::{self, ProjectionPlan},
     resolver::{
         self, EffectiveSkillGraph, InternalSkillId, ProjectionOutcome, ResolutionStage,
@@ -26,14 +26,13 @@ use crate::{
         self, CLAUDE_FRONTMATTER_FIELDS, OPENAI_METADATA_FILE, SKILL_MANIFEST_FILE,
         SkillDefinition, SkillSafetySummary, SkillVendorMetadata,
     },
-    source::{hash_directory_contents, imports_store_root, stored_import_root},
+    source::{hash_directory_contents, stored_import_root},
     state::{LocalStateStore, ManagedScope, ManagedSkillRef},
     trust::SkillTrust,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const UNUSED_IMPORTS_PLACEHOLDER_DIR: &str = ".agents/.skillctl-unused-imports";
 /// Issue code for a generated copy left behind in a root runtimes still read.
 const STALE_GENERATED_PROJECTION_CODE: &str = "stale-generated-projection";
 /// Issue code for a state database SQLite cannot read at all.
@@ -981,12 +980,13 @@ fn build_bundled_explain_report(context: &AppContext) -> Result<ExplainReport, A
         false
     };
 
-    let active_differs_from_pinned_source = match (status, managed_effective_version.as_ref()) {
-        (ExplainStatus::Selected, Some(_)) | (ExplainStatus::Selected, None) => {
-            !active_projection_matches_winner
-        }
-        (ExplainStatus::Missing, Some(_)) => true,
-        (ExplainStatus::Missing, None) | (ExplainStatus::Conflict, _) => false,
+    // Unlike the workspace twin of this match, the version hash only decides
+    // the missing case here: a selected bundled skill always compares its live
+    // projections, whether or not a version was recorded.
+    let active_differs_from_pinned_source = match status {
+        ExplainStatus::Selected => !active_projection_matches_winner,
+        ExplainStatus::Missing if managed_effective_version.is_some() => true,
+        ExplainStatus::Missing | ExplainStatus::Conflict => false,
     };
 
     Ok(ExplainReport {
@@ -1042,23 +1042,21 @@ fn bundled_base_issues(
     context: &AppContext,
     store: &LocalStateStore,
 ) -> Result<Vec<DiagnosticIssue>, AppError> {
-    builtin::diagnostics(context, store)?
+    Ok(builtin::diagnostics(context, store)?
         .into_iter()
-        .map(|diagnostic| {
-            Ok(DiagnosticIssue {
-                severity: DiagnosticSeverity::Warning,
-                code: diagnostic.code,
-                skill: Some("skillctl".to_string()),
-                scope: Some(ManagedScope::User.as_str().to_string()),
-                target: None,
-                path: diagnostic.path,
-                trust: None,
-                safety: None,
-                message: diagnostic.message,
-                fix: diagnostic.fix,
-            })
+        .map(|diagnostic| DiagnosticIssue {
+            severity: DiagnosticSeverity::Warning,
+            code: diagnostic.code,
+            skill: Some("skillctl".to_string()),
+            scope: Some(ManagedScope::User.as_str().to_string()),
+            target: None,
+            path: diagnostic.path,
+            trust: None,
+            safety: None,
+            message: diagnostic.message,
+            fix: diagnostic.fix,
         })
-        .collect()
+        .collect())
 }
 
 fn bundled_target_plan(context: &AppContext) -> Result<ProjectionPlan, AppError> {
@@ -1183,7 +1181,6 @@ fn analyze_workspace(context: &AppContext) -> Result<WorkspaceAnalysis, AppError
     } else {
         let request = ResolveWorkspaceRequest::new(
             &context.working_directory,
-            imports_directory_for(&context.working_directory, &manifest)?,
             manifest.clone(),
             lockfile.clone(),
         );
@@ -1278,7 +1275,7 @@ fn collect_validation_issues(
                     });
                     continue;
                 }
-                if resolver::is_generated_projection_root(&root)? {
+                if materialize::is_skillctl_generated_directory(&root)? {
                     continue;
                 }
 
@@ -1345,7 +1342,7 @@ fn validate_import(
     import: &crate::manifest::ImportDefinition,
 ) -> Result<Vec<DiagnosticIssue>, AppError> {
     let mut issues = Vec::new();
-    let scope = managed_scope_from_manifest(import.scope);
+    let scope = ManagedScope::from(import.scope);
 
     let Some(locked_import) = lockfile.imports.get(&import.id) else {
         issues.push(DiagnosticIssue {
@@ -1367,7 +1364,7 @@ fn validate_import(
     };
 
     let stored_root = stored_import_root(
-        managed_scope_from_manifest(import.scope),
+        ManagedScope::from(import.scope),
         &context.working_directory,
         &import.id,
     )?;
@@ -1429,6 +1426,7 @@ fn validate_import(
     let effective_files = apply_overlay_validation(
         context,
         manifest,
+        scope,
         import.id.as_str(),
         &base_files,
         &mut issues,
@@ -1470,7 +1468,6 @@ fn validate_import(
         )),
     }
 
-    let _ = locked_import;
     Ok(issues)
 }
 
@@ -1541,7 +1538,9 @@ fn doctor_issues(
 
     issues.extend(graph_shadowing_issues(scope, graph));
     issues.extend(graph_conflict_issues(scope, graph));
-    issues.extend(adapter_field_issues(context, &analysis.manifest, graph));
+    // Target-compatibility findings come from `collect_validation_issues`
+    // alone, with the same "target-compatibility" code `validate` reports, so
+    // one condition maps to one issue even when the graph agrees.
 
     // Every check below reads local state. When the state database is
     // unreadable, running them would either fail or report state skillctl
@@ -1559,7 +1558,7 @@ fn doctor_issues(
     if !targets.is_empty() {
         let plan = planner::plan_target_roots(
             &AdapterRegistry::new(),
-            target_scope_from_managed(scope),
+            TargetScope::from(scope),
             analysis.manifest.projection.policy,
             &targets,
             &analysis.manifest.adapters,
@@ -1671,25 +1670,6 @@ fn graph_conflict_issues(scope: ManagedScope, graph: &EffectiveSkillGraph) -> Ve
     }
 
     issues
-}
-
-fn adapter_field_issues(
-    context: &AppContext,
-    manifest: &WorkspaceManifest,
-    graph: &EffectiveSkillGraph,
-) -> Vec<DiagnosticIssue> {
-    graph
-        .candidates
-        .iter()
-        .flat_map(|candidate| {
-            skill_target_compatibility_issues(
-                context,
-                manifest,
-                &candidate.skill,
-                "unsupported-adapter-field",
-            )
-        })
-        .collect()
 }
 
 fn script_risk_issues(
@@ -2062,7 +2042,7 @@ fn stale_generated_projection_issues(
         crate::materialize::unplanned_documented_roots(
             context,
             manifest,
-            target_scope_from_managed(scope),
+            TargetScope::from(scope),
             plan,
         )?
         .into_iter()
@@ -2106,7 +2086,7 @@ fn stale_generated_projection_issues(
                     source,
                 })?
                 .is_dir()
-                || !resolver::is_generated_projection_root(&path)?
+                || !materialize::is_skillctl_generated_directory(&path)?
             {
                 continue;
             }
@@ -2343,7 +2323,7 @@ fn build_explain_report(
     } else {
         Some(planner::plan_target_roots(
             &AdapterRegistry::new(),
-            target_scope_from_managed(scope),
+            TargetScope::from(scope),
             analysis.manifest.projection.policy,
             &targets,
             &analysis.manifest.adapters,
@@ -2568,7 +2548,7 @@ fn build_inspect_report(
     } else {
         Some(planner::plan_target_roots(
             &AdapterRegistry::new(),
-            target_scope_from_managed(scope),
+            TargetScope::from(scope),
             analysis.manifest.projection.policy,
             &targets,
             &analysis.manifest.adapters,
@@ -2982,7 +2962,7 @@ fn disabled_import_issue(
     import: &crate::manifest::ImportDefinition,
 ) -> DiagnosticIssue {
     let skill_name = import.id.as_str();
-    let import_scope = managed_scope_from_manifest(import.scope);
+    let import_scope = ManagedScope::from(import.scope);
     let (message, fix) = if import_scope == scope {
         (
             format!("manifest import '{skill_name}' exists but is disabled"),
@@ -3584,9 +3564,22 @@ fn ensure_directory_issue(
     }
 }
 
+/// The `override` command qualified for the scope one import lives in.
+///
+/// A user-scope import is managed only through the user selector, so its
+/// repair advice must name the scoped command the way `scoped_sync_command`
+/// does.
+fn scoped_override_command(scope: ManagedScope) -> &'static str {
+    match scope {
+        ManagedScope::Workspace => "skillctl override <skill>",
+        ManagedScope::User => "skillctl --scope user override <skill>",
+    }
+}
+
 fn apply_overlay_validation(
     context: &AppContext,
     manifest: &WorkspaceManifest,
+    scope: ManagedScope,
     skill_id: &str,
     base_files: &BTreeMap<PathBuf, PathBuf>,
     issues: &mut Vec<DiagnosticIssue>,
@@ -3602,7 +3595,7 @@ fn apply_overlay_validation(
                 severity: DiagnosticSeverity::Error,
                 code: "missing-overlay-root".to_string(),
                 skill: Some(skill_id.to_string()),
-                scope: Some(ManagedScope::Workspace.as_str().to_string()),
+                scope: Some(scope.as_str().to_string()),
                 target: None,
                 path: Some(planner::display_path(context, &overlay_root)),
                 trust: None,
@@ -3621,7 +3614,7 @@ fn apply_overlay_validation(
                 severity: DiagnosticSeverity::Error,
                 code: "missing-overlay-root".to_string(),
                 skill: Some(skill_id.to_string()),
-                scope: Some(ManagedScope::Workspace.as_str().to_string()),
+                scope: Some(scope.as_str().to_string()),
                 target: None,
                 path: Some(planner::display_path(context, &overlay_root)),
                 trust: None,
@@ -3630,9 +3623,10 @@ fn apply_overlay_validation(
                     "overlay root '{}' does not exist",
                     planner::display_path(context, &overlay_root)
                 ),
-                fix: Some(
-                    "run skillctl override <skill> or remove the override mapping".to_string(),
-                ),
+                fix: Some(format!(
+                    "run {} or remove the override mapping",
+                    scoped_override_command(scope)
+                )),
             });
             return Ok(base_files.clone());
         }
@@ -3655,7 +3649,7 @@ fn apply_overlay_validation(
                     severity: DiagnosticSeverity::Error,
                     code: "invalid-overlay-path".to_string(),
                     skill: Some(skill_id.to_string()),
-                    scope: Some(ManagedScope::Workspace.as_str().to_string()),
+                    scope: Some(scope.as_str().to_string()),
                     target: None,
                     path: Some(planner::display_path(context, &source_path)),
                     trust: None,
@@ -3672,7 +3666,7 @@ fn apply_overlay_validation(
                 severity: DiagnosticSeverity::Error,
                 code: "invalid-overlay-mapping".to_string(),
                 skill: Some(skill_id.to_string()),
-                scope: Some(ManagedScope::Workspace.as_str().to_string()),
+                scope: Some(scope.as_str().to_string()),
                 target: None,
                 path: Some(planner::display_path(context, &source_path)),
                 trust: None,
@@ -4105,17 +4099,6 @@ fn load_manifest_or_default(working_directory: &Path) -> Result<WorkspaceManifes
     Ok(manifest)
 }
 
-fn imports_directory_for(
-    working_directory: &Path,
-    manifest: &WorkspaceManifest,
-) -> Result<PathBuf, AppError> {
-    if manifest.imports.iter().any(|import| import.enabled) {
-        imports_store_root()
-    } else {
-        Ok(working_directory.join(UNUSED_IMPORTS_PLACEHOLDER_DIR))
-    }
-}
-
 fn skill_error_issue(
     context: &AppContext,
     code: &str,
@@ -4313,24 +4296,10 @@ fn selected_managed_scope(context: &AppContext) -> ManagedScope {
     }
 }
 
-fn target_scope_from_managed(scope: ManagedScope) -> TargetScope {
-    match scope {
-        ManagedScope::Workspace => TargetScope::Workspace,
-        ManagedScope::User => TargetScope::User,
-    }
-}
-
 fn skill_scope_from_managed(scope: ManagedScope) -> SkillScope {
     match scope {
         ManagedScope::Workspace => SkillScope::Workspace,
         ManagedScope::User => SkillScope::User,
-    }
-}
-
-fn managed_scope_from_manifest(scope: ManifestScope) -> ManagedScope {
-    match scope {
-        ManifestScope::Workspace => ManagedScope::Workspace,
-        ManifestScope::User => ManagedScope::User,
     }
 }
 

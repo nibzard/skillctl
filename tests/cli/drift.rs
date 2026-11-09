@@ -2801,3 +2801,271 @@ fn update_keeps_a_digestless_symlink_projection_clean() {
         "no repair is advertised for a copy the engine would skip: {plan}"
     );
 }
+
+/// A direct `skillctl fork` rebuilds the canonical root from the stored
+/// import, so the unrecorded edits of the generated copy at that root move
+/// into the overlay first — the same preservation `update --apply --strategy
+/// fork` performs — instead of being deleted with the copy.
+#[test]
+fn a_direct_fork_preserves_edits_of_the_generated_canonical_root() {
+    let fixture = DroppedRootFixture::install();
+    fixture.edit_dropped_copy("keep my edit");
+
+    let (code, body) = fixture.run_json(&["--json", "fork", "release-notes"]);
+
+    assert_eq!(code, 0, "the fork takes local ownership: {body}");
+    assert_eq!(
+        body["data"]["preserved_edits"],
+        json!(["SKILL.md"]),
+        "the fork reports the edits it kept: {body}"
+    );
+    let canonical = fs::read_to_string(fixture.dropped_root().join("SKILL.md"))
+        .expect("the forked canonical root exists");
+    assert!(
+        canonical.contains("keep my edit"),
+        "the edit survives the fork: {canonical}"
+    );
+    assert!(
+        !fixture
+            .workspace
+            .path()
+            .join(".agents/overlays/release-notes")
+            .exists(),
+        "the fork consumes the overlay that carried the edit"
+    );
+    let lockfile = fixture.workspace.read_lockfile_yaml();
+    assert!(
+        lockfile["imports"]["release-notes"].is_null(),
+        "the fork releases the managed import: {lockfile:?}"
+    );
+}
+
+/// A clean copy beside a newer unpinned overlay edit carries nothing to
+/// preserve, so the fork must project the overlay edit instead of letting the
+/// stale copy clobber it.
+#[test]
+fn a_direct_fork_keeps_a_newer_overlay_edit_over_a_stale_clean_copy() {
+    let fixture = DroppedRootFixture::install();
+    let overlay_relative = ".agents/overlays/release-notes/SKILL.md";
+    fixture.workspace.write_file(
+        overlay_relative,
+        concat!(
+            "---\n",
+            "name: release-notes\n",
+            "description: Team-tailored release notes skill.\n",
+            "---\n",
+            "\n",
+            "# Release notes, team edition\n",
+        ),
+    );
+    let overlay = fixture.workspace.path().join(overlay_relative);
+
+    // The pin records the team overlay, and the sync materializes it into the
+    // canonical copy, so the copy is clean while it holds overlay content.
+    fixture.run_json(&["--json", "override", "release-notes"]);
+    let (code, body) = fixture.run_json(&["--json", "sync"]);
+    assert_eq!(code, 0, "the pinned overlay materializes cleanly: {body}");
+
+    let mut contents = fs::read_to_string(&overlay).expect("overlay manifest exists");
+    contents.push_str("\nnewer overlay note\n");
+    fs::write(&overlay, contents).expect("overlay edited without a re-pin");
+
+    let (code, body) = fixture.run_json(&["--json", "fork", "release-notes"]);
+
+    assert_eq!(code, 0, "the fork takes local ownership: {body}");
+    assert_eq!(
+        body["data"]["preserved_edits"],
+        json!([]),
+        "a copy that matches its record holds nothing to preserve: {body}"
+    );
+    let canonical = fs::read_to_string(fixture.dropped_root().join("SKILL.md"))
+        .expect("the forked canonical root exists");
+    assert!(
+        canonical.contains("newer overlay note"),
+        "the newer overlay edit wins: {canonical}"
+    );
+    assert!(
+        canonical.contains("team edition"),
+        "the pinned overlay content still flows into the fork: {canonical}"
+    );
+}
+
+/// A committed overlay edit and a newer canonical edit are two different edits
+/// of the same file against the same imported base. The fork must not let the
+/// newer edit overwrite the overlay's variant silently: the losing variant is
+/// retained durably and reported, exactly as the update path's preservation
+/// does for the same conflict.
+#[test]
+fn a_direct_fork_backs_up_the_conflicting_overlay_edit_it_replaces() {
+    let fixture = DroppedRootFixture::install();
+    let overlay_relative = ".agents/overlays/release-notes/SKILL.md";
+    fixture.run_json(&["--json", "override", "release-notes"]);
+    fixture.workspace.write_file(
+        overlay_relative,
+        concat!(
+            "---\n",
+            "name: release-notes\n",
+            "description: Team-tailored release notes skill.\n",
+            "---\n",
+            "\n",
+            "# Release notes, team edit\n",
+        ),
+    );
+    // The second override pins the team edit, so the overlay's variant is the
+    // committed one the lockfile records.
+    fixture.run_json(&["--json", "override", "release-notes"]);
+    let (code, body) = fixture.run_json(&["--json", "sync"]);
+    assert_eq!(code, 0, "the pinned overlay materializes cleanly: {body}");
+
+    // A different edit of the same file against the same imported base.
+    fixture.workspace.write_file(
+        ".agents/skills/release-notes/SKILL.md",
+        concat!(
+            "---\n",
+            "name: release-notes\n",
+            "description: Locally edited release notes skill.\n",
+            "---\n",
+            "\n",
+            "# Release notes, local edit\n",
+        ),
+    );
+
+    let (code, body) = fixture.run_json(&["--json", "fork", "release-notes"]);
+
+    assert_eq!(code, 0, "the fork takes local ownership: {body}");
+    assert_eq!(
+        body["data"]["preserved_edits"],
+        json!(["SKILL.md"]),
+        "the fork reports the edit it kept: {body}"
+    );
+    let replaced = &body["data"]["replaced_edits"];
+    let backup = replaced[0]["backup"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the replaced variant names a durable backup: {body}"))
+        .to_string();
+    assert!(
+        backup.contains(".skillctl/store/discards"),
+        "the losing edit lives in the durable store: {backup}"
+    );
+    let backed_up = fs::read_to_string(PathBuf::from(&backup).join("SKILL.md"))
+        .expect("the backup holds the overlay root");
+    assert!(
+        backed_up.contains("team edit") && !backed_up.contains("local edit"),
+        "the replaced overlay edit stays recoverable: {backed_up}"
+    );
+    let canonical = fs::read_to_string(fixture.dropped_root().join("SKILL.md"))
+        .expect("the forked canonical root exists");
+    assert!(
+        canonical.contains("local edit") && !canonical.contains("team edit"),
+        "the newer edit wins the fork: {canonical}"
+    );
+}
+
+/// A file the import does not provide has no overlay mapping, so a fork
+/// refuses the overlay instead of ferrying unmapped content. This pins the
+/// guard that makes the base-less conflict path unreachable: an overlay
+/// incumbent without an imported base cannot reach the preservation.
+#[test]
+fn a_fork_refuses_an_overlay_file_the_import_does_not_provide() {
+    let fixture = DroppedRootFixture::install();
+    // Pin the overlay so the manifest declares the overlay root.
+    fixture.run_json(&["--json", "override", "release-notes"]);
+    // After the pin, the user adds a base-less file to the overlay and a
+    // different file with the same name to the generated copy.
+    fixture.workspace.write_file(
+        ".agents/overlays/release-notes/EXTRA.md",
+        "# Overlay extra\n",
+    );
+    fixture
+        .workspace
+        .write_file(".agents/skills/release-notes/EXTRA.md", "# Copy extra\n");
+
+    let (code, body) = fixture.run_json(&["--json", "fork", "release-notes"]);
+
+    assert_eq!(
+        code, 3,
+        "the unmapped overlay file refuses the fork: {body}"
+    );
+    assert!(
+        body["errors"]
+            .as_array()
+            .is_some_and(|errors| errors.iter().any(|error| {
+                error
+                    .as_str()
+                    .is_some_and(|text| text.contains("EXTRA.md") && text.contains("does not map"))
+            })),
+        "the refusal names the unmapped file: {body}"
+    );
+    assert!(
+        fixture
+            .workspace
+            .path()
+            .join(".agents/skills/release-notes/SKILL.md")
+            .exists(),
+        "the managed copy survives the refusal untouched"
+    );
+}
+
+/// The fork copy keeps upstream files wherever they sit, so a file named like
+/// skillctl's projection metadata below the root survives, while the root
+/// itself stays free of skillctl's bookkeeping.
+#[test]
+fn fork_keeps_an_upstream_projection_metadata_file_below_the_root() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(DEFAULT_TARGETS_MANIFEST);
+    workspace.write_skill_source("git-source", "release-notes");
+    workspace.write_file(
+        "git-source/.agents/skills/release-notes/examples/.skillctl-projection.json",
+        "{\n  \"tool\": \"skillctl\",\n  \"note\": \"upstream fixture\"\n}\n",
+    );
+    workspace.init_git_repo("git-source");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            workspace.git_repo_url("git-source").as_str(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--json", "--no-input", "fork", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let nested = workspace
+        .path()
+        .join(".agents/skills/release-notes/examples/.skillctl-projection.json");
+    assert!(
+        fs::read_to_string(&nested)
+            .expect("the nested upstream file survives the fork")
+            .contains("upstream fixture"),
+        "the forked skill holds the upstream content: {nested:?}"
+    );
+    let stored = workspace
+        .workspace_import_root("release-notes")
+        .join(".agents/skills/release-notes/examples/.skillctl-projection.json");
+    assert_eq!(
+        fs::read_to_string(&nested).expect("the nested file is readable"),
+        fs::read_to_string(&stored).expect("the stored file is readable"),
+        "the forked file matches the pinned import verbatim"
+    );
+    assert!(
+        !workspace
+            .path()
+            .join(".agents/skills/release-notes/.skillctl-projection.json")
+            .exists(),
+        "the forked root carries no projection metadata of its own"
+    );
+}

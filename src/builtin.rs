@@ -112,18 +112,18 @@ fn ensure_bundled_skill_inner(context: &AppContext, force: bool) -> Result<bool,
         return Ok(false);
     }
 
+    // The shared decision below answers from the same chain the plan-time
+    // check uses, so what apply writes can never drift from what the plan
+    // promised.
+    if !bundled_refresh_required(context, Some(&store), existing.as_ref())? {
+        return Ok(false);
+    }
+
     let timestamp = current_timestamp();
     let content_hash = bundled_content_hash();
     let effective_version_hash =
         compute_effective_version_hash(env!("CARGO_PKG_VERSION"), &content_hash, NO_OVERLAY_HASH);
     let mut inspections = inspect_roots(context)?;
-    let manageable_roots = inspections
-        .iter()
-        .filter(|inspection| !matches!(inspection.status, RootStatus::Conflict { .. }))
-        .count();
-    if manageable_roots == 0 {
-        return Ok(false);
-    }
 
     let desired_install = install_record_from_state(
         existing.as_ref(),
@@ -238,7 +238,7 @@ pub(crate) fn handle_enable(context: &AppContext) -> Result<AppResponse, AppErro
     let projections = LocalStateStore::open_default_for(&context.working_directory)?
         .projection_records(Some(&bundled_skill_ref()))?
         .into_iter()
-        .map(|projection| projection_view(context, &projection))
+        .map(|projection| planner::projection_view(context, &projection))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(AppResponse::success("enable")
@@ -284,6 +284,21 @@ fn bundled_mutation_required(context: &AppContext, force: bool) -> Result<bool, 
         return Ok(false);
     }
 
+    bundled_refresh_required(context, store.as_ref(), existing.as_ref())
+}
+
+/// Decide whether refreshing the bundled skill would change recorded state or
+/// any projection.
+///
+/// [`ensure_bundled_skill_inner`] applies this decision before it writes and
+/// [`bundled_mutation_required`] reports it for planning, so both answer from
+/// one chain instead of restating it. `store` is absent while the state
+/// database does not exist yet; recorded state is then treated as empty.
+fn bundled_refresh_required(
+    context: &AppContext,
+    store: Option<&LocalStateStore>,
+    existing: Option<&InstallRecord>,
+) -> Result<bool, AppError> {
     let content_hash = bundled_content_hash();
     let effective_version_hash =
         compute_effective_version_hash(env!("CARGO_PKG_VERSION"), &content_hash, NO_OVERLAY_HASH);
@@ -297,15 +312,14 @@ fn bundled_mutation_required(context: &AppContext, force: bool) -> Result<bool, 
     }
 
     let desired_install = install_record_from_state(
-        existing.as_ref(),
-        &skill,
+        existing,
+        &bundled_skill_ref(),
         &content_hash,
         &effective_version_hash,
         "",
     );
-    let install_changed = existing
-        .as_ref()
-        .is_none_or(|record| install_record_changed(record, &desired_install));
+    let install_changed =
+        existing.is_none_or(|record| install_record_changed(record, &desired_install));
     if inspections
         .iter()
         .any(|inspection| matches!(inspection.status, RootStatus::NeedsWrite))
@@ -313,10 +327,9 @@ fn bundled_mutation_required(context: &AppContext, force: bool) -> Result<bool, 
         return Ok(true);
     }
 
-    let desired_projections = projection_records_for_roots(&skill, &inspections, "");
+    let desired_projections = projection_records_for_roots(&bundled_skill_ref(), &inspections, "");
     let current_projections = store
-        .as_ref()
-        .map(|store| store.projection_records(Some(&skill)))
+        .map(|store| store.projection_records(Some(&bundled_skill_ref())))
         .transpose()?
         .unwrap_or_default();
 
@@ -539,7 +552,11 @@ fn builtin_projection_state(path: &Path) -> Result<BundledProjectionState, AppEr
 
 fn projected_root_matches_asset(path: &Path) -> Result<bool, AppError> {
     let mut actual_files = BTreeMap::new();
-    collect_projected_files(path, Path::new(""), &mut actual_files)?;
+    if collect_projected_files(path, Path::new(""), &mut actual_files)? {
+        // The tree holds an entry the asset never contains, such as a
+        // symlink, so it cannot match no matter where the entry sorts.
+        return Ok(false);
+    }
     if actual_files.len() != BUNDLED_FILES.len() {
         return Ok(false);
     }
@@ -556,11 +573,17 @@ fn projected_root_matches_asset(path: &Path) -> Result<bool, AppError> {
     Ok(actual_files.is_empty())
 }
 
+/// Collect the regular files below one projected root.
+///
+/// Returns whether the walk skipped an entry the bundled asset never
+/// contains, such as a symlink. A skipped entry excludes only itself; the
+/// walk continues, so the caller's comparison does not depend on where the
+/// entry sorts.
 fn collect_projected_files(
     root: &Path,
     relative: &Path,
     files: &mut BTreeMap<String, Vec<u8>>,
-) -> Result<(), AppError> {
+) -> Result<bool, AppError> {
     let mut entries = fs::read_dir(root)
         .map_err(|source| AppError::FilesystemOperation {
             action: "read bundled skill projection root",
@@ -575,6 +598,7 @@ fn collect_projected_files(
         })?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
 
+    let mut skipped_unexpected = false;
     for entry in entries {
         let file_name = entry.file_name().to_string_lossy().into_owned();
         if relative.as_os_str().is_empty() && file_name == PROJECTION_METADATA_FILE {
@@ -595,11 +619,12 @@ fn collect_projected_files(
             relative.join(&file_name)
         };
 
-        if file_type.is_symlink() {
-            return Ok(());
-        }
         if file_type.is_dir() {
-            collect_projected_files(&path, &next_relative, files)?;
+            skipped_unexpected |= collect_projected_files(&path, &next_relative, files)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            skipped_unexpected = true;
             continue;
         }
 
@@ -611,7 +636,7 @@ fn collect_projected_files(
         files.insert(next_relative.to_string_lossy().into_owned(), bytes);
     }
 
-    Ok(())
+    Ok(skipped_unexpected)
 }
 
 fn write_projection(
@@ -888,15 +913,76 @@ fn bundled_content_hash() -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn projection_view(context: &AppContext, projection: &ProjectionRecord) -> Result<Value, AppError> {
-    let root = planner::resolve_runtime_root_path(context, &projection.physical_root)?;
-    let projected = root.join(&projection.projected_path);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    Ok(json!({
-        "target": projection.target,
-        "root": planner::display_path(context, &root),
-        "path": planner::display_path(context, &projected),
-        "generated_at": projection.generated_at,
-        "effective_version_hash": projection.effective_version_hash,
-    }))
+    struct ProjectionFixture {
+        root: PathBuf,
+    }
+
+    impl ProjectionFixture {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "skillctl-builtin-{}-{name}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("time moved backwards")
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&root).expect("fixture root exists");
+            Self { root }
+        }
+    }
+
+    impl Drop for ProjectionFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn projected_root_with_only_asset_files_matches() {
+        let fixture = ProjectionFixture::new("matches");
+        fs::write(
+            fixture.root.join(BUNDLED_FILES[0].relative_path),
+            BUNDLED_FILES[0].contents,
+        )
+        .expect("asset file written");
+
+        assert!(projected_root_matches_asset(&fixture.root).expect("comparison runs"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_is_reported_wherever_it_sorts() {
+        for name in ["a-link", "z-link"] {
+            let fixture = ProjectionFixture::new("symlink");
+            fs::write(
+                fixture.root.join(BUNDLED_FILES[0].relative_path),
+                BUNDLED_FILES[0].contents,
+            )
+            .expect("asset file written");
+            std::os::unix::fs::symlink(
+                fixture.root.join(BUNDLED_FILES[0].relative_path),
+                fixture.root.join(name),
+            )
+            .expect("symlink created");
+
+            let mut files = BTreeMap::new();
+            let skipped =
+                collect_projected_files(&fixture.root, Path::new(""), &mut files).expect("walk");
+            assert!(skipped, "the symlink must be reported for '{name}'");
+            assert_eq!(
+                files.keys().collect::<Vec<_>>(),
+                vec![BUNDLED_FILES[0].relative_path],
+                "the walk must keep collecting entries after '{name}'"
+            );
+            assert!(
+                !projected_root_matches_asset(&fixture.root).expect("comparison runs"),
+                "a tree holding '{name}' must not match the asset"
+            );
+        }
+    }
 }

@@ -1,7 +1,9 @@
-//! Acceptance tests for update apply on local-path and archive imports.
+//! Acceptance tests for update apply on imports that repair edits without a
+//! revision move.
 //!
-//! A local-path or archive import has no upstream revision to move to, but its
-//! generated copies can still hold unrecorded edits. These tests pin the
+//! A local-path or archive import has no upstream revision to move to, and an
+//! up-to-date well-known import stays on the digest the index declares, but
+//! their generated copies can still hold unrecorded edits. These tests pin the
 //! behavior of the repair strategies `sync` and `doctor` recommend for that
 //! case.
 
@@ -321,6 +323,171 @@ fn a_local_source_plan_document_applies_the_repair_it_describes() {
     assert!(
         fixture.overlay_copy().contains("keep my edit"),
         "the planned repair keeps the edits"
+    );
+}
+
+/// Index path a well-known origin serves its discovery document at.
+const WELL_KNOWN_INDEX_PATH: &str = "/.well-known/agent-skills/index.json";
+/// Discovery schema the supported index documents declare.
+const WELL_KNOWN_SCHEMA: &str = "https://schemas.agentskills.io/discovery/0.2.0/schema.json";
+
+/// One `skill-md` artifact body with the digest of its bytes.
+fn well_known_skill_md(name: &str, description: &str) -> (String, String) {
+    let body = format!("---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n");
+    let digest = {
+        let mut hasher = Sha256::new();
+        hasher.update(body.as_bytes());
+        format!("sha256:{:x}", hasher.finalize())
+    };
+    (body, digest)
+}
+
+/// One discovery index entry as raw JSON.
+fn well_known_entry(name: &str, url: &str, digest: &str) -> String {
+    format!(
+        "{{\"name\":\"{name}\",\"type\":\"skill-md\",\"description\":\"Published through a \
+         well-known index.\",\"url\":\"{url}\",\"digest\":\"{digest}\"}}"
+    )
+}
+
+/// A discovery index document declaring every given entry.
+fn well_known_index(entries: &[String]) -> String {
+    format!(
+        "{{\"$schema\":\"{WELL_KNOWN_SCHEMA}\",\"skills\":[{}]}}",
+        entries.join(",")
+    )
+}
+
+/// Run one `skillctl` command in a workspace.
+fn run_in(workspace: &TestWorkspace, args: &[&str]) -> Assert {
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(args)
+        .assert()
+        .stderr(predicate::str::is_empty())
+}
+
+/// Run one `skillctl --json` command in a workspace and return its body.
+fn run_json_in(workspace: &TestWorkspace, args: &[&str]) -> Value {
+    let assert = run_in(
+        workspace,
+        &["--json"]
+            .iter()
+            .copied()
+            .chain(args.iter().copied())
+            .collect::<Vec<_>>(),
+    );
+    serde_json::from_slice(&assert.get_output().stdout).expect("stdout is valid json")
+}
+
+#[test]
+fn a_well_known_plan_document_repairs_edits_at_the_pinned_digest() {
+    let (artifact, digest) = well_known_skill_md("code-review", "Review code for defects.");
+    let origin = serve(vec![
+        route(
+            WELL_KNOWN_INDEX_PATH,
+            200,
+            well_known_index(&[well_known_entry(
+                "code-review",
+                "/download/code-review.md",
+                &digest,
+            )]),
+        ),
+        route("/download/code-review.md", 200, artifact),
+    ]);
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest(NEUTRAL_MANIFEST);
+
+    run_in(
+        &workspace,
+        &[
+            "--no-input",
+            "--name",
+            "code-review",
+            "install",
+            origin.as_str(),
+        ],
+    )
+    .success();
+
+    let projected_copy = workspace.path().join(".agents/skills/code-review/SKILL.md");
+    let mut contents = fs::read_to_string(&projected_copy).expect("projected copy exists");
+    contents.push_str("\nkeep my well-known edit\n");
+    fs::write(&projected_copy, contents).expect("projected copy edited");
+
+    // The index still declares the pinned digest, so the check stays up to
+    // date and the document describes an edit repair, not a revision move.
+    let body = run_json_in(
+        &workspace,
+        &[
+            "update",
+            "code-review",
+            "--strategy",
+            "overlay",
+            "--plan",
+            "update-plan.json",
+        ],
+    );
+    assert_eq!(body["ok"], true, "planning changes nothing: {body}");
+    let document: Value = serde_json::from_str(
+        &fs::read_to_string(workspace.path().join("update-plan.json"))
+            .expect("plan document exists"),
+    )
+    .expect("plan document is valid json");
+    let proposed = &document["plans"][0]["proposed"][0];
+    assert!(
+        proposed["summary"]
+            .as_str()
+            .expect("summary exists")
+            .contains("resolve unrecorded edits"),
+        "an up-to-date well-known plan describes a repair: {document}"
+    );
+    assert!(
+        proposed["revision"].is_null(),
+        "the repair proposes no revision move: {document}"
+    );
+    assert!(
+        !workspace
+            .path()
+            .join(".agents/overlays/code-review")
+            .exists(),
+        "planning alone creates no overlay"
+    );
+
+    let body = run_json_in(
+        &workspace,
+        &[
+            "update",
+            "--apply",
+            "--plan-file",
+            "update-plan.json",
+            "--strategy",
+            "overlay",
+        ],
+    );
+
+    assert_eq!(body["ok"], true, "the plan applies: {body}");
+    assert_eq!(
+        body["data"]["applied"][0]["skill"], "code-review",
+        "the skill is reported as applied: {body}"
+    );
+    let overlay = fs::read_to_string(
+        workspace
+            .path()
+            .join(".agents/overlays/code-review/SKILL.md"),
+    )
+    .expect("overlay file exists");
+    assert!(
+        overlay.contains("keep my well-known edit"),
+        "the planned repair keeps the edits: {overlay}"
+    );
+    let lockfile = fs::read_to_string(workspace.path().join(".agents/skillctl.lock"))
+        .expect("lockfile exists");
+    assert!(
+        lockfile.contains(&format!("resolved: {digest}")),
+        "a repair must not move the pinned digest: {lockfile}"
     );
 }
 

@@ -30,19 +30,27 @@ use crate::{
     artifact::{ArtifactStore, ArtifactWrite},
     bundle::BundleManifest,
     error::{AppError, ExitStatus},
-    history::HistoryLedger,
+    history::{HistoryLedger, context_for_scope},
     lifecycle,
     lockfile::{LockedBundle, LockedImport, WorkspaceLockfile},
-    manifest::{ImportDefinition, ManifestScope, WorkspaceManifest},
+    manifest::{ImportDefinition, WorkspaceManifest},
     materialize::{self, MaterializationReport},
     overlay::{NO_OVERLAY_HASH, hash_overlay_root},
     response::AppResponse,
     source::{
-        SourceKind, acquire_locked_source, copy_source_tree, current_timestamp,
-        hash_directory_contents, stored_import_root,
+        LockedSourceStaging, SourceKind, acquire_locked_source, copy_source_tree,
+        current_timestamp, hash_directory_contents, stored_import_root,
     },
     state::{InstallRecord, LocalStateStore, ManagedScope, ManagedSkillRef},
 };
+
+/// Refusal for a restore whose staged revision disappeared before the
+/// guarded transaction opened.
+///
+/// The staging happens before the transaction because acquisition must not run
+/// under the coordination lock, so this race is detected rather than prevented.
+const STAGING_CHANGED_MESSAGE: &str =
+    "the import cache changed while this restore prepared; re-run 'skillctl restore'";
 
 /// Typed request for `skillctl restore`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -201,12 +209,24 @@ pub fn handle_restore(
     request: RestoreRequest,
 ) -> Result<AppResponse, AppError> {
     let manifest = WorkspaceManifest::load_required_from_workspace(context, "restore")?;
-    let lockfile = load_lockfile_for_restore(&context.working_directory)?;
+    // The lockfile is the portable pin set a restore reconstructs, so its
+    // absence is the shared refusal that names both repairs.
+    let lockfile = WorkspaceLockfile::load_required_from_workspace(context, "restore")?;
     let targets = restore_targets(&manifest, &lockfile, &context.working_directory)?;
     // Overlays travel with the repository, not with the lockfile, so they are
     // checked before anything is acquired or written.
     validate_declared_overlays(&targets)?;
     let artifacts = ArtifactStore::open_default()?;
+    // Source acquisitions run before the guarded transaction opens: the
+    // coordination lock must not be held across a network clone or a
+    // well-known fetch, either of which can outlast every other command's
+    // lock timeout. The guarded closure re-inspects every target under the
+    // lock, so a cache that changed underneath the staging refuses instead of
+    // quietly installing what the staging no longer describes.
+    let staged = targets
+        .iter()
+        .map(|target| stage_restore_target(target, &artifacts, request))
+        .collect::<Result<Vec<_>, AppError>>()?;
     let timestamp = current_timestamp();
 
     lifecycle::run_transaction("restore", |transaction| {
@@ -216,9 +236,9 @@ pub fn handle_restore(
         }
         for scope in restored_scopes(&targets) {
             for root in materialize::sync_mutation_root_paths(
-                &scoped_context(context, scope),
+                &context_for_scope(context, scope),
                 &manifest,
-                adapter_scope(scope),
+                crate::adapter::TargetScope::from(scope),
             )? {
                 transaction.track_path(root)?;
             }
@@ -231,8 +251,8 @@ pub fn handle_restore(
         let mut upgraded = lockfile.clone();
         let mut lockfile_upgrade_pending = false;
 
-        for target in &targets {
-            let (report, captured_bundle) = restore_one(target, &artifacts, request)?;
+        for (target, staged) in targets.iter().zip(staged) {
+            let (report, captured_bundle) = restore_one(target, &artifacts, request, staged)?;
             if let Some(bundle) = captured_bundle
                 && upgraded
                     .imports
@@ -255,12 +275,33 @@ pub fn handle_restore(
             lockfile_changed = true;
         }
 
-        let sync_report = materialize::sync_workspace(context)?;
-        record_restore_state(context, &targets, &sync_report, &timestamp)?;
+        // Every restored scope is materialized with its own scoped context, and
+        // each scope's projection state is refreshed from its own report. A
+        // single unscoped sync covers one scope only, so its report must never
+        // rewrite the projection records of another restored scope.
+        let mut scopes = restored_scopes(&targets);
+        if scopes.is_empty() {
+            // No import is enabled, so no scope is reconstructed. The selected
+            // scope is still synced once, as a restore of no imports always
+            // did, so stale projections are pruned and the response keeps its
+            // projection report.
+            scopes.push(selected_scope(context));
+        }
+        let mut scope_reports: Vec<(ManagedScope, MaterializationReport)> = Vec::new();
+        for scope in scopes {
+            let scoped = context_for_scope(context, scope);
+            let sync_report = materialize::sync_workspace(&scoped)?;
+            let scope_targets: Vec<&RestoreTarget> = targets
+                .iter()
+                .filter(|target| target.scope == scope)
+                .collect();
+            record_restore_state(&scoped, scope, &scope_targets, &sync_report, &timestamp)?;
+            scope_reports.push((scope, sync_report));
+        }
 
         let mut response = AppResponse::success("restore");
         let summary = restore_summary(&outcomes, request, lockfile_changed, &lockfile);
-        response = response.with_summary(summary).with_data(json!({
+        let mut data = json!({
             "frozen": request.frozen,
             "offline": request.offline,
             "lockfile": {
@@ -270,8 +311,20 @@ pub fn handle_restore(
                 "changed": lockfile_changed,
             },
             "imports": outcomes,
-            "projection": sync_report,
-        }));
+            "projection": &scope_reports[0].1,
+        });
+        if scope_reports.len() > 1 {
+            data["scope_projections"] = json!(
+                scope_reports
+                    .iter()
+                    .map(|(scope, report)| json!({
+                        "scope": scope.as_str(),
+                        "projection": report,
+                    }))
+                    .collect::<Vec<_>>()
+            );
+        }
+        response = response.with_summary(summary).with_data(data);
 
         Ok(response)
     })
@@ -322,7 +375,7 @@ pub fn handle_verify(
         let mut report = json!({
             "skill": target.import_id,
             "scope": target.scope.as_str(),
-            "source_type": lockfile_kind_str(&target.locked.source.kind),
+            "source_type": target.locked.source.kind.label(),
             "source_url": target.locked.source.url,
             "revision": target.locked.revision.resolved,
             "subpath": target.locked.source.subpath.as_str(),
@@ -402,15 +455,27 @@ pub fn handle_verify(
                 "recorded source"
             )
         } else {
-            concat!(
-                "the recorded source is a local path that is unavailable here and no ",
-                "verified artifact is retained"
-            )
+            match &store_state {
+                // A cache that disagrees with the pin is never trusted and is
+                // never silently replaced from a source; only a verified
+                // retained artifact repairs it, and none is available.
+                ContentState::Mismatch(_) => concat!(
+                    "the cached content no longer matches its pin and no verified ",
+                    "retained artifact can replace it"
+                ),
+                ContentState::Missing => concat!(
+                    "the recorded source is a local path that is unavailable here and no ",
+                    "verified artifact is retained"
+                ),
+                ContentState::Verified(_) => {
+                    unreachable!("verified content is always restorable")
+                }
+            }
         };
         report["portability"] = json!({
             "restorable": restorable,
             "retained_artifact": target.locked.bundle_digest().is_some(),
-            "source_kind": lockfile_kind_str(&target.locked.source.kind),
+            "source_kind": target.locked.source.kind.label(),
             "reason": portability_reason,
         });
         report["freshness"] =
@@ -479,16 +544,17 @@ pub fn handle_verify(
         .count();
 
     let mut response = if integrity_failures.is_empty() {
-        let mut response = AppResponse::success("verify");
-        for warning in &warnings {
-            response = response.with_warning(warning.clone());
-        }
-        response
+        AppResponse::success("verify")
     } else {
         let mut response = AppResponse::failure("verify", integrity_failures.join("; "));
         response.status_override = Some(ExitStatus::ValidationFailure);
         response
     };
+    // Warnings stay attached beside a failure too: `counts` reports them, and
+    // the status override keeps the exit code unchanged either way.
+    for warning in &warnings {
+        response = response.with_warning(warning.clone());
+    }
 
     response = response.with_summary(format!(
         "Verified {verified} of {} pinned imports. Integrity {}, portability {}, freshness {}.",
@@ -538,6 +604,7 @@ fn restore_one(
     target: &RestoreTarget,
     artifacts: &ArtifactStore,
     request: RestoreRequest,
+    staged: Option<StagedImport>,
 ) -> Result<(Value, Option<LockedBundle>), AppError> {
     let skill_root = &target.skill_root;
 
@@ -605,16 +672,37 @@ fn restore_one(
                 ));
             }
 
-            acquire_from_source(target, artifacts)
+            // The revision was staged before the transaction opened. A missing
+            // staging means the cache changed underneath the preparation, so
+            // the restore refuses instead of acquiring from its source while
+            // the coordination lock is held.
+            let staged = staged.ok_or_else(|| restore_error(target, STAGING_CHANGED_MESSAGE))?;
+            install_staged_import(target, artifacts, staged)
         }
     }
 }
 
-/// Acquire the locked revision from its source and verify it.
-fn acquire_from_source(
-    target: &RestoreTarget,
-    artifacts: &ArtifactStore,
-) -> Result<(Value, Option<LockedBundle>), AppError> {
+/// One locked revision staged from its source before the restore transaction
+/// opens.
+///
+/// The staging owns its temporary directory, so the verified tree stays alive
+/// until the guarded transaction has copied it into the workspace cache.
+struct StagedImport {
+    /// Staged skill root inside the staging directory.
+    skill_root: PathBuf,
+    /// Bundle manifest captured from the staged tree.
+    manifest: BundleManifest,
+    /// Staging that owns the temporary directory.
+    _staging: LockedSourceStaging,
+}
+
+/// Stage and verify the locked revision of one import from its source.
+///
+/// This is the acquiring half of a source restore. It performs every network
+/// step and every verification step and writes nothing to the workspace, so it
+/// runs before the restore transaction opens and never under the coordination
+/// lock.
+fn stage_locked_import(target: &RestoreTarget) -> Result<StagedImport, AppError> {
     let staged = acquire_locked_source(&target.locked).map_err(|error| match error {
         AppError::SourceValidation { input, message } => restore_error(
             target,
@@ -651,6 +739,46 @@ fn acquire_from_source(
     let manifest = BundleManifest::capture(&staged_skill_root)?;
     verify_against_lock(target, &manifest, &staged_skill_root)?;
 
+    Ok(StagedImport {
+        skill_root: staged_skill_root,
+        manifest,
+        _staging: staged,
+    })
+}
+
+/// Decide whether one target needs its locked revision staged from its source.
+///
+/// The decision mirrors the branches `restore_one` takes under the lock: a
+/// verified cache and a retained artifact need no network, a mismatched cache
+/// is repaired from the artifact store or refused, and only a cache that is
+/// both empty and uncovered acquires from the source.
+fn stage_restore_target(
+    target: &RestoreTarget,
+    artifacts: &ArtifactStore,
+    request: RestoreRequest,
+) -> Result<Option<StagedImport>, AppError> {
+    match inspect_content(&target.skill_root, &target.locked) {
+        ContentState::Verified(_) | ContentState::Mismatch(_) => Ok(None),
+        ContentState::Missing => {
+            if let Some(digest) = target.locked.bundle_digest()
+                && artifacts.verify(digest)?.is_some()
+            {
+                return Ok(None);
+            }
+            if request.offline {
+                return Ok(None);
+            }
+            stage_locked_import(target).map(Some)
+        }
+    }
+}
+
+/// Copy one staged revision into the workspace cache and retain its artifact.
+fn install_staged_import(
+    target: &RestoreTarget,
+    artifacts: &ArtifactStore,
+    staged: StagedImport,
+) -> Result<(Value, Option<LockedBundle>), AppError> {
     // Replace the workspace cache for this import, then retain the artifact.
     if target.stored_root.exists() {
         fs::remove_dir_all(&target.stored_root).map_err(|source| {
@@ -661,12 +789,12 @@ fn acquire_from_source(
             }
         })?;
     }
-    copy_source_tree(&staged_skill_root, &target.skill_root)?;
+    copy_source_tree(&staged.skill_root, &target.skill_root)?;
     let artifact = retain_artifact(artifacts, &target.skill_root)?;
 
     Ok((
         report(target, RestoreOrigin::SourceAtLockedRevision, &artifact),
-        Some(bundle_record(&manifest)),
+        Some(bundle_record(&staged.manifest)),
     ))
 }
 
@@ -731,7 +859,7 @@ fn verify_against_lock(
                  pins {expected}; the source changed after the lockfile was written or the \
                  lockfile was edited. skillctl will not install content that differs from the \
                  approved digest",
-                lockfile_kind_str(&target.locked.source.kind),
+                target.locked.source.kind.label(),
                 manifest.digest()
             ),
         ));
@@ -745,7 +873,7 @@ fn verify_against_lock(
                 "content reconstructed from the locked {} source hashes to {content_hash} but \
                  the lockfile pins {}; the pinned source no longer reproduces the approved \
                  content",
-                lockfile_kind_str(&target.locked.source.kind),
+                target.locked.source.kind.label(),
                 target.locked.hashes.content
             ),
         ));
@@ -913,7 +1041,7 @@ fn restore_targets(
                 ),
             });
         };
-        let scope = managed_scope(import);
+        let scope = ManagedScope::from(import.scope);
         let stored_root = stored_import_root(scope, working_directory, &import.id)?;
         let skill_root = stored_root.join(locked.source.subpath.as_str());
         let overlay = overlay_expectation(manifest, import, locked, working_directory);
@@ -953,29 +1081,17 @@ fn overlay_expectation(
     }
 }
 
-fn load_lockfile_for_restore(working_directory: &Path) -> Result<WorkspaceLockfile, AppError> {
-    let path = working_directory.join(crate::lockfile::DEFAULT_LOCKFILE_PATH);
-    if !path.is_file() {
-        return Err(AppError::RestoreValidation {
-            import_id: "<workspace>".to_string(),
-            message: format!(
-                "no lockfile at '{}'; there is nothing to restore. In a team checkout, retrieve \
-                 the committed .agents/skillctl.lock. For a workspace that pinned nothing yet, \
-                 run 'skillctl init' and install the skills again",
-                path.display()
-            ),
-        });
-    }
-    WorkspaceLockfile::load_from_path(&path)
-}
-
-/// Record local installation bookkeeping for the restored imports.
+/// Record local installation bookkeeping for the restored imports of one
+/// scope.
 ///
 /// Dependency identity is never advanced here: the install records repeat the
-/// revisions and digests already pinned in the lockfile.
+/// revisions and digests already pinned in the lockfile. Projection state is
+/// refreshed from this scope's own sync report only, so one scope's report
+/// never rewrites another scope's records.
 fn record_restore_state(
     context: &AppContext,
-    targets: &[RestoreTarget],
+    scope: ManagedScope,
+    targets: &[&RestoreTarget],
     sync_report: &MaterializationReport,
     timestamp: &str,
 ) -> Result<(), AppError> {
@@ -1015,16 +1131,14 @@ fn record_restore_state(
         }
     }
 
-    for scope in restored_scopes(targets) {
-        materialize::refresh_projection_state_for_scope(
-            &mut store,
-            context,
-            scope,
-            sync_report,
-            timestamp,
-            |_| Ok(()),
-        )?;
-    }
+    materialize::refresh_projection_state_for_scope(
+        &mut store,
+        context,
+        scope,
+        sync_report,
+        timestamp,
+        |_| Ok(()),
+    )?;
 
     Ok(())
 }
@@ -1040,20 +1154,11 @@ fn restored_scopes(targets: &[RestoreTarget]) -> Vec<ManagedScope> {
     scopes
 }
 
-/// Context narrowed to one scope, matching how install scopes its projections.
-fn scoped_context(context: &AppContext, scope: ManagedScope) -> AppContext {
-    let mut scoped = context.clone();
-    scoped.selector.scope = Some(match scope {
-        ManagedScope::Workspace => crate::cli::Scope::Workspace,
-        ManagedScope::User => crate::cli::Scope::User,
-    });
-    scoped
-}
-
-fn adapter_scope(scope: ManagedScope) -> crate::adapter::TargetScope {
-    match scope {
-        ManagedScope::Workspace => crate::adapter::TargetScope::Workspace,
-        ManagedScope::User => crate::adapter::TargetScope::User,
+/// The scope the invocation selected, defaulting to the workspace.
+fn selected_scope(context: &AppContext) -> ManagedScope {
+    match context.selector.scope {
+        Some(crate::cli::Scope::User) => ManagedScope::User,
+        Some(crate::cli::Scope::Workspace) | None => ManagedScope::Workspace,
     }
 }
 
@@ -1070,7 +1175,7 @@ fn report(target: &RestoreTarget, origin: RestoreOrigin, artifact: &Value) -> Va
     json!({
         "skill": target.import_id,
         "scope": target.scope.as_str(),
-        "source_type": lockfile_kind_str(&target.locked.source.kind),
+        "source_type": target.locked.source.kind.label(),
         "source_url": target.locked.source.url,
         "revision": target.locked.revision.resolved,
         "subpath": target.locked.source.subpath.as_str(),
@@ -1214,25 +1319,28 @@ fn source_is_reachable(locked: &LockedImport) -> bool {
     }
 }
 
-fn lockfile_kind_str(kind: &SourceKind) -> &'static str {
-    match kind {
-        SourceKind::Git => "git",
-        SourceKind::LocalPath => "local-path",
-        SourceKind::Archive => "archive",
-        SourceKind::WellKnown => "well-known",
-    }
-}
-
-fn managed_scope(import: &ImportDefinition) -> ManagedScope {
-    match import.scope {
-        ManifestScope::Workspace => ManagedScope::Workspace,
-        ManifestScope::User => ManagedScope::User,
-    }
-}
-
 fn restore_error(target: &RestoreTarget, message: impl Into<String>) -> AppError {
     AppError::RestoreValidation {
         import_id: target.import_id.clone(),
         message: message.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::STAGING_CHANGED_MESSAGE;
+
+    /// The refusal renders verbatim, so a stray run of spaces inside the
+    /// literal corrupts every error report that carries it.
+    #[test]
+    fn the_staging_changed_refusal_renders_single_spaced() {
+        assert!(
+            !STAGING_CHANGED_MESSAGE.contains("  "),
+            "the refusal must not contain doubled spaces: {STAGING_CHANGED_MESSAGE}"
+        );
+        assert!(
+            STAGING_CHANGED_MESSAGE.contains("re-run 'skillctl restore'"),
+            "the refusal names the repair: {STAGING_CHANGED_MESSAGE}"
+        );
     }
 }

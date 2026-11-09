@@ -73,22 +73,48 @@ pub(crate) const MIGRATION_STAGES: &[MigrationStage] = &[
 /// boundaries in a child process.
 pub(crate) type MigrationHook<'a> = &'a dyn Fn(MigrationStage) -> Result<(), AppError>;
 
+/// What one bootstrap pass did about schema work.
+///
+/// The outcome is the coordination contract between a store and its caller: a
+/// pass that only reads reports [`Validated`](Self::Validated), a pass that
+/// wrote reports [`Wrote`](Self::Wrote), and a pass that found work it may not
+/// perform unlocked reports [`NeedsCoordination`](Self::NeedsCoordination) so
+/// its caller retries while holding the coordination lock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BootstrapOutcome {
+    /// The pass validated the schema without writing.
+    Validated,
+    /// The pass created, migrated, or recovered the schema.
+    Wrote,
+    /// The pass found schema work only a coordinated pass may perform.
+    NeedsCoordination,
+}
+
+/// Bootstrap one connection's schema.
+///
+/// The pass classifies the schema it finds and acts on that one reading: with
+/// `allow_writes` clear it refuses to create, migrate, or recover anything and
+/// reports [`BootstrapOutcome::NeedsCoordination`] instead, so an unlocked
+/// bootstrap can never write no matter how the shared database changed around
+/// it. Callers that hold the coordination lock pass `allow_writes` set.
 pub(super) fn bootstrap_connection(
     connection: &mut Connection,
     path: &Path,
     workspace_key: &str,
-) -> Result<(), AppError> {
+    allow_writes: bool,
+) -> Result<BootstrapOutcome, AppError> {
     connection
         .execute_batch("PRAGMA foreign_keys = ON;")
         .map_err(|source| local_state_query(path, "enable foreign keys", source))?;
-    initialize_or_validate_schema(connection, path, workspace_key)
+    initialize_or_validate_schema(connection, path, workspace_key, allow_writes)
 }
 
 fn initialize_or_validate_schema(
     connection: &mut Connection,
     path: &Path,
     workspace_key: &str,
-) -> Result<(), AppError> {
+    allow_writes: bool,
+) -> Result<BootstrapOutcome, AppError> {
     let found = schema_version(connection, path)?;
     if found == 0 {
         if database_has_user_tables(connection, path)? {
@@ -98,16 +124,34 @@ fn initialize_or_validate_schema(
             ));
         }
 
+        if !allow_writes {
+            return Ok(BootstrapOutcome::NeedsCoordination);
+        }
         create_current_schema(connection, path)?;
-        return Ok(());
+        return Ok(BootstrapOutcome::Wrote);
     }
 
     match LOCAL_STATE_SCHEMA_POLICY.classify(found) {
         VersionDisposition::Current => {
+            // The stranded-table recovery writes only when a legacy table
+            // exists beside the current schema, so its presence decides
+            // whether this pass may stay read-only.
+            let stranded = !present_legacy_tables(connection, path)?.is_empty();
+            if stranded && !allow_writes {
+                return Ok(BootstrapOutcome::NeedsCoordination);
+            }
             recover_stranded_legacy_tables(connection, path, workspace_key, found)?;
-            validate_required_tables(connection, path)
+            validate_required_tables(connection, path)?;
+            if stranded {
+                Ok(BootstrapOutcome::Wrote)
+            } else {
+                Ok(BootstrapOutcome::Validated)
+            }
         }
         VersionDisposition::NeedsMigration { from, to } => {
+            if !allow_writes {
+                return Ok(BootstrapOutcome::NeedsCoordination);
+            }
             migrate_schema(
                 connection,
                 path,
@@ -116,7 +160,8 @@ fn initialize_or_validate_schema(
                 to,
                 &env_migration_hook,
             )?;
-            validate_required_tables(connection, path)
+            validate_required_tables(connection, path)?;
+            Ok(BootstrapOutcome::Wrote)
         }
         VersionDisposition::Unsupported {
             found,
@@ -189,6 +234,19 @@ pub(crate) fn migrate_schema(
         for (legacy_name, migrated_name) in LEGACY_RENAMES {
             rename_legacy_table_if_needed(&transaction, path, legacy_name, migrated_name)?;
         }
+        // Renaming a table keeps its indexes attached under their original
+        // names, so the `IF NOT EXISTS` creates below would skip those names
+        // and `drop_legacy_tables` would remove the indexes with the `_v1`
+        // tables. Drop the names first so the current schema recreates every
+        // index.
+        let drop_legacy_indexes = LEGACY_SECONDARY_INDEXES
+            .iter()
+            .map(|index| format!("DROP INDEX IF EXISTS {index};"))
+            .collect::<Vec<_>>()
+            .concat();
+        transaction
+            .execute_batch(&drop_legacy_indexes)
+            .map_err(|source| local_state_query(path, "drop legacy schema indexes", source))?;
         hook(MigrationStage::AfterRenames)?;
     }
 
@@ -198,7 +256,7 @@ pub(crate) fn migrate_schema(
             local_state_query(path, "initialize migrated local state schema", source)
         })?;
     if from > 1 {
-        rebuild_widened_constraint_tables(&transaction, path)?;
+        rebuild_widened_constraint_tables(&transaction, path, from)?;
     }
     hook(MigrationStage::AfterSchemaCreation)?;
 
@@ -234,70 +292,82 @@ pub(crate) fn migrate_schema(
 /// through the schema-v1 rename and copy flow.
 const ADDITIVE_MIGRATION_SUPPORTED_VERSIONS: &[u32] = &[2, 3, 4, 5];
 
-/// Tables the additive migration rebuilds from the canonical schema, with the
-/// index the canonical schema attaches to them and the columns every supported
-/// older version already carries.
+/// One table the additive migration rebuilds from the canonical schema.
+struct WidenedConstraintTable {
+    /// Table name in the current schema.
+    table: &'static str,
+    /// Secondary index the canonical schema attaches to the table.
+    index: Option<&'static str>,
+    /// Columns the supported older versions carry, each paired with the first
+    /// schema version whose table carries it, so the copy can skip a column
+    /// the migrated-from version does not have yet.
+    columns: &'static [(&'static str, u32)],
+}
+
+/// Tables the additive migration rebuilds.
 ///
 /// A rebuild delivers each shape change an older table cannot hold in place: a
 /// `CHECK` constraint list that gained values and a column that was added.
-/// Columns the older table lacks take their default, so no row is lost.
+/// The copy names only the columns the older table carries, so a column the
+/// canonical schema added keeps its default instead of losing rows.
 ///
 /// `install_records` carries no secondary index of its own, so its rebuild has
 /// none to drop.
-const WIDENED_CONSTRAINT_TABLES: &[(&str, Option<&str>, &[&str])] = &[
-    (
-        "history_events",
-        Some("idx_history_events_skill_time"),
-        &[
-            "id",
-            "workspace_key",
-            "kind",
-            "scope",
-            "skill_id",
-            "target",
-            "occurred_at",
-            "summary",
-            "details_json",
+const WIDENED_CONSTRAINT_TABLES: &[WidenedConstraintTable] = &[
+    WidenedConstraintTable {
+        table: "history_events",
+        index: Some("idx_history_events_skill_time"),
+        columns: &[
+            ("id", 2),
+            ("workspace_key", 2),
+            ("kind", 2),
+            ("scope", 2),
+            ("skill_id", 2),
+            ("target", 2),
+            ("occurred_at", 2),
+            ("summary", 2),
+            ("details_json", 2),
         ],
-    ),
-    (
-        "update_checks",
-        Some("idx_update_checks_skill_time"),
-        &[
-            "id",
-            "scope",
-            "workspace_key",
-            "skill_id",
-            "checked_at",
-            "pinned_revision",
-            "latest_revision",
-            "outcome",
-            "overlay_detected",
-            "local_modification_detected",
-            "notes",
+    },
+    WidenedConstraintTable {
+        table: "update_checks",
+        index: Some("idx_update_checks_skill_time"),
+        columns: &[
+            ("id", 2),
+            ("scope", 2),
+            ("workspace_key", 2),
+            ("skill_id", 2),
+            ("checked_at", 2),
+            ("pinned_revision", 2),
+            ("latest_revision", 2),
+            ("outcome", 2),
+            ("overlay_detected", 2),
+            ("local_modification_detected", 2),
+            ("apply_blocked_by", 5),
+            ("notes", 2),
         ],
-    ),
-    (
-        "install_records",
-        None,
-        &[
-            "scope",
-            "workspace_key",
-            "skill_id",
-            "source_kind",
-            "source_url",
-            "source_subpath",
-            "resolved_revision",
-            "upstream_revision",
-            "content_hash",
-            "overlay_hash",
-            "effective_version_hash",
-            "installed_at",
-            "updated_at",
-            "detached",
-            "forked",
+    },
+    WidenedConstraintTable {
+        table: "install_records",
+        index: None,
+        columns: &[
+            ("scope", 2),
+            ("workspace_key", 2),
+            ("skill_id", 2),
+            ("source_kind", 2),
+            ("source_url", 2),
+            ("source_subpath", 2),
+            ("resolved_revision", 2),
+            ("upstream_revision", 2),
+            ("content_hash", 2),
+            ("overlay_hash", 2),
+            ("effective_version_hash", 2),
+            ("installed_at", 2),
+            ("updated_at", 2),
+            ("detached", 2),
+            ("forked", 2),
         ],
-    ),
+    },
 ];
 
 /// Rebuild every table whose canonical shape changed since the version being
@@ -308,10 +378,22 @@ const WIDENED_CONSTRAINT_TABLES: &[(&str, Option<&str>, &[&str])] = &[
 /// which keeps the rebuilt shape and the created shape from drifting. The copy
 /// names only the columns the older table carries, so a column the canonical
 /// schema added keeps its default instead of losing rows.
-fn rebuild_widened_constraint_tables(connection: &Connection, path: &Path) -> Result<(), AppError> {
-    for (table, index, columns) in WIDENED_CONSTRAINT_TABLES {
-        let column_list = columns.join(", ");
-        let drop_index = index
+fn rebuild_widened_constraint_tables(
+    connection: &Connection,
+    path: &Path,
+    from: u32,
+) -> Result<(), AppError> {
+    for widened in WIDENED_CONSTRAINT_TABLES {
+        let table = widened.table;
+        let column_list = widened
+            .columns
+            .iter()
+            .filter(|(_, since)| *since <= from)
+            .map(|(column, _)| *column)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let drop_index = widened
+            .index
             .map(|index| format!("DROP INDEX IF EXISTS {index};\n"))
             .unwrap_or_default();
         connection
@@ -350,6 +432,19 @@ pub(crate) const LEGACY_RENAMES: &[(&str, &str)] = &[
     ("history_events", "history_events_v1"),
 ];
 
+/// Secondary index names the schema-v1 tables carried.
+///
+/// A schema-v1 database created every secondary index the current schema
+/// declares, under the same names. The v1 migration drops them after the
+/// renames so the recreated schema attaches fresh indexes to the current
+/// tables instead of losing the names with the dropped `_v1` tables.
+const LEGACY_SECONDARY_INDEXES: &[&str] = &[
+    "idx_update_checks_skill_time",
+    "idx_local_modifications_skill_time",
+    "idx_rollback_records_skill_time",
+    "idx_history_events_skill_time",
+];
+
 fn rename_legacy_table_if_needed(
     connection: &Connection,
     path: &Path,
@@ -386,8 +481,6 @@ fn advance_schema_version(
 /// Result of comparing legacy `_v1` tables with the current tables.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct LegacyReconciliation {
-    /// Human-readable description of every applied change.
-    pub actions: Vec<String>,
     /// Legacy tables that were left untouched because ownership is ambiguous.
     pub ambiguous: Vec<String>,
 }
@@ -481,20 +574,12 @@ pub(crate) fn reconcile_legacy_tables(
     for disposition in classify_legacy_tables(connection, path, workspace_key)? {
         let migration = migration_for(disposition.legacy).expect("legacy table is registered");
         match disposition.action {
-            LegacyTableAction::CopyAndDrop { missing, identical } => {
+            LegacyTableAction::CopyAndDrop { .. } => {
                 copy_missing_legacy_rows(connection, path, migration, workspace_key)?;
                 drop_legacy_table(connection, path, migration.legacy)?;
-                reconciliation.actions.push(format!(
-                    "copied {missing} and verified {identical} row(s) from {} into {}",
-                    migration.legacy, migration.current
-                ));
             }
-            LegacyTableAction::DropOnly { identical } => {
+            LegacyTableAction::DropOnly { .. } => {
                 drop_legacy_table(connection, path, migration.legacy)?;
-                reconciliation.actions.push(format!(
-                    "verified {identical} row(s) already present in {} and dropped {}",
-                    migration.current, migration.legacy
-                ));
             }
             LegacyTableAction::Ambiguous { reason } => {
                 reconciliation
@@ -1081,7 +1166,13 @@ fn env_migration_hook(stage: MigrationStage) -> Result<(), AppError> {
     Ok(())
 }
 
-pub(super) fn resolve_home_directory() -> Option<PathBuf> {
+/// Resolve the current home directory.
+///
+/// Empty `HOME` and `USERPROFILE` values are ignored, and Windows
+/// `HOMEDRIVE`+`HOMEPATH` pairs are honored, so every store and sync helper
+/// that roots itself at the home directory agrees with the state database on
+/// which directory that is.
+pub(crate) fn resolve_home_directory() -> Option<PathBuf> {
     let home = env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty());

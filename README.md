@@ -36,14 +36,14 @@ Important rule:
 Install the latest release:
 
 ```bash
-curl -fsSL https://github.com/nibzard/skillctl/releases/latest/download/skillctl-install.sh | sh
+curl -fsSL https://github.com/nibzard/skillctl/releases/latest/download/skillctl-install.sh | bash
 ```
 
 Install a specific version or custom destination:
 
 ```bash
 curl -fsSL https://github.com/nibzard/skillctl/releases/latest/download/skillctl-install.sh | \
-  SKILLCTL_VERSION=v0.1.0 SKILLCTL_INSTALL_DIR="$HOME/.local/bin" sh
+  SKILLCTL_VERSION=v0.1.0 SKILLCTL_INSTALL_DIR="$HOME/.local/bin" bash
 ```
 
 Published release artifacts currently cover:
@@ -362,6 +362,9 @@ Full guide: [docs/troubleshooting.md](./docs/troubleshooting.md)
 | `3` | validation or conflict failure |
 | `4` | trust gate blocked |
 | `5` | interactive input required |
+
+A closed output pipe is not a command failure. `skillctl list | head` exits
+with `0` when the reader stops early, instead of reporting a panic status.
 
 ## Development
 

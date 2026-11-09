@@ -131,25 +131,18 @@ pub(crate) fn acquire(
 
     record_holder(&file, purpose);
 
-    let mut registry = registry().lock().expect("coordination registry locks");
-    match registry.get_mut(&lock_path) {
-        Some(held) => {
-            // Another thread of this process registered the lock while this
-            // call waited for the file lock. Follow that registration instead.
-            held.depth += 1;
-            drop(registry);
-            let _ = file.unlock();
-            Ok(CoordinationGuard {
-                lock_path: Some(lock_path),
-            })
-        }
-        None => {
-            registry.insert(lock_path.clone(), HeldLock { file, depth: 1 });
-            Ok(CoordinationGuard {
-                lock_path: Some(lock_path),
-            })
-        }
-    }
+    // A registry entry exists only while its file holds the flock: every
+    // entry is inserted right after the inserting call won `try_lock`, and
+    // `Drop` removes the entry before it unlocks. Because this call now owns
+    // the flock, no other thread of this process can hold a registration for
+    // this path, so the insert always creates the process's entry.
+    registry()
+        .lock()
+        .expect("coordination registry locks")
+        .insert(lock_path.clone(), HeldLock { file, depth: 1 });
+    Ok(CoordinationGuard {
+        lock_path: Some(lock_path),
+    })
 }
 
 /// Register a reentrant acquisition when this process already holds the lock.
@@ -161,6 +154,58 @@ fn acquire_reentrant(lock_path: &Path) -> bool {
             true
         }
         None => false,
+    }
+}
+
+/// Whether this process already registered one coordination lock.
+fn held_in_process(lock_path: &Path) -> bool {
+    registry()
+        .lock()
+        .expect("coordination registry locks")
+        .contains_key(lock_path)
+}
+
+/// Whether the coordination lock for one state database is currently held.
+///
+/// The probe tries to take the lock without waiting, so it answers "held"
+/// whenever any process — including this one — owns it. Callers that hold no
+/// lock themselves use it to tell an operation in progress from an interrupted
+/// one: a lifecycle journal exists on disk only while its owner holds this
+/// lock, and the operating system releases the lock when that process dies.
+/// An unanswerable probe reports "not held", so its caller keeps reporting the
+/// journals it found.
+pub(crate) fn is_held(database_path: &Path) -> bool {
+    let Some(lock_path) = lock_path_for(database_path) else {
+        return false;
+    };
+
+    if held_in_process(&lock_path) {
+        return true;
+    }
+
+    let Ok(file) = open_lock_file(&lock_path) else {
+        return false;
+    };
+
+    let probe = file.try_lock();
+    if matches!(probe, Ok(())) {
+        let _ = file.unlock();
+    }
+    probe_reports_held(probe)
+}
+
+/// Whether one probe outcome means the lock is held.
+///
+/// Only `WouldBlock` reports a holder. A successful probe acquired and
+/// released the lock itself, and a hard error — an exhausted lock table or an
+/// NFS flock failure, the same error [`acquire`] treats as a distinct failure
+/// — means the filesystem cannot answer, which this probe reports as "not
+/// held" so its caller keeps reporting the journals it found.
+fn probe_reports_held(probe: Result<(), std::fs::TryLockError>) -> bool {
+    match probe {
+        Ok(()) => false,
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(_)) => false,
     }
 }
 
@@ -213,12 +258,10 @@ fn record_holder(mut file: &File, purpose: &'static str) {
 }
 
 fn configured_timeout() -> Duration {
-    std::env::var(LOCK_TIMEOUT_ENV)
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .map_or(DEFAULT_TIMEOUT, |milliseconds| {
-            Duration::from_millis(milliseconds.max(1))
-        })
+    super::env_millisecond_timeout(
+        std::env::var(LOCK_TIMEOUT_ENV).ok().as_deref(),
+        DEFAULT_TIMEOUT,
+    )
 }
 
 fn lock_timeout(lock_path: &Path, purpose: &'static str, started: Instant) -> AppError {
@@ -227,5 +270,36 @@ fn lock_timeout(lock_path: &Path, purpose: &'static str, started: Instant) -> Ap
         purpose,
         waited_ms: started.elapsed().as_millis() as u64,
         holder: read_holder(lock_path),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::probe_reports_held;
+    use std::{fs::TryLockError, io};
+
+    #[test]
+    fn only_a_would_block_probe_reports_a_holder() {
+        assert!(
+            !probe_reports_held(Ok(())),
+            "a probe that acquired the lock reports it free"
+        );
+        assert!(
+            probe_reports_held(Err(TryLockError::WouldBlock)),
+            "a blocked probe reports the holder"
+        );
+    }
+
+    #[test]
+    fn an_unanswerable_probe_reports_not_held() {
+        // ENOLCK (37): the lock table is exhausted, so flock cannot answer.
+        // The same class covers an NFS flock failure. An unanswerable probe
+        // must keep doctor reporting the journals it found instead of hiding
+        // them behind an imaginary holder.
+        let unanswerable = TryLockError::Error(io::Error::from_raw_os_error(37));
+        assert!(
+            !probe_reports_held(Err(unanswerable)),
+            "a hard probe error is not a holder"
+        );
     }
 }

@@ -17,7 +17,7 @@
 
 use std::{
     collections::BTreeMap,
-    env, fs,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -158,6 +158,11 @@ pub struct ProposedImport {
 }
 
 /// How a mutation treats the canonical bundle identity of an import.
+///
+/// The policy is descriptive: it tells a reader of a plan document how the
+/// mutation treats the bundle digest. The engine derives the real outcome from
+/// the operations the plan applies, so a wrong declaration changes the document
+/// a reader sees, not what the apply does.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BundlePolicy {
@@ -189,6 +194,10 @@ pub struct PlanTarget {
     /// Absolute path the operation may change.
     pub path: String,
     /// Action applied to the path.
+    ///
+    /// The action is descriptive: it tells a reader of a plan document what the
+    /// operation intends. The guard backs up and restores every declared target
+    /// the same way, so the engine does not branch on this value.
     pub action: TargetAction,
 }
 
@@ -206,32 +215,6 @@ pub struct ChangeDiff {
     pub modified: Vec<String>,
 }
 
-impl ChangeDiff {
-    /// Whether the two trees were identical.
-    pub fn is_empty(&self) -> bool {
-        self.added.is_empty() && self.removed.is_empty() && self.modified.is_empty()
-    }
-
-    /// Compact human-readable summary of the difference.
-    pub fn describe(&self) -> String {
-        if self.is_empty() {
-            return "content is unchanged".to_string();
-        }
-
-        let mut parts = Vec::new();
-        if !self.added.is_empty() {
-            parts.push(format!("+{}", self.added.len()));
-        }
-        if !self.removed.is_empty() {
-            parts.push(format!("-{}", self.removed.len()));
-        }
-        if !self.modified.is_empty() {
-            parts.push(format!("~{}", self.modified.len()));
-        }
-        parts.join(" ")
-    }
-}
-
 /// One proposed change a plan will make.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PlannedChange {
@@ -246,6 +229,10 @@ pub struct PlannedChange {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RecoveryRefs {
     /// Lifecycle operation that owns the journal for this plan.
+    ///
+    /// The name is descriptive: it tells a reader of a plan document where the
+    /// journal lives. The journal itself is opened by the operation that runs
+    /// the plan, so the engine does not consult this value.
     pub journal_operation: String,
     /// Directory that holds durable pre-discard backups.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -352,15 +339,6 @@ impl MutationPlanBuilder {
     pub fn target(mut self, path: impl AsRef<Path>, action: TargetAction) -> Self {
         self.targets.push(PlanTarget {
             path: path.as_ref().display().to_string(),
-            action,
-        });
-        self
-    }
-
-    /// Declare one filesystem target by display string.
-    pub fn target_label(mut self, path: impl Into<String>, action: TargetAction) -> Self {
-        self.targets.push(PlanTarget {
-            path: path.into(),
             action,
         });
         self
@@ -797,10 +775,8 @@ pub struct DiscardStore {
 impl DiscardStore {
     /// Open the default store below the skillctl home directory.
     pub fn open_default() -> Result<Self, AppError> {
-        let home = env::var_os("HOME")
-            .or_else(|| env::var_os("USERPROFILE"))
-            .map(PathBuf::from)
-            .ok_or(AppError::HomeDirectoryUnavailable)?;
+        let home =
+            crate::state::resolve_home_directory().ok_or(AppError::HomeDirectoryUnavailable)?;
         Ok(Self {
             root: home.join(DISCARDS_STORE_RELATIVE_PATH),
         })
@@ -814,21 +790,19 @@ impl DiscardStore {
     /// Retain one tree durably before it is discarded.
     ///
     /// The source is copied, never moved, so the caller keeps control of the
-    /// original path until it chooses to replace it.
+    /// original path until it chooses to replace it. The backup name counts up
+    /// when an earlier backup already holds it, because a pinned clock
+    /// (`SOURCE_DATE_EPOCH`) or a repeated process id can reproduce a name
+    /// without any state having been lost, so an existing sibling never blocks
+    /// the discard it is asked to back up.
     pub fn retain(&self, label: &str, source: &Path) -> Result<PathBuf, AppError> {
-        let destination = self.root.join(sanitize_component(label)).join(format!(
-            "{}-{}",
-            current_timestamp(),
-            std::process::id()
-        ));
-        if destination.exists() {
-            return Err(AppError::ArtifactValidation {
-                path: self.root.clone(),
-                message: format!(
-                    "a retained backup already exists at '{}'",
-                    destination.display()
-                ),
-            });
+        let label_root = self.root.join(sanitize_component(label));
+        let base_name = format!("{}-{}", current_timestamp(), std::process::id());
+        let mut destination = label_root.join(&base_name);
+        let mut attempt = 1;
+        while destination.exists() {
+            attempt += 1;
+            destination = label_root.join(format!("{base_name}-{attempt}"));
         }
 
         fs::create_dir_all(&destination).map_err(|source| AppError::FilesystemOperation {
@@ -1170,7 +1144,7 @@ pub fn inspect_projection(
             }
         }
         None => {
-            if !is_skillctl_generated_directory(dir)? {
+            if !crate::materialize::is_skillctl_generated_directory(dir)? {
                 return Ok(ProjectionState::HandAuthored);
             }
             // Copies written before digests were recorded carry no baseline.
@@ -1196,64 +1170,19 @@ pub fn inspect_projection(
 }
 
 /// Read the content digest recorded in one projection metadata file.
+///
+/// `None` covers both a directory without projection metadata and one whose
+/// metadata names no digest, because neither leaves a baseline to compare a
+/// copy against.
 fn read_projection_content_digest(dir: &Path) -> Result<Option<String>, AppError> {
-    if !is_skillctl_generated_directory(dir)? {
-        return Ok(None);
-    }
-    let metadata_path = dir.join(PROJECTION_METADATA_FILE);
-    let contents = match fs::read_to_string(&metadata_path) {
-        Ok(contents) => contents,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(AppError::FilesystemOperation {
-                action: "read projection metadata",
-                path: metadata_path,
-                source,
-            });
-        }
-    };
-    let parsed = serde_json::from_str::<serde_json::Value>(&contents).map_err(|source| {
-        AppError::MaterializationValidation {
-            message: format!(
-                "projection metadata '{}' is invalid JSON: {source}",
-                metadata_path.display()
-            ),
-        }
-    })?;
-
-    Ok(parsed
-        .get("content_digest")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string))
-}
-
-/// Whether a directory was generated by skillctl.
-fn is_skillctl_generated_directory(dir: &Path) -> Result<bool, AppError> {
-    let metadata_path = dir.join(PROJECTION_METADATA_FILE);
-    let contents = match fs::read_to_string(&metadata_path) {
-        Ok(contents) => contents,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(source) => {
-            return Err(AppError::FilesystemOperation {
-                action: "read projection metadata",
-                path: metadata_path,
-                source,
-            });
-        }
-    };
-    let parsed = serde_json::from_str::<serde_json::Value>(&contents).map_err(|source| {
-        AppError::MaterializationValidation {
-            message: format!(
-                "projection metadata '{}' is invalid JSON: {source}",
-                metadata_path.display()
-            ),
-        }
-    })?;
-
-    Ok(parsed
-        .get("tool")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|tool| tool == "skillctl"))
+    Ok(
+        crate::materialize::read_projection_metadata(dir)?.and_then(|parsed| {
+            parsed
+                .get("content_digest")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        }),
+    )
 }
 
 /// Hash the content of one projection directory, ignoring the metadata file.
@@ -1508,6 +1437,13 @@ pub(crate) fn apply_import_revision(
 
     let new_skill_root = target.source_root.join(&subpath);
     ensure_directory(&new_skill_root, "inspect imported skill")?;
+    ensure_overlay_maps_into_tree(
+        manifest,
+        &context.working_directory,
+        &import_id,
+        &new_skill_root,
+        target.resolved_revision,
+    )?;
     let new_bundle = BundleManifest::capture(&new_skill_root)?;
     let content_hash = hash_directory_contents(&new_skill_root)?;
     let overlay_hash =
@@ -1590,6 +1526,68 @@ pub(crate) fn apply_import_revision(
             bytes: new_bundle.total_bytes(),
         },
         diff,
+    })
+}
+
+/// Refuse a revision move whose incoming tree deletes an overlay file's base.
+///
+/// An overlay file only resolves against a base the imported tree provides, so
+/// a revision that removes the file makes every later sync fail while the move
+/// itself rolls back to a tree where the overlay maps again — a dead end no
+/// strategy escapes and no diagnosis explains. The refusal runs before the
+/// first write and names the overlay files whose base the revision drops, with
+/// the two exits that resolve it.
+fn ensure_overlay_maps_into_tree(
+    manifest: &WorkspaceManifest,
+    working_directory: &Path,
+    import_id: &str,
+    incoming_root: &Path,
+    resolved_revision: &str,
+) -> Result<(), AppError> {
+    let Some(overlay_path) = manifest.overrides.get(import_id) else {
+        return Ok(());
+    };
+    let overlay_root = working_directory.join(overlay_path.as_str());
+    let mut overlay_files = Vec::new();
+    match fs::metadata(&overlay_root) {
+        Ok(metadata) if metadata.is_dir() => {
+            collect_projection_files_for_overlay(&overlay_root, Path::new(""), &mut overlay_files)?;
+        }
+        Ok(_) => {
+            return Err(AppError::PathConflict {
+                path: overlay_root,
+                expected: "directory",
+            });
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(AppError::FilesystemOperation {
+                action: "inspect overlay root",
+                path: overlay_root,
+                source,
+            });
+        }
+    }
+
+    let unmapped: Vec<PathBuf> = overlay_files
+        .into_iter()
+        .filter(|relative| {
+            !fs::metadata(incoming_root.join(relative)).is_ok_and(|metadata| metadata.is_file())
+        })
+        .collect();
+    if unmapped.is_empty() {
+        return Ok(());
+    }
+
+    Err(AppError::DirtyContent {
+        path: overlay_root.join(unmapped.first().cloned().unwrap_or_default()),
+        message: format!(
+            "the managed overlay edits {}, which revision '{}' no longer contains; delete the \
+             overlay file to apply the revision, or run 'skillctl fork {import_id}' to keep the \
+             edit as local ownership",
+            quoted_relative_names(&unmapped),
+            resolved_revision
+        ),
     })
 }
 
@@ -1752,7 +1750,11 @@ impl ProjectionDrift {
 pub struct UpdateApplyTarget {
     /// Managed skill the apply targets.
     pub skill: ManagedSkillRef,
-    /// Upstream URL the revision is checked out from.
+    /// Upstream URL the update check observed for the revision.
+    ///
+    /// A revision apply checks out this URL, so the apply fetches the source
+    /// the check or plan document saw instead of whatever the install record
+    /// happens to name now.
     pub source_url: String,
     /// Immutable revision the apply moves to.
     pub target_revision: String,
@@ -1844,10 +1846,7 @@ pub fn build_update_mutation_plan(
                 crate::materialize::sync_mutation_root_paths(
                     &scoped_context,
                     &manifest,
-                    match target.skill.scope {
-                        ManagedScope::Workspace => crate::adapter::TargetScope::Workspace,
-                        ManagedScope::User => crate::adapter::TargetScope::User,
-                    },
+                    crate::adapter::TargetScope::from(target.skill.scope),
                 )?,
                 TargetAction::Replace,
             );
@@ -1914,10 +1913,7 @@ pub(crate) fn build_edit_repair_mutation_plan(
                 crate::materialize::sync_mutation_root_paths(
                     &scoped_context,
                     &manifest,
-                    match target.skill.scope {
-                        ManagedScope::Workspace => crate::adapter::TargetScope::Workspace,
-                        ManagedScope::User => crate::adapter::TargetScope::User,
-                    },
+                    crate::adapter::TargetScope::from(target.skill.scope),
                 )?,
                 TargetAction::Replace,
             );
@@ -2064,18 +2060,26 @@ pub fn run_update_apply(
     }
 
     // Fork detaches into local canonical ownership, which is its own guarded
-    // mutation, so it runs instead of a revision apply.
+    // mutation, so it runs instead of a revision apply. The fork moves the
+    // unrecorded edits of every generated copy into its overlay and merges
+    // them into the local canonical copy inside that one transaction, so a
+    // fork that fails leaves no declared overlay behind.
     if strategy == ApplyStrategy::Fork {
         for target in targets {
-            // The fork rebuilds the skill from the stored import, so any
-            // unrecorded edits in its generated copies are moved into the
-            // overlay first. The overlay then flows into the local canonical
-            // copy, which keeps the edits instead of dropping them.
-            preserve_edits_before_detach(context, &target.skill, &mut report)?;
-            let response = crate::overlay::handle_fork(
+            let (response, preservation) = crate::overlay::run_fork(
                 context,
                 crate::overlay::ForkRequest::new(target.skill.skill_id.clone()),
             )?;
+            for file in &preservation.preserved {
+                report.preserved.push(PreservedCopy {
+                    path: format!("{}/{file}", preservation.overlay_root),
+                    skill: Some(target.skill.skill_id.clone()),
+                    reason: "moved-to-overlay".to_string(),
+                    detail: OVERLAY_PRESERVED_DETAIL.to_string(),
+                    repair: overlay_preserved_repair(target.skill.scope),
+                });
+            }
+            report.discarded.extend(preservation.replaced);
             report.applied.push(AppliedUpdate {
                 skill: target.skill.skill_id.clone(),
                 scope: target.skill.scope,
@@ -2117,6 +2121,33 @@ pub fn run_update_apply(
 
         let plan = build_update_mutation_plan(context, target, strategy)?;
         let timestamp = current_timestamp();
+
+        // The staged revision is what the trust gate evaluates, so it is
+        // acquired before the guarded transaction opens and the gate decides
+        // on the tree the apply would install. Staging clones the git source
+        // or fetches the discovery artifact over the network, so it must not
+        // run while the coordination lock is held: a download that outlasts
+        // the lock timeout would fail every other command while this one is
+        // healthy. The guarded closure re-reads the install record under the
+        // lock, and the plan verification re-checks the pre-state, so a
+        // workspace that moved underneath the staged tree refuses before
+        // anything changes.
+        let staging_store = LocalStateStore::open_default_for(&context.working_directory)?;
+        let staging_install = staging_store
+            .install_record(&target.skill)?
+            .ok_or_else(|| AppError::ResolutionValidation {
+                message: format!(
+                    "skill '{}' does not have an installed state record",
+                    target.skill.skill_id
+                ),
+            })?;
+        ensure_update_supported(&staging_install, &target.target_revision)?;
+        let staged = stage_incoming_revision(
+            &staging_install,
+            &target.source_url,
+            &target.target_revision,
+        )?;
+
         let mut outcome_report: Option<AppliedUpdate> = None;
 
         run_guarded(&plan, context, |transaction| {
@@ -2136,10 +2167,9 @@ pub fn run_update_apply(
             })?;
             ensure_update_supported(&install, &target.target_revision)?;
 
-            // The staged revision is what the trust gate evaluates, so it is
-            // acquired before the first write and the gate decides on the tree
-            // the apply would install.
-            let staged = stage_incoming_revision(&install, &target.target_revision)?;
+            // The staged revision was acquired before the transaction opened,
+            // so the gate decides on the tree the apply would install and the
+            // download never ran under the coordination lock.
             ensure_revision_apply_is_allowed(
                 context,
                 &store,
@@ -2172,12 +2202,13 @@ pub fn run_update_apply(
                 }
                 ApplyStrategy::Overlay => {
                     for drift in &dirty {
-                        let preserved_files = preserve_edits_as_overlay(
+                        let preservation = preserve_edits_as_overlay(
                             context,
                             transaction,
                             &mut manifest,
                             &target.skill,
                             &drift.path,
+                            OverlayPurpose::Managed,
                         )?;
                         // The edits now live in the overlay, so the generated
                         // copy is rebuilt from the new effective content. The
@@ -2188,7 +2219,7 @@ pub fn run_update_apply(
                             .overlay_path_for(&target.skill.skill_id)
                             .as_str()
                             .to_owned();
-                        for file in preserved_files {
+                        for file in &preservation.preserved {
                             report.preserved.push(PreservedCopy {
                                 path: format!("{overlay_root}/{file}"),
                                 skill: Some(target.skill.skill_id.clone()),
@@ -2197,6 +2228,7 @@ pub fn run_update_apply(
                                 repair: overlay_preserved_repair(target.skill.scope),
                             });
                         }
+                        report.discarded.extend(preservation.replaced);
                     }
                 }
                 ApplyStrategy::Discard | ApplyStrategy::Fork | ApplyStrategy::Skip => {}
@@ -2405,12 +2437,13 @@ fn apply_edit_repair(
             }
             ApplyStrategy::Overlay => {
                 for drift in &dirty {
-                    let preserved_files = preserve_edits_as_overlay(
+                    let preservation = preserve_edits_as_overlay(
                         context,
                         transaction,
                         &mut manifest,
                         &target.skill,
                         &drift.path,
+                        OverlayPurpose::Managed,
                     )?;
                     // The edits now live in the overlay, so the generated copy
                     // is rebuilt from the new effective content.
@@ -2419,7 +2452,7 @@ fn apply_edit_repair(
                         .overlay_path_for(&target.skill.skill_id)
                         .as_str()
                         .to_owned();
-                    for file in &preserved_files {
+                    for file in &preservation.preserved {
                         report.preserved.push(PreservedCopy {
                             path: format!("{overlay_root}/{file}"),
                             skill: Some(target.skill.skill_id.clone()),
@@ -2428,7 +2461,8 @@ fn apply_edit_repair(
                             repair: overlay_preserved_repair(target.skill.scope),
                         });
                     }
-                    if !preserved_files.is_empty() {
+                    report.discarded.extend(preservation.replaced);
+                    if !preservation.preserved.is_empty() {
                         overlay_created = Some(overlay_root);
                     }
                 }
@@ -2584,81 +2618,58 @@ fn ensure_edit_repair_supported(
     }
 }
 
-/// Move the unrecorded edits of one skill into its managed overlay.
+/// Edits a fork ferried into the managed overlay before it detached.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ForkEditPreservation {
+    /// Workspace-relative overlay root the edits moved through.
+    pub(crate) overlay_root: String,
+    /// Overlay-relative paths whose edits moved into the overlay.
+    pub(crate) preserved: Vec<String>,
+    /// Overlay variants a different edit replaced, backed up durably.
+    pub(crate) replaced: Vec<DiscardedCopy>,
+}
+
+/// Move the unrecorded edits of every generated copy of one skill into the
+/// overlay its fork is about to merge.
 ///
-/// This prepares a detach or fork, which rebuilds the skill from the stored
-/// import: without this step the edits in a generated copy would be dropped.
-/// The step runs as its own guarded mutation, so a later failure leaves the
-/// import managed with the edits safely recorded as overlay content.
-fn preserve_edits_before_detach(
+/// Both fork entries — `skillctl fork <skill>` and `update --apply --strategy
+/// fork` — call this from inside the guarded transaction that performs the
+/// fork, so one conflict-aware move, one deletion refusal, and one commit
+/// boundary serve them. The overlay writes ride the fork's own transaction, so
+/// a fork that fails later rolls them back instead of leaving a declared
+/// overlay the resolver cannot map.
+pub(crate) fn preserve_edits_for_fork(
     context: &AppContext,
+    transaction: &mut LifecycleTransaction,
+    manifest: &mut WorkspaceManifest,
     skill: &ManagedSkillRef,
-    report: &mut UpdateApplyReport,
-) -> Result<(), AppError> {
-    let manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
-    let dirty = dirty_projection_copies(context, &manifest, skill)?;
-    if dirty.is_empty() {
-        return Ok(());
+) -> Result<ForkEditPreservation, AppError> {
+    let mut preservation = ForkEditPreservation::default();
+    // A fork installs exactly the stored bytes it finds, and the divergence
+    // repair names the standalone fork as the way to keep changed bytes, so
+    // this scan reports on the store as it is instead of refusing on it.
+    for drift in dirty_projection_copies_with_divergence(
+        context,
+        manifest,
+        skill,
+        resolver::StoreDivergencePolicy::Report,
+    )? {
+        let moved = preserve_edits_as_overlay(
+            context,
+            transaction,
+            manifest,
+            skill,
+            &drift.path,
+            OverlayPurpose::Detach,
+        )?;
+        preservation.preserved.extend(moved.preserved);
+        preservation.replaced.extend(moved.replaced);
     }
-
-    let store = LocalStateStore::open_default_for(&context.working_directory)?;
-    let install = store
-        .install_record(skill)?
-        .ok_or_else(|| AppError::ResolutionValidation {
-            message: format!(
-                "skill '{}' does not have an installed state record",
-                skill.skill_id
-            ),
-        })?;
-    let expected = capture_expected_import(context, &install)?;
-    let overlay_path = manifest.overlay_path_for(&skill.skill_id);
-    let plan = MutationPlanBuilder::new(MutationOperation::Override, &context.working_directory)
-        .skill(skill.clone())
-        .expect_import(expected)
-        .propose(ProposedImport {
-            import_id: skill.skill_id.clone(),
-            revision: None,
-            bundle_digest: None,
-            bundle_policy: BundlePolicy::Preserve,
-            summary: format!(
-                "move the unrecorded edits of '{}' into the overlay before detaching",
-                skill.skill_id
-            ),
-        })
-        .target(manifest.path, TargetAction::Update)
-        .target(
-            context
-                .working_directory
-                .join(overlay_path.as_str())
-                .join(&skill.skill_id),
-            TargetAction::Create,
-        )
-        .seal();
-
-    run_guarded(&plan, context, |transaction| {
-        let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
-        for drift in &dirty {
-            let preserved_files =
-                preserve_edits_as_overlay(context, transaction, &mut manifest, skill, &drift.path)?;
-            let overlay_root = manifest
-                .overlay_path_for(&skill.skill_id)
-                .as_str()
-                .to_owned();
-            for file in preserved_files {
-                report.preserved.push(PreservedCopy {
-                    path: format!("{overlay_root}/{file}"),
-                    skill: Some(skill.skill_id.clone()),
-                    reason: "moved-to-overlay".to_string(),
-                    detail: OVERLAY_PRESERVED_DETAIL.to_string(),
-                    repair: overlay_preserved_repair(skill.scope),
-                });
-            }
-        }
-        manifest.write_to_path()?;
-        transaction.checkpoint("after-state")?;
-
-        Ok(())
-    })
+    preservation.overlay_root = manifest
+        .overlay_path_for(&skill.skill_id)
+        .as_str()
+        .to_owned();
+    Ok(preservation)
 }
 
 /// Copy one sync report's drift outcome into an apply report.
@@ -2723,18 +2734,20 @@ impl StagedRevision {
 
 /// Stage the incoming revision one apply target moves an import to.
 ///
-/// A git import checks out the revision its remote names. A well-known import
-/// re-reads the discovery index, requires the entry it now declares to still
-/// name the digest the check saw, and stages the artifact that digest
-/// verifies, so an index that moved again refuses the apply instead of
-/// installing content the check never saw.
+/// A git import checks out the revision its remote names, from the URL the
+/// update check observed (`observed_source_url`). A well-known import re-reads
+/// the discovery index, requires the entry it now declares to still name the
+/// digest the check saw, and stages the artifact that digest verifies, so an
+/// index that moved again refuses the apply instead of installing content the
+/// check never saw.
 fn stage_incoming_revision(
     install: &InstallRecord,
+    observed_source_url: &str,
     target_revision: &str,
 ) -> Result<StagedRevision, AppError> {
     match install.source_kind {
         crate::source::SourceKind::Git => Ok(StagedRevision::Git(
-            crate::history::checkout_git_revision(&install.source_url, target_revision)?,
+            crate::history::checkout_git_revision(observed_source_url, target_revision)?,
         )),
         crate::source::SourceKind::WellKnown => Ok(StagedRevision::WellKnown(
             crate::source::stage_well_known_revision(install, target_revision)?,
@@ -2833,16 +2846,34 @@ fn dirty_projection_copies(
     manifest: &WorkspaceManifest,
     skill: &ManagedSkillRef,
 ) -> Result<Vec<ProjectionDrift>, AppError> {
+    dirty_projection_copies_with_divergence(
+        context,
+        manifest,
+        skill,
+        crate::materialize::store_divergence_policy(manifest),
+    )
+}
+
+/// [`dirty_projection_copies`] with an explicit store-divergence policy.
+///
+/// A fork passes [`resolver::StoreDivergencePolicy::Report`], because it
+/// installs exactly the stored bytes it finds and the divergence repair names
+/// the fork as the way to keep them. Every other caller keeps the mode-derived
+/// policy, which refuses a diverged copy-mode store before an update touches
+/// it.
+fn dirty_projection_copies_with_divergence(
+    context: &AppContext,
+    manifest: &WorkspaceManifest,
+    skill: &ManagedSkillRef,
+    divergence: resolver::StoreDivergencePolicy,
+) -> Result<Vec<ProjectionDrift>, AppError> {
     let scoped_context = crate::history::context_for_scope(context, skill.scope);
     let roots = crate::materialize::edit_repair_root_paths(
         &scoped_context,
         manifest,
-        match skill.scope {
-            ManagedScope::Workspace => crate::adapter::TargetScope::Workspace,
-            ManagedScope::User => crate::adapter::TargetScope::User,
-        },
+        crate::adapter::TargetScope::from(skill.scope),
     )?;
-    let desired = desired_copy_digest(context, manifest, skill)?;
+    let desired = desired_copy_digest_with_divergence(context, manifest, skill, divergence)?;
 
     let mut drift = Vec::new();
     for root in roots {
@@ -2869,19 +2900,20 @@ fn dirty_projection_copies(
 /// projection hashes its link targets instead of its content. A disabled import
 /// resolves to no candidate, so its copies carry no baseline and stay judged by
 /// the digest they record alone.
-fn desired_copy_digest(
+/// Content digest the next materialization of one import records.
+fn desired_copy_digest_with_divergence(
     context: &AppContext,
     manifest: &WorkspaceManifest,
     skill: &ManagedSkillRef,
+    divergence: resolver::StoreDivergencePolicy,
 ) -> Result<Option<String>, AppError> {
     let lockfile = load_lockfile(&context.working_directory)?;
     let request = resolver::ResolveWorkspaceRequest::new(
         &context.working_directory,
-        crate::source::imports_store_root()?,
         manifest.clone(),
         lockfile,
     )
-    .with_store_divergence_policy(crate::materialize::store_divergence_policy(manifest));
+    .with_store_divergence_policy(divergence);
     let graph = resolver::build_effective_skill_graph(&request)?;
     let scope = match skill.scope {
         ManagedScope::Workspace => SkillScope::Workspace,
@@ -2904,14 +2936,46 @@ fn desired_copy_digest(
         .transpose()
 }
 
+/// Why unrecorded edits move into the managed overlay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OverlayPurpose {
+    /// The import stays managed after the move, so a sync resolves the overlay
+    /// inside the same transaction: every preserved file must map to an
+    /// imported file, because the resolver refuses an overlay file without a
+    /// base.
+    Managed,
+    /// The skill detaches right after the move, so the overlay only ferries
+    /// the edits into the local canonical copy before it is removed.
+    Detach,
+}
+
+/// Outcome of moving one dirty copy's edits into the managed overlay.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct OverlayPreservation {
+    /// Relative paths whose edits now live in the overlay.
+    preserved: Vec<String>,
+    /// Overlay variants a different edit replaced, backed up durably so the
+    /// losing edit stays recoverable.
+    replaced: Vec<DiscardedCopy>,
+}
+
 /// Move the edited files of one generated copy into the managed overlay.
+///
+/// Every copy of one skill shares the overlay root, so two copies that edited
+/// the same file differently would each claim the overlay's copy of it, and a
+/// later copy would silently overwrite the earlier edit. The move refuses an
+/// overlay a sync cannot resolve — a file the import does not provide, or a
+/// file the copy deleted that an overlay entry cannot express — and when one
+/// overlay file would hold two different edits, the variant already in the
+/// overlay is backed up durably before the newer edit replaces it.
 fn preserve_edits_as_overlay(
     context: &AppContext,
     transaction: &mut LifecycleTransaction,
     manifest: &mut WorkspaceManifest,
     skill: &ManagedSkillRef,
     dirty_dir: &Path,
-) -> Result<Vec<String>, AppError> {
+    purpose: OverlayPurpose,
+) -> Result<OverlayPreservation, AppError> {
     let overlay_path = manifest
         .overrides
         .get(&skill.skill_id)
@@ -2928,18 +2992,73 @@ fn preserve_edits_as_overlay(
     let source_root = stored_import_root(skill.scope, &context.working_directory, &skill.skill_id)?
         .join(import_subpath(manifest, skill)?);
 
-    let mut preserved = Vec::new();
-    let mut files = Vec::new();
-    collect_projection_files_for_overlay(dirty_dir, Path::new(""), &mut files)?;
-    files.sort();
-    for relative in files {
+    let mut copy_files = Vec::new();
+    collect_projection_files_for_overlay(dirty_dir, Path::new(""), &mut copy_files)?;
+    copy_files.sort();
+    let mut import_files = Vec::new();
+    collect_projection_files_for_overlay(&source_root, Path::new(""), &mut import_files)?;
+    import_files.sort();
+
+    // A file only the copy holds has no imported base an overlay entry could
+    // replace, and the resolver refuses an overlay file without a base, so a
+    // managed apply must refuse it before the in-transaction sync meets an
+    // overlay it cannot resolve. A detach keeps it: the overlay only ferries
+    // the content into the local canonical copy.
+    let unmanaged: Vec<PathBuf> = copy_files
+        .iter()
+        .filter(|file| !import_files.contains(file))
+        .cloned()
+        .collect();
+    if purpose == OverlayPurpose::Managed && !unmanaged.is_empty() {
+        return Err(AppError::DirtyContent {
+            path: dirty_dir.join(unmanaged.first().cloned().unwrap_or_default()),
+            message: format!(
+                "the copy holds files the imported skill does not provide ({}), which the \
+                 managed overlay cannot map; run 'skillctl update {} --apply --strategy fork' to \
+                 keep them as local ownership, or 'skillctl update {} --apply --strategy \
+                 discard' to back them up and drop them",
+                quoted_relative_names(&unmanaged),
+                skill.skill_id,
+                skill.skill_id
+            ),
+        });
+    }
+
+    // An overlay entry replaces a file, so a deletion cannot survive the move:
+    // the copy is rebuilt from the import and the deleted file returns. The
+    // refusal names the deletion instead of silently reverting the edit.
+    let deleted: Vec<PathBuf> = import_files
+        .iter()
+        .filter(|file| !copy_files.contains(file))
+        .cloned()
+        .collect();
+    if !deleted.is_empty() {
+        return Err(AppError::DirtyContent {
+            path: dirty_dir.to_path_buf(),
+            message: format!(
+                "the copy deletes files the imported skill still provides ({}), which the \
+                 managed overlay cannot express; restore the files and re-run, or run 'skillctl \
+                 update {} --apply --strategy discard' to back the edits up and drop them",
+                quoted_relative_names(&deleted),
+                skill.skill_id
+            ),
+        });
+    }
+
+    let mut preservation = OverlayPreservation::default();
+    let mut conflict_backup: Option<PathBuf> = None;
+    for relative in copy_files {
         let edited = dirty_dir.join(&relative);
         let upstream = source_root.join(&relative);
-        let differs = match fs::read(&upstream) {
-            Ok(upstream_contents) => {
-                fs::read(&edited).map_or(true, |contents| contents != upstream_contents)
-            }
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => true,
+        let edited_contents =
+            fs::read(&edited).map_err(|source| AppError::FilesystemOperation {
+                action: "read edited file for overlay preservation",
+                path: edited.clone(),
+                source,
+            })?;
+        let base_contents = match fs::read(&upstream) {
+            Ok(contents) => Some(contents),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
             Err(source) => {
                 return Err(AppError::FilesystemOperation {
                     action: "read imported file for overlay comparison",
@@ -2948,11 +3067,64 @@ fn preserve_edits_as_overlay(
                 });
             }
         };
+        let differs = match &base_contents {
+            Some(base) => *base != edited_contents,
+            // A file without an imported base is unmanaged content a detach
+            // still ferries into the local canonical copy.
+            None => true,
+        };
         if !differs {
             continue;
         }
 
         let destination = overlay_root.join(&relative);
+        let incumbent = match fs::read(&destination) {
+            Ok(contents) => Some(contents),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+            Err(source) => {
+                return Err(AppError::FilesystemOperation {
+                    action: "read overlay file for conflict comparison",
+                    path: destination,
+                    source,
+                });
+            }
+        };
+        if let Some(incumbent) = incumbent {
+            if incumbent == edited_contents {
+                // The overlay already holds this edit, so the copy matches the
+                // effective content and nothing needs to move.
+                preservation
+                    .preserved
+                    .push(relative.to_string_lossy().into_owned());
+                continue;
+            }
+            if base_contents.is_none()
+                || base_contents
+                    .as_deref()
+                    .is_some_and(|base| incumbent.as_slice() != base)
+            {
+                // The overlay holds one edit and the copy another, either both
+                // against the same imported file or both user-authored for a
+                // file the import does not provide. The copy's edit wins the
+                // overlay and the replaced variant is backed up durably, so
+                // neither edit is silently discarded.
+                let backup = match conflict_backup.as_ref() {
+                    Some(backup) => backup.clone(),
+                    None => {
+                        let store = DiscardStore::open_default()?;
+                        let backup = store.retain(&overlay_backup_label(skill), &overlay_root)?;
+                        conflict_backup = Some(backup.clone());
+                        backup
+                    }
+                };
+                preservation.replaced.push(DiscardedCopy {
+                    path: crate::planner::display_path(context, &destination),
+                    skill: skill.skill_id.clone(),
+                    backup: backup.display().to_string(),
+                });
+            }
+        }
+
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).map_err(|source| AppError::FilesystemOperation {
                 action: "create overlay parent directory",
@@ -2965,7 +3137,9 @@ fn preserve_edits_as_overlay(
             path: destination,
             source,
         })?;
-        preserved.push(relative.to_string_lossy().into_owned());
+        preservation
+            .preserved
+            .push(relative.to_string_lossy().into_owned());
     }
 
     if !manifest.overrides.contains_key(&skill.skill_id) {
@@ -2974,7 +3148,21 @@ fn preserve_edits_as_overlay(
             .insert(skill.skill_id.clone(), overlay_path);
     }
 
-    Ok(preserved)
+    Ok(preservation)
+}
+
+/// Stable label for the durable backup that keeps a replaced overlay variant.
+fn overlay_backup_label(skill: &ManagedSkillRef) -> String {
+    format!("{}-overlay", skill.skill_id)
+}
+
+/// Quote a list of relative paths for a refusal that names the files.
+fn quoted_relative_names(files: &[PathBuf]) -> String {
+    files
+        .iter()
+        .map(|file| format!("'{}'", file.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn import_subpath(
@@ -3413,7 +3601,6 @@ mod tests {
         assert_eq!(diff.added, vec!["new.md".to_string()]);
         assert_eq!(diff.removed, vec!["old.md".to_string()]);
         assert_eq!(diff.modified, vec!["SKILL.md".to_string()]);
-        assert_eq!(diff.describe(), "+1 -1 ~1");
     }
 
     #[test]
@@ -3429,5 +3616,42 @@ mod tests {
                 "the serialized form must match the reported identifier"
             );
         }
+    }
+
+    #[test]
+    fn a_retained_backup_never_refuses_an_existing_destination() {
+        let root = std::env::temp_dir().join(format!(
+            "skillctl-retain-test-{}-{}",
+            std::process::id(),
+            current_timestamp()
+        ));
+        let store = DiscardStore { root: root.clone() };
+
+        let source = root.join("source");
+        fs::create_dir_all(&source).expect("source tree exists");
+        fs::write(source.join("SKILL.md"), "edited").expect("source file exists");
+
+        // Occupy the exact name the first retain would compute, the way a
+        // pinned clock (SOURCE_DATE_EPOCH) plus a repeated process id does.
+        let occupied = store.root.join("test-skill").join(format!(
+            "{}-{}",
+            current_timestamp(),
+            std::process::id()
+        ));
+        fs::create_dir_all(&occupied).expect("colliding backup name exists");
+
+        let backup = store
+            .retain("test-skill", &source)
+            .expect("an occupied name counts up instead of refusing");
+        assert_ne!(backup, occupied, "the backup moved to a free name");
+        assert!(
+            fs::read_to_string(backup.join("SKILL.md"))
+                .expect("the backup holds the tree")
+                .contains("edited"),
+            "the retained content is intact at {}",
+            backup.display()
+        );
+
+        fs::remove_dir_all(&root).ok();
     }
 }

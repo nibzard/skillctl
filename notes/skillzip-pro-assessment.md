@@ -34,7 +34,7 @@ targets. The mapping:
 | Paper concept | `skillctl` equivalent |
 |---|---|
 | Transient mode: canonical bundle stays byte-identical, per-run view is compressed | Compress in `src/materialize.rs` at projection time. Never touch the canonical copy. Matches the rule "edit canonical skills or overlays, not generated runtime copies". |
-| Continual mode: re-compress after each evolution patch | The `update` flow for pinned skills in `skills-lock.json`. Re-apply compression as a deterministic step. |
+| Continual mode: re-compress after each evolution patch | The `update` flow for pinned skills in `.agents/skillctl.lock`. Re-apply compression as a deterministic step. |
 | Routing preservation audit | `skillctl doctor`. It already walks projections. Add a check: every path `SKILL.md` references must resolve in the projected tree. |
 | Entry contracts (private, public, conditional) | No current equivalent. Overlays or lockfile metadata could store them. |
 
@@ -72,7 +72,7 @@ References:
   - `src/materialize.rs`
   - `src/planner.rs`
   - `src/doctor.rs`
-  - `skills-lock.json`
+  - `.agents/skillctl.lock`
 - External:
   - https://academy.dair.ai/papers/skillzip-pro-execution-aware-dynamic-compression-of-progressively-loaded-skills-2608.30785
   - arXiv 2608.30785

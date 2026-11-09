@@ -5,7 +5,7 @@ use std::{
     env,
     ffi::OsStr,
     fs::{self, File},
-    io::{self, IsTerminal, Read, Write},
+    io::{self, IsTerminal, Read, Seek, Write},
     path::{Component, Path, PathBuf},
     process::Command,
 };
@@ -95,6 +95,21 @@ pub enum SourceKind {
     WellKnown,
 }
 
+impl SourceKind {
+    /// Stable label of this kind, shared by every surface that names one.
+    ///
+    /// The labels match the lockfile `source.type` values, so one kind prints
+    /// one label wherever a source kind is reported.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Git => "git",
+            Self::LocalPath => "local-path",
+            Self::Archive => "archive",
+            Self::WellKnown => "well-known",
+        }
+    }
+}
+
 /// Unnormalized install source definition from the CLI.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstallSource {
@@ -142,13 +157,23 @@ pub struct SourceRevision {
     pub upstream: Option<String>,
 }
 
+/// Shortest reference shape treated as an abbreviated commit sha.
+///
+/// Git itself never abbreviates a commit below seven hexadecimal characters.
+/// Shorter all-hex strings (`b`, `0`, `2023`) are ordinary branch and tag names
+/// git accepts, so treating one as a sha would freeze a movable ref whenever
+/// its name happens to prefix the resolved revision.
+const MINIMUM_COMMIT_ABBREVIATION: usize = 7;
+
 /// Whether `reference` names the resolved commit itself rather than a movable ref.
 ///
-/// A full or abbreviated git commit sha is hexadecimal and a prefix of the
+/// A full or abbreviated git commit sha is hexadecimal, at least
+/// [`MINIMUM_COMMIT_ABBREVIATION`] characters long, and a prefix of the
 /// resolved revision. Such a reference is immutable, so a source can never
 /// report a newer revision for it.
 fn reference_names_commit(reference: &str, resolved_revision: &str) -> bool {
     !reference.is_empty()
+        && reference.len() >= MINIMUM_COMMIT_ABBREVIATION
         && reference.len() <= resolved_revision.len()
         && resolved_revision.starts_with(reference)
         && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -342,14 +367,6 @@ struct InstallOperation {
 struct InstallBuildContext<'a> {
     working_directory: &'a Path,
     manifest: &'a WorkspaceManifest,
-}
-
-/// Inspect, normalize, and stage an install source before later lifecycle steps.
-pub fn inspect_install_source(
-    working_directory: &Path,
-    request: &InstallRequest,
-) -> Result<InstallInspection, AppError> {
-    Ok(prepare_install_source_at(working_directory, request)?.inspection())
 }
 
 /// Handle `skillctl install`.
@@ -588,39 +605,6 @@ fn prepare_install_source_with(
         discovery,
         origin_warning,
         selected_skill_name,
-        _staging_dir: prepared._staging_dir,
-    })
-}
-
-/// Resolve and stage an install source from a working directory alone.
-///
-/// Sources that need a selector to stage anything, such as a well-known index,
-/// are refused here: this path stages a whole source, so it cannot choose one
-/// index entry.
-fn prepare_install_source_at(
-    working_directory: &Path,
-    request: &InstallRequest,
-) -> Result<PreparedInstall, AppError> {
-    let resolved = resolve_install_source(&request.source, working_directory)?;
-    if resolved.normalized.kind == SourceKind::WellKnown {
-        return Err(source_validation(
-            &resolved.normalized.raw,
-            "a well-known discovery index stages one declared entry at a time, and this path \
-             cannot select one; run 'skillctl install <url> --name <skill>' instead",
-        ));
-    }
-
-    let prepared = prepare_source(&resolved)?;
-    let candidates = detect_install_candidates(&prepared.root, &prepared.source.raw)?;
-
-    Ok(PreparedInstall {
-        source: prepared.source,
-        revision: prepared.revision,
-        candidates,
-        root: prepared.root,
-        discovery: None,
-        origin_warning: None,
-        selected_skill_name: None,
         _staging_dir: prepared._staging_dir,
     })
 }
@@ -1080,7 +1064,7 @@ fn validate_install_selection(
                         expected: "directory",
                     });
                 }
-                Ok(_) if !is_skillctl_generated_directory(&existing_path)? => {
+                Ok(_) if !materialize::is_skillctl_generated_directory(&existing_path)? => {
                     return Err(source_validation(
                         source.raw.clone(),
                         format!(
@@ -1438,9 +1422,7 @@ fn install_summary(installed: &[InstalledSkill], sync_report: &MaterializationRe
 }
 
 pub(crate) fn imports_store_root() -> Result<PathBuf, AppError> {
-    env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
+    crate::state::resolve_home_directory()
         .map(|path| path.join(".skillctl/store/imports"))
         .ok_or(AppError::HomeDirectoryUnavailable)
 }
@@ -1466,7 +1448,27 @@ pub(crate) fn stored_import_root(
     Ok(imports_scope_root(scope, working_directory)?.join(import_id))
 }
 
+/// The runtime clock every state-store writer stamps records with.
+///
+/// This clock always reports real time. A build-determinism variable such as
+/// `SOURCE_DATE_EPOCH` must not freeze the audit clock, because rows written
+/// under a leaked variable would carry one fixed instant forever; see
+/// [`deterministic_timestamp`] for the one writer that wants determinism.
 pub(crate) fn current_timestamp() -> String {
+    let format = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
+
+    OffsetDateTime::now_utc()
+        .format(format)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+/// Build-deterministic timestamp for projection metadata.
+///
+/// Projection metadata is the only writer whose output is committed next to
+/// the content it describes, so its `generated_at` honors `SOURCE_DATE_EPOCH`
+/// to keep two runs of one build byte-identical. When the variable is absent
+/// or unusable, the real clock applies.
+pub(crate) fn deterministic_timestamp() -> String {
     let format = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
 
     if let Some(value) = env::var_os("SOURCE_DATE_EPOCH")
@@ -1477,9 +1479,7 @@ pub(crate) fn current_timestamp() -> String {
         return formatted;
     }
 
-    OffsetDateTime::now_utc()
-        .format(format)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+    current_timestamp()
 }
 
 pub(crate) fn compute_effective_version_hash(
@@ -1531,31 +1531,6 @@ fn scope_label(scope: TargetScope) -> &'static str {
         TargetScope::Workspace => "workspace",
         TargetScope::User => "user",
     }
-}
-
-fn is_skillctl_generated_directory(path: &Path) -> Result<bool, AppError> {
-    let metadata_path = path.join(materialize::PROJECTION_METADATA_FILE);
-    let contents = match fs::read_to_string(&metadata_path) {
-        Ok(contents) => contents,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(source) => {
-            return Err(AppError::FilesystemOperation {
-                action: "read projection metadata",
-                path: metadata_path,
-                source,
-            });
-        }
-    };
-    let parsed = serde_json::from_str::<serde_json::Value>(&contents).map_err(|source| {
-        AppError::MaterializationValidation {
-            message: format!(
-                "projection metadata '{}' is invalid JSON: {source}",
-                metadata_path.display()
-            ),
-        }
-    })?;
-
-    Ok(parsed.get("tool").and_then(|value| value.as_str()) == Some("skillctl"))
 }
 
 fn plural_suffix(count: usize) -> &'static str {
@@ -1816,6 +1791,13 @@ fn prepare_archive(source: &ResolvedInstallSource) -> Result<PreparedSource, App
     })
 }
 
+/// Clone the source's current default branch into a throwaway staging clone.
+///
+/// Staging lives in a [`TempDir`], so every ordinary failure removes the clone
+/// on return. A signal that kills the process mid-acquisition bypasses that
+/// cleanup, because skillctl registers no signal handlers; the partial clone a
+/// Ctrl-C leaves behind in the system temporary directory has to be removed by
+/// hand.
 fn prepare_git(source: &ResolvedInstallSource) -> Result<PreparedSource, AppError> {
     let staging_dir = TempDir::new().map_err(|source| AppError::FilesystemOperation {
         action: "create git staging directory",
@@ -1824,8 +1806,7 @@ fn prepare_git(source: &ResolvedInstallSource) -> Result<PreparedSource, AppErro
     })?;
     let checkout_path = staging_dir.path().join("checkout");
 
-    run_external_command(
-        "git",
+    run_git_transport_command(
         &[
             OsStr::new("clone"),
             OsStr::new("--quiet"),
@@ -1835,15 +1816,14 @@ fn prepare_git(source: &ResolvedInstallSource) -> Result<PreparedSource, AppErro
             checkout_path.as_os_str(),
         ],
         None,
-        Some(&source.normalized.raw),
+        &source.normalized.url,
         "git clone failed",
     )?;
 
-    let resolved = run_external_command(
-        "git",
+    let resolved = run_git_command(
         &[OsStr::new("rev-parse"), OsStr::new("HEAD")],
         Some(&checkout_path),
-        Some(&source.normalized.raw),
+        &source.normalized.raw,
         "failed to resolve cloned git revision",
     )?;
 
@@ -1904,7 +1884,11 @@ pub(crate) fn stage_discovered_artifact(
 /// Write one verified `skill-md` artifact into the direct-skill packaging root.
 ///
 /// The staged `SKILL.md` has to declare the name the discovery index declared
-/// for the entry, because that name is what a later install pins.
+/// for the entry, because that name is what a later install pins. The staging
+/// directory carries exactly the index-declared name, so
+/// [`SkillDefinition::load_from_dir`] enforces that equality: its
+/// directory-name validation rejects a manifest that declares any other name,
+/// and that load error is the rejection users see.
 fn stage_discovered_skill_md(
     artifact: &crate::discovery::FetchedArtifact,
     staged_root: &Path,
@@ -1924,23 +1908,12 @@ fn stage_discovered_skill_md(
         source,
     })?;
 
-    let staged = SkillDefinition::load_from_dir(&skill_root).map_err(|error| {
+    SkillDefinition::load_from_dir(&skill_root).map_err(|error| {
         artifact_rejection(
             artifact,
             format!("the fetched SKILL.md is not valid: {error}"),
         )
     })?;
-    if staged.name.as_str() != artifact.name {
-        return Err(artifact_rejection(
-            artifact,
-            format!(
-                "the fetched SKILL.md declares the name '{}', which does not match the name '{}' \
-                 the discovery index declares",
-                staged.name.as_str(),
-                artifact.name
-            ),
-        ));
-    }
 
     Ok(())
 }
@@ -2216,6 +2189,12 @@ fn acquire_locked_well_known_with_transport(
 }
 
 /// Clone exactly one commit, refusing every substitute for it.
+///
+/// Staging lives in a [`TempDir`], so every ordinary failure removes the clone
+/// on return. A signal that kills the process mid-acquisition bypasses that
+/// cleanup, because skillctl registers no signal handlers; the partial clone a
+/// Ctrl-C leaves behind in the system temporary directory has to be removed by
+/// hand.
 fn acquire_git_revision(url: &str, revision: &str, raw: &str) -> Result<PreparedSource, AppError> {
     let staging_dir = TempDir::new().map_err(|source| AppError::FilesystemOperation {
         action: "create locked git staging directory",
@@ -2224,19 +2203,17 @@ fn acquire_git_revision(url: &str, revision: &str, raw: &str) -> Result<Prepared
     })?;
     let checkout_path = staging_dir.path().join("checkout");
 
-    run_external_command(
-        "git",
+    run_git_command(
         &[
             OsStr::new("init"),
             OsStr::new("--quiet"),
             checkout_path.as_os_str(),
         ],
         None,
-        Some(raw),
+        raw,
         "git init failed",
     )?;
-    run_external_command(
-        "git",
+    run_git_command(
         &[
             OsStr::new("remote"),
             OsStr::new("add"),
@@ -2244,14 +2221,13 @@ fn acquire_git_revision(url: &str, revision: &str, raw: &str) -> Result<Prepared
             OsStr::new(url),
         ],
         Some(&checkout_path),
-        Some(raw),
+        raw,
         "failed to register the locked git source",
     )?;
 
     // Some servers refuse to serve an arbitrary object by name. Fall back to a
     // full fetch, then check out the locked commit from whatever arrived.
-    let fetched_by_revision = run_external_command(
-        "git",
+    let fetched_by_revision = run_git_transport_command(
         &[
             OsStr::new("fetch"),
             OsStr::new("--quiet"),
@@ -2261,19 +2237,18 @@ fn acquire_git_revision(url: &str, revision: &str, raw: &str) -> Result<Prepared
             OsStr::new(revision),
         ],
         Some(&checkout_path),
-        Some(raw),
+        url,
         "git fetch failed",
     );
     if fetched_by_revision.is_err() {
-        run_external_command(
-            "git",
+        run_git_transport_command(
             &[
                 OsStr::new("fetch"),
                 OsStr::new("--quiet"),
                 OsStr::new("origin"),
             ],
             Some(&checkout_path),
-            Some(raw),
+            url,
             "git fetch failed",
         )?;
     }
@@ -2294,8 +2269,7 @@ fn acquire_git_revision(url: &str, revision: &str, raw: &str) -> Result<Prepared
         ));
     }
 
-    run_external_command(
-        "git",
+    run_git_command(
         &[
             OsStr::new("checkout"),
             OsStr::new("--quiet"),
@@ -2303,15 +2277,14 @@ fn acquire_git_revision(url: &str, revision: &str, raw: &str) -> Result<Prepared
             OsStr::new(revision),
         ],
         Some(&checkout_path),
-        Some(raw),
+        raw,
         &format!("failed to check out locked revision {revision} from {url}"),
     )?;
 
-    let resolved = run_external_command(
-        "git",
+    let resolved = run_git_command(
         &[OsStr::new("rev-parse"), OsStr::new("HEAD")],
         Some(&checkout_path),
-        Some(raw),
+        raw,
         "failed to resolve the checked out git revision",
     )?;
     if resolved != revision {
@@ -2351,14 +2324,17 @@ fn git_object_is_present(
     revision: &str,
     raw: &str,
 ) -> Result<bool, AppError> {
-    let output = Command::new("git")
-        .args(["cat-file", "-e", revision])
-        .current_dir(checkout_path)
-        .output()
-        .map_err(|source| AppError::ExternalCommand {
-            command: "git".to_string(),
-            source,
-        })?;
+    let output = git_command(&[
+        OsStr::new("cat-file"),
+        OsStr::new("-e"),
+        OsStr::new(revision),
+    ])
+    .current_dir(checkout_path)
+    .output()
+    .map_err(|source| AppError::ExternalCommand {
+        command: "git".to_string(),
+        source,
+    })?;
 
     match output.status.code() {
         Some(0) => Ok(true),
@@ -2368,7 +2344,7 @@ fn git_object_is_present(
             format!(
                 "git cat-file exited with status {status:?} while checking for revision \
                  {revision}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                bounded_command_stderr(&output.stderr)
             ),
         )),
     }
@@ -2411,10 +2387,11 @@ fn stage_locked_local_source(kind: SourceKind, url: &str) -> Result<PreparedSour
         (kind, is_dir),
         (SourceKind::Archive, false) | (SourceKind::LocalPath, true)
     ) {
+        let actual = if is_dir { "a directory" } else { "a file" };
         return Err(source_validation(
             url,
             format!(
-                "locked source '{}' is {expected} but the recorded source kind no longer matches",
+                "locked source '{}' is {actual}, but the recorded source kind expects {expected}",
                 local_path.display()
             ),
         ));
@@ -2434,7 +2411,10 @@ fn stage_locked_local_source(kind: SourceKind, url: &str) -> Result<PreparedSour
         SourceKind::LocalPath => prepare_local_path(&resolved),
         SourceKind::Git | SourceKind::WellKnown => Err(source_validation(
             url,
-            "the recorded source kind no longer matches a local source",
+            format!(
+                "the recorded source kind '{}' no longer matches a local source",
+                kind.label()
+            ),
         )),
     }
 }
@@ -2648,18 +2628,7 @@ fn extract_archive(path: &Path, destination: &Path, raw_source: &str) -> Result<
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
     {
-        run_external_command(
-            "unzip",
-            &[
-                OsStr::new("-qq"),
-                path.as_os_str(),
-                OsStr::new("-d"),
-                destination.as_os_str(),
-            ],
-            None,
-            Some(raw_source),
-            "archive extraction failed",
-        )?;
+        extract_zip_archive(path, destination, raw_source)?;
     } else {
         run_external_command(
             "tar",
@@ -2670,11 +2639,32 @@ fn extract_archive(path: &Path, destination: &Path, raw_source: &str) -> Result<
                 destination.as_os_str(),
             ],
             None,
-            Some(raw_source),
+            raw_source,
             "archive extraction failed",
         )?;
     }
 
+    Ok(())
+}
+
+/// Unpack a local `.zip` archive in process.
+///
+/// Local archives unpack through the same code the discovery fetch uses, so the
+/// zip-slip, symlink, and size-budget rules apply and no external `unzip` tool
+/// is required. Stock Windows ships no `unzip` binary, while skillctl itself
+/// reads zip archives everywhere it runs.
+fn extract_zip_archive(path: &Path, destination: &Path, raw_source: &str) -> Result<(), AppError> {
+    let archive = File::open(path).map_err(|source| AppError::FilesystemOperation {
+        action: "open local zip archive",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    unpack_zip(
+        archive,
+        destination,
+        &UnpackLimits::default(),
+        &UnpackContext::Local { raw_source },
+    )?;
     Ok(())
 }
 
@@ -2709,21 +2699,35 @@ impl Default for UnpackLimits {
     }
 }
 
-/// The skill and URL a rejected remote artifact is reported with.
-struct UnpackContext<'a> {
-    /// Skill the artifact belongs to.
-    skill: &'a str,
-    /// URL the artifact was fetched from.
-    url: &'a str,
+/// The source one unpacked archive is reported against when it is rejected.
+///
+/// A remote discovery artifact names its skill and URL, while a local install
+/// archive has no index entry and reports against the install source.
+enum UnpackContext<'a> {
+    /// One remote discovery artifact.
+    Remote {
+        /// Skill the artifact belongs to.
+        skill: &'a str,
+        /// URL the artifact was fetched from.
+        url: &'a str,
+    },
+    /// One local install source.
+    Local {
+        /// Raw install source the archive was resolved from.
+        raw_source: &'a str,
+    },
 }
 
 impl UnpackContext<'_> {
-    /// Reject the artifact with `message`.
+    /// Reject the archive with `message`.
     fn reject(&self, message: impl Into<String>) -> AppError {
-        AppError::DiscoveryArtifactRejected {
-            skill: self.skill.to_string(),
-            url: self.url.to_string(),
-            message: message.into(),
+        match self {
+            Self::Remote { skill, url } => AppError::DiscoveryArtifactRejected {
+                skill: skill.to_string(),
+                url: url.to_string(),
+                message: message.into(),
+            },
+            Self::Local { raw_source } => source_validation(raw_source.to_string(), message),
         }
     }
 }
@@ -2778,7 +2782,7 @@ pub(crate) fn unpack_archive_bytes(
     skill: &str,
     url: &str,
 ) -> Result<usize, AppError> {
-    let context = UnpackContext { skill, url };
+    let context = UnpackContext::Remote { skill, url };
     let unpacked = unpack_detected_archive(bytes, destination, limits, &context);
     if unpacked.is_err() {
         // A rejection means the archive is not used, so the bytes it already
@@ -2806,7 +2810,9 @@ fn unpack_detected_archive(
     })?;
 
     match format {
-        RemoteArchiveFormat::Zip => unpack_zip(bytes, destination, limits, context),
+        RemoteArchiveFormat::Zip => {
+            unpack_zip(io::Cursor::new(bytes), destination, limits, context)
+        }
         RemoteArchiveFormat::Tar => unpack_tar(bytes, destination, limits, context),
         RemoteArchiveFormat::TarGzip => {
             let decoder = flate2::read::MultiGzDecoder::new(bytes);
@@ -2815,14 +2821,15 @@ fn unpack_detected_archive(
     }
 }
 
-/// Unpack a ZIP archive that was already verified against its digest.
-fn unpack_zip(
-    bytes: &[u8],
+/// Unpack a ZIP archive that was already verified against its digest, when it
+/// was fetched, or opened from a local file.
+fn unpack_zip<R: Read + Seek>(
+    archive_source: R,
     destination: &Path,
     limits: &UnpackLimits,
     context: &UnpackContext<'_>,
 ) -> Result<usize, AppError> {
-    let mut archive = zip::ZipArchive::new(io::Cursor::new(bytes))
+    let mut archive = zip::ZipArchive::new(archive_source)
         .map_err(|source| context.reject(format!("archive cannot be read as zip: {source}")))?;
     if archive.len() > limits.max_entries {
         return Err(context.reject(format!(
@@ -3396,19 +3403,151 @@ fn relative_path_for_hash(path: &Path) -> Result<String, String> {
     Ok(normalized.join("/"))
 }
 
-fn run_external_command(
-    program: &str,
+/// Bytes of captured subprocess stderr one error message keeps at each end.
+const EMBEDDED_STDERR_EDGE_BYTES: usize = 2 * 1024;
+
+/// Render captured subprocess stderr for an error message.
+///
+/// A failing endpoint can emit megabytes of stderr, and the message that
+/// embeds it has to stay bounded. The head and the tail carry the diagnosis,
+/// so a longer stream keeps both around an elision marker. Every module that
+/// runs git and embeds its stderr shares this bound, so no message grows with
+/// the stream it quotes.
+pub(crate) fn bounded_command_stderr(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr).trim().to_string();
+    if text.len() <= 2 * EMBEDDED_STDERR_EDGE_BYTES {
+        return text;
+    }
+
+    let head_end = floor_char_boundary(&text, EMBEDDED_STDERR_EDGE_BYTES);
+    let tail_start = ceil_char_boundary(&text, text.len() - EMBEDDED_STDERR_EDGE_BYTES);
+    let elided = text.len() - head_end - (text.len() - tail_start);
+    format!(
+        "{}\n[... {elided} bytes of stderr elided ...]\n{}",
+        &text[..head_end],
+        &text[tail_start..]
+    )
+}
+
+/// Largest char boundary at or below `index`.
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// Smallest char boundary at or above `index`.
+fn ceil_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+/// Build one git subprocess with the environment skillctl controls.
+///
+/// `GIT_TERMINAL_PROMPT=0` and the removed askpass helpers make git fail
+/// instead of waiting for credentials on a terminal, because an unattended run
+/// cannot answer a prompt. `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, and
+/// `GIT_CONFIG_PARAMETERS` override repository discovery and configuration, so
+/// values an enclosing git environment exports — a hook or a linked worktree —
+/// are removed to keep every command pointed at the repository skillctl
+/// manages. `core.autocrlf` and `core.safecrlf` are pinned off, because Git
+/// for Windows rewrites text files to CRLF by default while content hashes
+/// cover raw working-tree bytes: one revision has to check out byte-identical
+/// on every platform for a lockfile pinned elsewhere to verify.
+///
+/// Every git child skillctl spawns goes through this builder, including the
+/// ones other modules spawn, so one controlled environment governs them all.
+pub(crate) fn git_command(args: &[&OsStr]) -> Command {
+    let mut command = Command::new("git");
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_ASKPASS")
+        .env_remove("SSH_ASKPASS")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .args([
+            OsStr::new("-c"),
+            OsStr::new("core.autocrlf=false"),
+            OsStr::new("-c"),
+            OsStr::new("core.safecrlf=false"),
+        ])
+        .args(args);
+    command
+}
+
+/// Run one git subprocess with the controlled environment [`git_command`]
+/// builds, and capture its standard output.
+///
+/// A failure reports the source as invalid, which fits the local git
+/// operations this serves — `init`, `remote add`, `checkout`, and `rev-parse`
+/// describe the staged repository skillctl manages, not the source's
+/// reachability.
+fn run_git_command(
     args: &[&OsStr],
     current_dir: Option<&Path>,
-    raw_source: Option<&str>,
+    raw_source: &str,
     failure_prefix: &str,
 ) -> Result<String, AppError> {
-    let mut command = Command::new(program);
-    command.args(args);
+    run_prepared_command(
+        prepared_git_command(args, current_dir),
+        "git",
+        |message| source_validation(raw_source, message),
+        failure_prefix,
+    )
+}
+
+/// Run one git subprocess that moves data from the source over the network,
+/// and capture its standard output.
+///
+/// `git clone` and `git fetch` fail when the source cannot be reached — the
+/// network is down, the host refuses the connection, or authentication is
+/// refused — which says nothing about the source's validity. The failure is
+/// an [`AppError::GitTransport`] operational error, the same exit status a
+/// discovery fetch reports, while a source that answered but does not serve
+/// the locked revision stays a validation failure through
+/// [`source_validation`].
+fn run_git_transport_command(
+    args: &[&OsStr],
+    current_dir: Option<&Path>,
+    url: &str,
+    failure_prefix: &str,
+) -> Result<String, AppError> {
+    run_prepared_command(
+        prepared_git_command(args, current_dir),
+        "git",
+        |message| AppError::GitTransport {
+            url: url.to_string(),
+            message,
+        },
+        failure_prefix,
+    )
+}
+
+/// Build one git subprocess with the environment [`git_command`] controls,
+/// rooted at `current_dir` when one is given.
+fn prepared_git_command(args: &[&OsStr], current_dir: Option<&Path>) -> Command {
+    let mut command = git_command(args);
     if let Some(current_dir) = current_dir {
         command.current_dir(current_dir);
     }
+    command
+}
 
+/// Run one prepared subprocess, capture its standard output, and classify a
+/// failure through `classify`.
+fn run_prepared_command(
+    mut command: Command,
+    program: &str,
+    classify: impl FnOnce(String) -> AppError,
+    failure_prefix: &str,
+) -> Result<String, AppError> {
     let output = command
         .output()
         .map_err(|source| AppError::ExternalCommand {
@@ -3417,20 +3556,37 @@ fn run_external_command(
         })?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr = bounded_command_stderr(&output.stderr);
         let message = if stderr.is_empty() {
             format!("{failure_prefix} with status {}", output.status)
         } else {
             format!("{failure_prefix}: {stderr}")
         };
 
-        return Err(match raw_source {
-            Some(raw_source) => source_validation(raw_source, message),
-            None => source_validation(program, message),
-        });
+        return Err(classify(message));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn run_external_command(
+    program: &str,
+    args: &[&OsStr],
+    current_dir: Option<&Path>,
+    raw_source: &str,
+    failure_prefix: &str,
+) -> Result<String, AppError> {
+    let mut command = Command::new(program);
+    command.args(args);
+    if let Some(current_dir) = current_dir {
+        command.current_dir(current_dir);
+    }
+    run_prepared_command(
+        command,
+        program,
+        |message| source_validation(raw_source, message),
+        failure_prefix,
+    )
 }
 
 fn source_validation(source: impl Into<String>, message: impl Into<String>) -> AppError {
@@ -3916,6 +4072,12 @@ mod tests {
         for unavailable in [fabricated, mistyped] {
             let error = acquire_locked_source(&locked_git_import(&url, &unavailable))
                 .expect_err("an unserved revision must fail acquisition");
+            assert_eq!(
+                error.exit_status(),
+                crate::error::ExitStatus::ValidationFailure,
+                "a source that answered without the revision is a validation refusal, unlike a \
+                 transport failure: {error}"
+            );
             let message = error.to_string();
             assert!(
                 message.contains(&format!(
@@ -3947,7 +4109,18 @@ mod tests {
         ))
         .expect_err("an unreachable source must fail acquisition");
 
-        let message = error.to_string();
+        assert_eq!(
+            error.exit_status(),
+            crate::error::ExitStatus::OperationalError,
+            "an unreachable source is an operational failure, not a validation refusal: {error}"
+        );
+        let AppError::GitTransport { url, message } = error else {
+            panic!("expected a git transport failure, found a different error");
+        };
+        assert_eq!(
+            url, missing_url,
+            "the transport failure names the source it could not reach"
+        );
         assert!(
             message.contains("git fetch failed"),
             "expected a transport failure, found: {message}"
@@ -3955,6 +4128,35 @@ mod tests {
         assert!(
             !message.contains("does not serve this revision"),
             "an unreachable source must not be reported as an unserved revision: {message}"
+        );
+    }
+
+    #[test]
+    fn unreachable_git_clones_report_transport_failures() {
+        let fixture = TestSourceFixture::new();
+        let missing_url = Url::from_file_path(fixture.path().join("no-such-repo"))
+            .expect("repo path converts to file url")
+            .to_string();
+
+        let error =
+            inspect_install_source(fixture.path(), &InstallRequest::new(missing_url.clone()))
+                .expect_err("an unreachable source must fail inspection");
+
+        assert_eq!(
+            error.exit_status(),
+            crate::error::ExitStatus::OperationalError,
+            "a clone that cannot reach the source is an operational failure: {error}"
+        );
+        let AppError::GitTransport { url, message } = error else {
+            panic!("expected a git transport failure, found a different error");
+        };
+        assert_eq!(
+            url, missing_url,
+            "the transport failure names the source it could not reach"
+        );
+        assert!(
+            message.contains("git clone failed"),
+            "expected the clone failure, found: {message}"
         );
     }
 
@@ -3990,6 +4192,82 @@ mod tests {
                 .map(|candidate| candidate.source_path.clone())
                 .collect::<Vec<_>>(),
             vec![".agents/skills/release-notes".to_string()]
+        );
+    }
+
+    #[test]
+    fn local_zip_archives_unpack_in_process_without_external_tools() {
+        let fixture = TestSourceFixture::new();
+        let archive_path = fixture.path().join("skills.zip");
+        fs::write(
+            &archive_path,
+            test_archives::zip_bytes(&[(
+                ".agents/skills/release-notes/SKILL.md",
+                RELEASE_NOTES_SKILL.as_bytes(),
+            )]),
+        )
+        .expect("local zip archive is written");
+
+        let inspection = inspect_install_source(
+            fixture.path(),
+            &InstallRequest::new(archive_path.display().to_string()),
+        )
+        .expect("a local zip archive inspects without an external unzip tool");
+
+        assert_eq!(inspection.source.kind, SourceKind::Archive);
+        assert_eq!(
+            inspection_candidates(&inspection),
+            vec![(
+                "release-notes".to_string(),
+                ".agents/skills/release-notes".to_string()
+            )],
+            "an in-process zip unpack detects the same candidates as tar"
+        );
+    }
+
+    #[test]
+    fn local_zip_archives_enforce_the_in_process_unpack_rules() {
+        let fixture = TestSourceFixture::new();
+
+        let mut traversal = test_archives::zip_bytes(&[("skills/escape.txt", b"payload")]);
+        test_archives::rename_zip_entry(&mut traversal, b"skills/escape.txt", b"../../../evil.txt");
+        let traversal_path = fixture.path().join("traversal.zip");
+        fs::write(&traversal_path, traversal).expect("traversal zip archive is written");
+        let error = inspect_install_source(
+            fixture.path(),
+            &InstallRequest::new(traversal_path.display().to_string()),
+        )
+        .expect_err("a traversal entry refuses the local archive");
+        assert!(
+            matches!(error, AppError::SourceValidation { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("escapes the extraction directory"),
+            "unexpected error: {error}"
+        );
+
+        let symlink_path = fixture.path().join("symlink.zip");
+        fs::write(
+            &symlink_path,
+            test_archives::zip_symlink_bytes("skills/link", "target"),
+        )
+        .expect("symlink zip archive is written");
+        let error = inspect_install_source(
+            fixture.path(),
+            &InstallRequest::new(symlink_path.display().to_string()),
+        )
+        .expect_err("a link entry refuses the local archive");
+        assert!(
+            error.to_string().contains("symbolic or hard link"),
+            "unexpected error: {error}"
+        );
+
+        assert!(
+            !fixture.path().join("evil.txt").exists(),
+            "a rejected local archive must not leave files outside its destination",
         );
     }
 
@@ -4597,6 +4875,24 @@ mod tests {
     }
 
     #[test]
+    fn short_hex_reference_names_stay_movable_references() {
+        let revision = "b0123456789abcdef0123456789abcdef01234567";
+
+        for reference in ["b", "b0", "b0123"] {
+            assert!(
+                !reference_pins_immutable_revision(reference, revision),
+                "a branch or tag named '{reference}' stays a movable reference",
+            );
+        }
+        for reference in [&revision[..7], revision] {
+            assert!(
+                reference_pins_immutable_revision(reference, revision),
+                "the commit shape '{reference}' pins one immutable revision",
+            );
+        }
+    }
+
+    #[test]
     fn stored_import_roots_are_namespaced_by_scope_and_workspace() {
         let fixture = TestSourceFixture::new();
         let workspace_a = fixture.path().join("workspace-a");
@@ -4696,6 +4992,64 @@ mod tests {
         (url, head)
     }
 
+    /// One local-path or archive import at `url`, whose recorded shape the
+    /// acquisition tests contradict on purpose.
+    fn locked_local_import(kind: SourceKind, url: &str) -> crate::lockfile::LockedImport {
+        crate::lockfile::LockedImport {
+            source: crate::lockfile::LockedSource {
+                kind,
+                url: url.to_string(),
+                subpath: crate::lockfile::LockfilePath::new(".agents/skills/release-notes"),
+            },
+            discovery: None,
+            revision: crate::lockfile::LockedRevision {
+                resolved: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(),
+                upstream: None,
+            },
+            bundle: None,
+            hashes: crate::lockfile::LockedHashes {
+                content: "sha256:content".to_string(),
+                overlay: "sha256:overlay".to_string(),
+                effective_version: "sha256:effective".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn locked_local_sources_report_the_observed_filesystem_shape() {
+        let fixture = TestSourceFixture::new();
+        let directory = fixture.path().join("packed");
+        fs::create_dir_all(&directory).expect("directory exists");
+        let file = fixture.path().join("packed.tar.gz");
+        fs::write(&file, b"never unpacked").expect("file exists");
+
+        let directory_url = Url::from_directory_path(&directory)
+            .expect("directory converts to a file url")
+            .to_string();
+        let error =
+            acquire_locked_source(&locked_local_import(SourceKind::Archive, &directory_url))
+                .expect_err("an archive lockfile must refuse a directory");
+        assert!(
+            error
+                .to_string()
+                .contains("is a directory, but the recorded source kind expects a file"),
+            "unexpected error: {error}"
+        );
+
+        let file_url = Url::from_file_path(&file)
+            .expect("file converts to a file url")
+            .to_string();
+        let error = acquire_locked_source(&locked_local_import(SourceKind::LocalPath, &file_url))
+            .expect_err("a path lockfile must refuse a regular file");
+        assert!(
+            error
+                .to_string()
+                .contains("is a file, but the recorded source kind expects a directory"),
+            "unexpected error: {error}"
+        );
+    }
+
     /// One git import pinned at `revision`, for acquisition tests.
     fn locked_git_import(url: &str, revision: &str) -> crate::lockfile::LockedImport {
         crate::lockfile::LockedImport {
@@ -4724,6 +5078,34 @@ mod tests {
             .iter()
             .map(|candidate| (candidate.name.clone(), candidate.source_path.clone()))
             .collect()
+    }
+
+    /// Resolve, stage, and inspect one install source from a working directory
+    /// alone, the way the tests drive the whole non-discovery install path.
+    ///
+    /// A well-known index is refused, because this path stages a whole source
+    /// and cannot choose one index entry.
+    fn inspect_install_source(
+        working_directory: &Path,
+        request: &InstallRequest,
+    ) -> Result<InstallInspection, AppError> {
+        let resolved = resolve_install_source(&request.source, working_directory)?;
+        if resolved.normalized.kind == SourceKind::WellKnown {
+            return Err(source_validation(
+                &resolved.normalized.raw,
+                "a well-known discovery index stages one declared entry at a time, and this path \
+                 cannot select one; run 'skillctl install <url> --name <skill>' instead",
+            ));
+        }
+
+        let prepared = prepare_source(&resolved)?;
+        let candidates = detect_install_candidates(&prepared.root, &prepared.source.raw)?;
+
+        Ok(InstallInspection {
+            source: prepared.source,
+            revision: prepared.revision,
+            candidates,
+        })
     }
 
     struct TestSourceFixture {
@@ -4864,6 +5246,13 @@ mod tests {
         assert!(
             message.contains("'other-skill'") && message.contains("'code-review'"),
             "unexpected error: {message}"
+        );
+        // The staging directory carries the index-declared name, so the load's
+        // directory-name validation is the reachable rejection: it names both
+        // the declared skill and the directory the index declared.
+        assert!(
+            message.contains("must match the parent directory 'code-review'"),
+            "the rejection names the index-declared directory: {message}"
         );
         assert!(
             matches!(error, AppError::DiscoveryArtifactRejected { .. }),
@@ -5335,5 +5724,63 @@ mod tests {
                 resolved.display()
             );
         }
+    }
+
+    #[test]
+    fn bounded_command_stderr_keeps_a_head_and_a_tail() {
+        let short = "fatal: repository not found\n";
+        assert_eq!(
+            bounded_command_stderr(short.as_bytes()),
+            short.trim(),
+            "an ordinary failure embeds its stderr unchanged"
+        );
+
+        let head = "x".repeat(EMBEDDED_STDERR_EDGE_BYTES);
+        let middle = "y".repeat(EMBEDDED_STDERR_EDGE_BYTES * 4);
+        let tail = "z".repeat(EMBEDDED_STDERR_EDGE_BYTES);
+        let rendered = bounded_command_stderr(format!("{head}{middle}{tail}").as_bytes());
+        assert!(rendered.starts_with('x'), "the head survives: {rendered}");
+        assert!(rendered.ends_with('z'), "the tail survives: {rendered}");
+        assert!(
+            rendered.contains("bytes of stderr elided"),
+            "the elision is named: {rendered}"
+        );
+        assert!(
+            rendered.len() < EMBEDDED_STDERR_EDGE_BYTES * 3,
+            "the rendered stderr stays bounded: {} bytes",
+            rendered.len()
+        );
+
+        let multibyte = "é".repeat(EMBEDDED_STDERR_EDGE_BYTES + 16);
+        let rendered = bounded_command_stderr(multibyte.as_bytes());
+        assert!(
+            rendered.ends_with('é') && rendered.len() < multibyte.len() + 64,
+            "a cut inside a multi-byte character stays valid: {rendered}"
+        );
+    }
+
+    #[test]
+    fn git_children_run_with_a_controlled_environment() {
+        let command = git_command(&[OsStr::new("version")]);
+
+        let explicitly_set: Vec<(String, String)> = command
+            .get_envs()
+            .filter_map(|(key, value)| {
+                Some((
+                    key.to_string_lossy().into_owned(),
+                    value?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        assert!(
+            explicitly_set.contains(&("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())),
+            "git must fail instead of waiting for terminal credentials: {explicitly_set:?}"
+        );
+
+        let rendered = format!("{command:?}");
+        assert!(
+            rendered.contains("core.autocrlf=false") && rendered.contains("core.safecrlf=false"),
+            "every checkout pins byte-stable line endings: {rendered}"
+        );
     }
 }

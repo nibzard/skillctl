@@ -21,14 +21,25 @@ release_base_url="${SKILLCTL_RELEASE_BASE_URL:-$default_release_base_url}"
 install_dir="${SKILLCTL_INSTALL_DIR:-${HOME}/.local/bin}"
 version="${SKILLCTL_VERSION:-}"
 
+require_flag_value() {
+  local flag="$1"
+  if [[ $# -lt 2 || -z "${2:-}" ]]; then
+    printf 'error: %s requires a value\n' "$flag" >&2
+    usage >&2
+    exit 1
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --version)
-      version="${2:-}"
+      require_flag_value "$@"
+      version="$2"
       shift 2
       ;;
     --install-dir|--bin-dir)
-      install_dir="${2:-}"
+      require_flag_value "$@"
+      install_dir="$2"
       shift 2
       ;;
     -h|--help)
@@ -137,7 +148,8 @@ archive_name="skillctl-${version}-${target}.tar.gz"
 checksums_name="skillctl-${version}-checksums.txt"
 
 tmp_dir="$(mktemp -d)"
-trap 'rm -rf "$tmp_dir"' EXIT
+install_tmp=""
+trap 'rm -rf "$tmp_dir" ${install_tmp:+"$install_tmp"}' EXIT
 
 archive_path="$tmp_dir/$archive_name"
 checksums_path="$tmp_dir/$checksums_name"
@@ -160,8 +172,14 @@ fi
 tar -xzf "$archive_path" -C "$tmp_dir"
 
 mkdir -p "$install_dir"
-cp "$tmp_dir/skillctl-${version}-${target}/skillctl" "$install_dir/skillctl"
-chmod 755 "$install_dir/skillctl"
+# Stage the binary beside its destination and move it into place. Writing over
+# a running executable fails with "Text file busy" on Linux, while a rename on
+# the same filesystem replaces it atomically, so an upgrade works even while a
+# `skillctl mcp serve` process keeps the old binary open.
+install_tmp="$install_dir/skillctl.install.$$"
+cp "$tmp_dir/skillctl-${version}-${target}/skillctl" "$install_tmp"
+chmod 755 "$install_tmp"
+mv -f "$install_tmp" "$install_dir/skillctl"
 
 printf 'Installed skillctl %s to %s/skillctl\n' "$version" "$install_dir"
 if [[ ":${PATH:-}:" != *":${install_dir}:"* ]]; then

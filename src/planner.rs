@@ -2,9 +2,9 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs, io,
+    ffi::OsStr,
+    fs, io,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use serde::Serialize;
@@ -22,7 +22,7 @@ use crate::{
     overlay::{NO_OVERLAY_HASH, hash_overlay_root},
     resolver::{self, ResolveWorkspaceRequest, ResolvedSkillCandidate, SkillScope},
     response::AppResponse,
-    source::{SourceKind, current_timestamp, imports_store_root},
+    source::{SourceKind, current_timestamp},
     state::{
         InstallRecord, LocalModificationKind, LocalModificationRecord, LocalStateStore,
         ManagedScope, ManagedSkillRef, PinRecord, ProjectionRecord, UpdateCheckOutcome,
@@ -44,19 +44,6 @@ pub struct ProjectionPlan {
     /// Physical roots required by the selected assignments.
     pub physical_roots: Vec<PhysicalRootPlan>,
 }
-
-impl ProjectionPlan {
-    /// Return the selected root for one runtime, if present in the plan.
-    pub fn root_for(&self, target: TargetRuntime) -> Option<&str> {
-        self.assignments
-            .iter()
-            .find(|assignment| assignment.target == target)
-            .map(|assignment| assignment.root.as_str())
-    }
-}
-
-/// Backwards-compatible alias for call sites that want to emphasize root planning.
-pub type TargetRootPlan = ProjectionPlan;
 
 /// One target's selected discovery root.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -104,14 +91,6 @@ pub struct UpdateRequest {
 }
 
 impl UpdateRequest {
-    /// Create an update request from parsed CLI arguments.
-    pub fn new(skill: Option<String>) -> Self {
-        Self {
-            skill,
-            ..Self::default()
-        }
-    }
-
     /// Effective strategy for an apply.
     pub fn effective_strategy(&self) -> crate::apply::ApplyStrategy {
         self.strategy.unwrap_or_default()
@@ -484,12 +463,6 @@ fn blocks_clean_apply(plan: &SkillUpdatePlan) -> bool {
         && !gate_blocks_apply(plan)
 }
 
-/// Skip reason for a local source whose edits need a repair strategy.
-const LOCAL_SOURCE_STRATEGY_HINT: &str = "local sources track no upstream revision to apply; \
-                                           re-run with '--strategy overlay' to keep the edits, \
-                                           '--strategy discard' to back them up and drop them, or \
-                                           '--strategy fork' to take local ownership";
-
 /// Why a local source reports no update check.
 const NO_UPSTREAM_CHECK_NOTE: &str = "local sources do not support upstream update checks";
 
@@ -515,24 +488,15 @@ fn skip_reason(
         );
     }
     match plan.outcome {
-        UpdateCheckOutcome::LocalSource if plan.local_modification_detected => {
-            LOCAL_SOURCE_STRATEGY_HINT.to_string()
-        }
+        // A local source or a commit-pinned import with unrecorded edits
+        // always contributes a repair target, so a skipped one has no edits to
+        // repair and the arm reports the strategy it met.
         UpdateCheckOutcome::LocalSource => format!(
             "local sources do not support upstream update checks, and '{}' has no unrecorded \
              edits to repair with the {} strategy",
             plan.skill,
             strategy.as_str()
         ),
-        UpdateCheckOutcome::CommitPinned if plan.local_modification_detected => {
-            format!(
-                "'{}' is pinned to a commit, so upstream tracking is unavailable and only its \
-                 unrecorded edits can be repaired; re-run with '--strategy overlay' to keep \
-                 them, '--strategy discard' to back them up and drop them, or '--strategy \
-                 fork' to take local ownership",
-                plan.skill
-            )
-        }
         UpdateCheckOutcome::CommitPinned => format!(
             "'{}' is pinned to a commit, so upstream tracking is unavailable and no upstream \
              revision can move with the {} strategy",
@@ -608,7 +572,8 @@ fn write_plan_document(
     for target in targets {
         // A target that repairs edits instead of moving a revision gets the
         // plan that describes that repair: a local source tracks no upstream
-        // revision, and an up-to-date check leaves a git import on its pin.
+        // revision, and an up-to-date check leaves a git or well-known import
+        // on its pin.
         plans.push(if crate::apply::repairs_unrecorded_edits(target) {
             crate::apply::build_edit_repair_mutation_plan(context, target, strategy)?
         } else {
@@ -643,10 +608,10 @@ fn write_plan_document(
             "Wrote {} plan{} to {} without changing anything.",
             plans.len(),
             if plans.len() == 1 { "" } else { "s" },
-            planner_display_path(context, path)
+            display_path(context, path)
         ))
         .with_data(json!({
-            "plan_document": planner_display_path(context, path),
+            "plan_document": display_path(context, path),
             "strategy": strategy.as_str(),
             "plans": plans,
             "plan_digests": digests,
@@ -785,8 +750,8 @@ fn apply_plan_document(
         }
         // A plan that proposes no revision repairs the unrecorded edits of a
         // pinned import instead of moving it upstream: a local source tracks no
-        // revision to move to, and an up-to-date check leaves a git import on
-        // the revision it pins.
+        // revision to move to, and an up-to-date check leaves a git or
+        // well-known import on the revision it pins.
         let edit_repair = proposed.revision.is_none();
         let target_revision = match proposed.revision.clone() {
             Some(revision) => revision,
@@ -877,7 +842,7 @@ fn apply_plan_document(
     let mut response = AppResponse::success("update")
         .with_summary(apply_summary(&report))
         .with_data(json!({
-            "plan_document": planner_display_path(context, path),
+            "plan_document": display_path(context, path),
             "strategy": strategy.as_str(),
             "applied": report.applied,
             "apply_skipped": report.skipped,
@@ -908,12 +873,13 @@ fn apply_plan_document(
 ///
 /// The document records no outcome, and the apply routes a target by it, so a
 /// repair plan reports the outcome whose check contributes an edit repair: a
-/// local source by definition, and an up-to-date check for a git import.
+/// local source by definition, and an up-to-date check for a git or well-known
+/// import. Any other outcome sends the apply down the revision-move path, whose
+/// refusal would name the revision the import already holds.
 fn repair_outcome(kind: SourceKind) -> UpdateCheckOutcome {
-    if kind == SourceKind::Git {
-        UpdateCheckOutcome::UpToDate
-    } else {
-        UpdateCheckOutcome::LocalSource
+    match kind {
+        SourceKind::Git | SourceKind::WellKnown => UpdateCheckOutcome::UpToDate,
+        SourceKind::LocalPath | SourceKind::Archive => UpdateCheckOutcome::LocalSource,
     }
 }
 
@@ -925,10 +891,6 @@ fn proposed_scope(skill_id: &str, store: &LocalStateStore) -> Result<ManagedScop
             message: format!("skill '{skill_id}' is not installed"),
         }
     })
-}
-
-fn planner_display_path(context: &AppContext, path: &Path) -> String {
-    display_path(context, path)
 }
 
 /// Planner recommendation for how to respond to one update result.
@@ -1118,7 +1080,6 @@ fn trust_decision(
         )),
         None => crate::trust::trust_for_install_record(
             install,
-            false,
             None,
             reviews.approved_for_install(install),
         ),
@@ -1881,7 +1842,6 @@ fn imported_candidate_map(
 ) -> Result<ImportedCandidates, AppError> {
     let request = ResolveWorkspaceRequest::new(
         &context.working_directory,
-        imports_store_root()?,
         manifest.clone(),
         lockfile.clone(),
     )
@@ -2047,16 +2007,23 @@ fn well_known_index_lookup(
 
 /// Ask one git source which revision `reference` names.
 ///
-/// `Ok(None)` says the source answered but named no revision for the reference,
-/// which stays distinct from the transport and command failures `Err` carries.
+/// The child runs through the controlled environment
+/// [`crate::source::git_command`] builds, so this lookup answers the same way
+/// an acquisition does when credentials or an enclosing git environment would
+/// otherwise divert it. `Ok(None)` says the source answered but named no
+/// revision for the reference, which stays distinct from the transport and
+/// command failures `Err` carries.
 fn latest_git_revision(source_url: &str, reference: &str) -> Result<Option<String>, String> {
-    let output = Command::new("git")
-        .args(["ls-remote", source_url, reference])
-        .output()
-        .map_err(|source| format!("failed to run git ls-remote for '{source_url}': {source}"))?;
+    let output = crate::source::git_command(&[
+        OsStr::new("ls-remote"),
+        OsStr::new(source_url),
+        OsStr::new(reference),
+    ])
+    .output()
+    .map_err(|source| format!("failed to run git ls-remote for '{source_url}': {source}"))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr = crate::source::bounded_command_stderr(&output.stderr);
         let detail = if stderr.is_empty() {
             "git ls-remote returned a non-zero exit status".to_string()
         } else {
@@ -2125,7 +2092,7 @@ fn missing_projection_destinations(
     for root in crate::materialize::planned_physical_roots(
         context,
         manifest,
-        target_scope_for(install.skill.scope),
+        TargetScope::from(install.skill.scope),
     )? {
         let destination =
             resolve_runtime_root_path(context, &root.path)?.join(&install.skill.skill_id);
@@ -2149,12 +2116,24 @@ fn missing_projection_destinations(
     Ok(missing)
 }
 
-/// Target scope that plans and materializes one managed scope.
-fn target_scope_for(scope: ManagedScope) -> TargetScope {
-    match scope {
-        ManagedScope::Workspace => TargetScope::Workspace,
-        ManagedScope::User => TargetScope::User,
-    }
+/// One projection record as `explain` and the TUI report it.
+///
+/// The same view serves every surface that lists a skill's generated copies,
+/// so one projection renders one set of fields wherever it appears.
+pub(crate) fn projection_view(
+    context: &AppContext,
+    projection: &ProjectionRecord,
+) -> Result<serde_json::Value, AppError> {
+    let root = resolve_runtime_root_path(context, &projection.physical_root)?;
+    let projected = root.join(&projection.projected_path);
+
+    Ok(json!({
+        "target": projection.target,
+        "root": display_path(context, &root),
+        "path": display_path(context, &projected),
+        "generated_at": projection.generated_at,
+        "effective_version_hash": projection.effective_version_hash,
+    }))
 }
 
 /// Whether the manifest declares one install's import as disabled.
@@ -2335,7 +2314,7 @@ fn audit_copies_against_written_content(
         })
         .transpose()?;
 
-    let scope = target_scope_for(install.skill.scope);
+    let scope = TargetScope::from(install.skill.scope);
     let mut modifications = Vec::new();
     let mut records = Vec::new();
     for root in crate::materialize::edit_repair_root_paths(context, manifest, scope)? {
@@ -2496,7 +2475,7 @@ fn detect_unrecorded_copies_in_documented_roots(
     install: &InstallRecord,
     desired: Option<&str>,
 ) -> Result<Vec<PlannedModification>, AppError> {
-    let scope = target_scope_for(install.skill.scope);
+    let scope = TargetScope::from(install.skill.scope);
     let planned: BTreeSet<PathBuf> =
         crate::materialize::planned_physical_root_paths(context, manifest, scope)?
             .into_iter()
@@ -2625,15 +2604,6 @@ fn collect_projection_files(
             continue;
         }
 
-        if !metadata.is_file() {
-            files.push(
-                path.strip_prefix(root)
-                    .expect("projection entry remains under the root")
-                    .to_path_buf(),
-            );
-            continue;
-        }
-
         files.push(
             path.strip_prefix(root)
                 .expect("projection entry remains under the root")
@@ -2678,10 +2648,7 @@ pub(crate) fn resolve_runtime_root_path(
 }
 
 fn home_directory() -> Result<PathBuf, AppError> {
-    env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .ok_or(AppError::HomeDirectoryUnavailable)
+    crate::state::resolve_home_directory().ok_or(AppError::HomeDirectoryUnavailable)
 }
 
 pub(crate) fn display_path(context: &AppContext, path: &Path) -> String {
@@ -2772,7 +2739,7 @@ pub fn plan_target_roots(
     policy: ProjectionPolicy,
     targets: &[TargetRuntime],
     overrides: &BTreeMap<TargetRuntime, AdapterOverride>,
-) -> Result<TargetRootPlan, AppError> {
+) -> Result<ProjectionPlan, AppError> {
     let normalized_targets = normalize_targets(targets)?;
     let candidates = normalized_targets
         .iter()
@@ -2962,7 +2929,7 @@ fn build_projection_plan(
     scope: TargetScope,
     policy: ProjectionPolicy,
     assignments: Vec<CandidateAssignment>,
-) -> TargetRootPlan {
+) -> ProjectionPlan {
     let assignments: Vec<_> = assignments
         .into_iter()
         .map(|assignment| TargetRootAssignment {
@@ -3721,7 +3688,7 @@ mod tests {
         }
     }
 
-    fn assignment_roots(plan: &TargetRootPlan) -> Vec<(TargetRuntime, &str, RootSelectionSource)> {
+    fn assignment_roots(plan: &ProjectionPlan) -> Vec<(TargetRuntime, &str, RootSelectionSource)> {
         plan.assignments
             .iter()
             .map(|assignment| {

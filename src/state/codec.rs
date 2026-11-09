@@ -94,6 +94,81 @@ type HistoryEntryRow = (
     Option<String>,
 );
 
+// Row mappers shared by the all-rows and filtered queries of each record
+// list, so the two statements of one list cannot decode columns differently.
+
+pub(super) fn map_projection_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectionRow> {
+    Ok((
+        row.get::<_, String>(0)?,
+        row.get::<_, String>(1)?,
+        row.get::<_, String>(2)?,
+        row.get::<_, String>(3)?,
+        row.get::<_, String>(4)?,
+        row.get::<_, String>(5)?,
+        row.get::<_, String>(6)?,
+        row.get::<_, String>(7)?,
+        row.get::<_, String>(8)?,
+    ))
+}
+
+pub(super) fn map_update_check_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UpdateCheckRow> {
+    Ok((
+        row.get::<_, i64>(0)?,
+        row.get::<_, String>(1)?,
+        row.get::<_, String>(2)?,
+        row.get::<_, String>(3)?,
+        row.get::<_, String>(4)?,
+        row.get::<_, String>(5)?,
+        row.get::<_, Option<String>>(6)?,
+        row.get::<_, String>(7)?,
+        row.get::<_, i64>(8)?,
+        row.get::<_, i64>(9)?,
+        row.get::<_, Option<String>>(10)?,
+        row.get::<_, Option<String>>(11)?,
+    ))
+}
+
+pub(super) fn map_local_modification_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<LocalModificationRow> {
+    Ok((
+        row.get::<_, i64>(0)?,
+        row.get::<_, String>(1)?,
+        row.get::<_, String>(2)?,
+        row.get::<_, String>(3)?,
+        row.get::<_, String>(4)?,
+        row.get::<_, String>(5)?,
+        row.get::<_, Option<String>>(6)?,
+        row.get::<_, Option<String>>(7)?,
+    ))
+}
+
+pub(super) fn map_rollback_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RollbackRow> {
+    Ok((
+        row.get::<_, i64>(0)?,
+        row.get::<_, String>(1)?,
+        row.get::<_, String>(2)?,
+        row.get::<_, String>(3)?,
+        row.get::<_, String>(4)?,
+        row.get::<_, String>(5)?,
+        row.get::<_, String>(6)?,
+    ))
+}
+
+pub(super) fn map_history_entry_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntryRow> {
+    Ok((
+        row.get::<_, i64>(0)?,
+        row.get::<_, String>(1)?,
+        row.get::<_, String>(2)?,
+        row.get::<_, Option<String>>(3)?,
+        row.get::<_, Option<String>>(4)?,
+        row.get::<_, Option<String>>(5)?,
+        row.get::<_, String>(6)?,
+        row.get::<_, String>(7)?,
+        row.get::<_, Option<String>>(8)?,
+    ))
+}
+
 pub(super) fn decode_install_record(
     path: &Path,
     row: InstallRow,
@@ -422,15 +497,6 @@ fn parse_target_runtime(path: &Path, field: &str, value: &str) -> Result<TargetR
             path,
             format!("{field} has unsupported target runtime '{value}'"),
         )),
-    }
-}
-
-pub(super) fn source_kind_as_str(kind: SourceKind) -> &'static str {
-    match kind {
-        SourceKind::Git => "git",
-        SourceKind::LocalPath => "local-path",
-        SourceKind::Archive => "archive",
-        SourceKind::WellKnown => "well-known",
     }
 }
 

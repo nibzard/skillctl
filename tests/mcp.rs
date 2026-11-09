@@ -320,6 +320,91 @@ fn mcp_tool_calls_reuse_the_cli_json_response_contract() {
     assert_eq!(remove["ok"], true);
 }
 
+/// `skills_history` advertises a `scope` argument, so an unnamed request in a
+/// workspace with ledger rows in both scopes must answer with only the
+/// requested scope's entries, exactly like `--scope <s> --json history`.
+#[test]
+fn skills_history_honors_the_scope_selector_like_the_cli() {
+    let workspace = TestWorkspace::new();
+    workspace.write_manifest_for_targets(&["codex"]);
+    workspace.write_file(
+        "git-source/.agents/skills/release-notes/SKILL.md",
+        &skill_manifest("release-notes", "Summarize release notes."),
+    );
+    workspace.write_file(
+        "git-source/.agents/skills/changelog/SKILL.md",
+        &skill_manifest("changelog", "Summarize a changelog."),
+    );
+    workspace.init_git_repo("git-source");
+    let home_path = workspace.home_path();
+    let repo_url = workspace.git_repo_url("git-source");
+
+    let mut server = McpServer::spawn(workspace.path(), &home_path);
+
+    // One skill per scope leaves ledger rows in both, so only the scope
+    // selector can tell the two trails apart.
+    for (skill, scope) in [("release-notes", "workspace"), ("changelog", "user")] {
+        let install = server.call_tool(
+            "skills_install",
+            json!({
+                "source": repo_url,
+                "skill_name": skill,
+                "scope": scope
+            }),
+        );
+        assert_eq!(install["command"], "install");
+        assert_eq!(install["ok"], true, "{install:#?}");
+    }
+
+    let user_history = server.call_tool("skills_history", json!({ "scope": "user" }));
+    assert_eq!(user_history["command"], "history");
+    assert_eq!(user_history["ok"], true);
+    assert!(
+        user_history["data"]["entries"]
+            .as_array()
+            .expect("entries exist")
+            .iter()
+            .any(|entry| entry["scope"] == "user" && entry["skill_id"] == "changelog"),
+        "the user-scope request must answer with the user install: {user_history:#?}",
+    );
+    assert!(
+        user_history["data"]["entries"]
+            .as_array()
+            .expect("entries exist")
+            .iter()
+            .all(|entry| entry["scope"] != "workspace"),
+        "the user-scope request must not answer with workspace rows: {user_history:#?}",
+    );
+    let cli_user_history = cli_json(&home_path, workspace.path(), ["--scope", "user", "history"]);
+    assert_eq!(user_history, cli_user_history);
+
+    let workspace_history = server.call_tool("skills_history", json!({ "scope": "workspace" }));
+    assert_eq!(workspace_history["command"], "history");
+    assert_eq!(workspace_history["ok"], true);
+    assert!(
+        workspace_history["data"]["entries"]
+            .as_array()
+            .expect("entries exist")
+            .iter()
+            .any(|entry| entry["scope"] == "workspace" && entry["skill_id"] == "release-notes"),
+        "the workspace-scope request must answer with the workspace install: {workspace_history:#?}",
+    );
+    assert!(
+        workspace_history["data"]["entries"]
+            .as_array()
+            .expect("entries exist")
+            .iter()
+            .all(|entry| entry["scope"] != "user"),
+        "the workspace-scope request must not answer with user rows: {workspace_history:#?}",
+    );
+    let cli_workspace_history = cli_json(
+        &home_path,
+        workspace.path(),
+        ["--scope", "workspace", "history"],
+    );
+    assert_eq!(workspace_history, cli_workspace_history);
+}
+
 const SUPPORTED_DISCOVERY_SCHEMA: &str =
     "https://schemas.agentskills.io/discovery/0.2.0/schema.json";
 const INDEX_PATH: &str = "/.well-known/agent-skills/index.json";
@@ -853,7 +938,6 @@ fn mcp_conflict_results_agree_with_cli_json_and_exit_code() {
 fn mcp_trust_gate_blocks_update_apply_like_the_cli() {
     let workspace = TestWorkspace::new();
     workspace.write_manifest_for_targets(&["claude-code"]);
-    seed_script_bearing_import(&workspace);
     let home_path = workspace.home_path();
     let projected_skill = workspace.path().join(".claude/skills/delta/SKILL.md");
     let pinned_revision = seed_script_bearing_import(&workspace);

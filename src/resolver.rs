@@ -8,9 +8,8 @@ use std::{
 
 use crate::{
     error::AppError,
-    lockfile::{LockfilePath, WorkspaceLockfile},
-    manifest::{ImportDefinition, ManifestPath, ManifestScope, WorkspaceManifest},
-    materialize::PROJECTION_METADATA_FILE,
+    lockfile::WorkspaceLockfile,
+    manifest::{ImportDefinition, ManifestScope, WorkspaceManifest},
     skill::{OPENAI_METADATA_FILE, SKILL_MANIFEST_FILE, SkillDefinition, SkillVendorMetadata},
     source::{hash_directory_contents, stored_import_root},
 };
@@ -136,16 +135,10 @@ pub struct AppliedOverlay {
 pub struct ResolvedImport {
     /// Stable manifest import identifier.
     pub id: String,
-    /// Requested relative subpath from the manifest.
-    pub requested_path: ManifestPath,
     /// Requested revision selector from the manifest.
     pub requested_ref: String,
     /// Requested scope from the manifest.
     pub scope: SkillScope,
-    /// Normalized source URL from the lockfile.
-    pub source_url: String,
-    /// Selected relative subpath from the lockfile.
-    pub locked_subpath: LockfilePath,
     /// Locked resolved revision.
     pub resolved_revision: String,
     /// Last observed upstream revision, when the requested reference leaves
@@ -337,8 +330,6 @@ pub struct ImportStoreDivergence {
 pub struct ResolveWorkspaceRequest {
     /// Root directory of the active workspace.
     pub working_directory: PathBuf,
-    /// Root directory containing stored imported source checkouts keyed by import id.
-    pub imports_directory: PathBuf,
     /// Parsed manifest driving resolution.
     pub manifest: WorkspaceManifest,
     /// Parsed lockfile containing resolved import pins.
@@ -353,13 +344,11 @@ impl ResolveWorkspaceRequest {
     /// Construct a request with no explicit manifest priorities.
     pub fn new(
         working_directory: impl Into<PathBuf>,
-        imports_directory: impl Into<PathBuf>,
         manifest: WorkspaceManifest,
         lockfile: WorkspaceLockfile,
     ) -> Self {
         Self {
             working_directory: working_directory.into(),
-            imports_directory: imports_directory.into(),
             manifest,
             lockfile,
             manifest_priorities: BTreeMap::new(),
@@ -432,7 +421,7 @@ fn discover_local_candidates(
 
     let mut candidates = Vec::new();
     for root in skill_roots {
-        if is_generated_projection_root(&root)? {
+        if crate::materialize::is_skillctl_generated_directory(&root)? {
             continue;
         }
 
@@ -466,32 +455,6 @@ fn discover_local_candidates(
     Ok(candidates)
 }
 
-pub(crate) fn is_generated_projection_root(root: &Path) -> Result<bool, AppError> {
-    let metadata_path = root.join(PROJECTION_METADATA_FILE);
-    let contents = match fs::read_to_string(&metadata_path) {
-        Ok(contents) => contents,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(source) => {
-            return Err(AppError::FilesystemOperation {
-                action: "read projection metadata",
-                path: metadata_path,
-                source,
-            });
-        }
-    };
-
-    let parsed = serde_json::from_str::<serde_json::Value>(&contents).map_err(|source| {
-        AppError::ResolutionValidation {
-            message: format!(
-                "projection metadata '{}' is invalid JSON: {source}",
-                metadata_path.display()
-            ),
-        }
-    })?;
-
-    Ok(parsed.get("tool").and_then(serde_json::Value::as_str) == Some("skillctl"))
-}
-
 fn discover_import_candidates(
     request: &ResolveWorkspaceRequest,
     store_divergences: &mut Vec<ImportStoreDivergence>,
@@ -520,10 +483,7 @@ fn load_import_candidate(
     };
 
     let stored_source_root = stored_import_root(
-        match import.scope {
-            ManifestScope::Workspace => crate::state::ManagedScope::Workspace,
-            ManifestScope::User => crate::state::ManagedScope::User,
-        },
+        crate::state::ManagedScope::from(import.scope),
         &request.working_directory,
         &import.id,
     )?;
@@ -648,11 +608,8 @@ fn load_import_candidate(
         overlay,
         import: Some(ResolvedImport {
             id: import.id.clone(),
-            requested_path: import.path.clone(),
             requested_ref: import.ref_spec.clone(),
             scope,
-            source_url: locked_import.source.url.clone(),
-            locked_subpath: locked_import.source.subpath.clone(),
             resolved_revision: locked_import.revision.resolved.clone(),
             // A lockfile written before a commit pin stopped recording an
             // upstream observation may still carry one, so the reference the
@@ -1084,8 +1041,8 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use crate::{
-        lockfile::{LockedHashes, LockedImport, LockedRevision, LockedSource},
-        manifest::ImportSourceType,
+        lockfile::{LockedHashes, LockedImport, LockedRevision, LockedSource, LockfilePath},
+        manifest::{ImportSourceType, ManifestPath},
         source::{SourceKind, stored_import_root},
         state::ManagedScope,
     };
@@ -1637,10 +1594,7 @@ mod tests {
                     continue;
                 }
 
-                let scope = match import.scope {
-                    ManifestScope::Workspace => ManagedScope::Workspace,
-                    ManifestScope::User => ManagedScope::User,
-                };
+                let scope = ManagedScope::from(import.scope);
                 let stored_root = stored_import_root(scope, self.root.path(), &import.id)
                     .expect("stored import root builds");
                 if let Some(parent) = stored_root.parent() {
@@ -1660,7 +1614,7 @@ mod tests {
                 }
             }
 
-            ResolveWorkspaceRequest::new(self.root.path(), self.path("imports"), manifest, lockfile)
+            ResolveWorkspaceRequest::new(self.root.path(), manifest, lockfile)
         }
     }
 

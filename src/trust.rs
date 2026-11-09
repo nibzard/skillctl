@@ -151,11 +151,6 @@ impl SkillTrust {
         }
     }
 
-    /// Return whether this trust decision should emit warnings.
-    pub fn has_warnings(&self) -> bool {
-        !self.warnings.is_empty()
-    }
-
     /// Return whether the trust gate blocks one operation.
     ///
     /// Callers that mutate installed content must refuse when this returns
@@ -305,9 +300,15 @@ impl DiscoveryOriginTrust {
         !matches!(self, Self::InsecureTransport)
     }
 
-    /// Whether telemetry may classify this origin as public.
-    const fn is_public(self) -> bool {
-        matches!(self, Self::VerifiedPublicHttps)
+    /// Stable kebab-case name of this classification, matching the serialized
+    /// form reports carry.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Loopback => "loopback",
+            Self::VerifiedPublicHttps => "verified-public-https",
+            Self::UnverifiedRemote => "unverified-remote",
+            Self::InsecureTransport => "insecure-transport",
+        }
     }
 }
 
@@ -377,11 +378,6 @@ pub fn discovery_origin_warning(trust: DiscoveryOriginTrust, index_url: &str) ->
         // The acquisition is refused before a warning could be shown.
         DiscoveryOriginTrust::InsecureTransport => None,
     }
-}
-
-/// Whether telemetry may report one discovery origin as public.
-pub fn discovery_origin_is_public(index_url: &str) -> bool {
-    discovery_origin_trust(index_url).is_public()
 }
 
 /// Whether a host names this machine, which serves a local index.
@@ -529,7 +525,6 @@ pub fn update_apply_is_gated(
                     .join(&install.source_subpath);
             trust_for_install_record(
                 &install,
-                false,
                 Some(&root),
                 reviews.approved_for_install(&install),
             )?
@@ -700,9 +695,12 @@ pub fn trust_for_revision_apply(
 }
 
 /// Build trust for one current install record using a known effective file root.
+///
+/// The record itself says whether the skill is locally owned: a `builtin://`
+/// source, a detached import, or a fork is local, so no caller needs to pass
+/// that fact in.
 pub fn trust_for_install_record(
     install: &InstallRecord,
-    builtin: bool,
     effective_root: Option<&Path>,
     review: Option<&TrustReviewRecord>,
 ) -> Result<SkillTrust, AppError> {
@@ -711,8 +709,7 @@ pub fn trust_for_install_record(
         None => false,
     };
 
-    if builtin || install.source_url.starts_with("builtin://") || install.detached || install.forked
-    {
+    if install.source_url.starts_with("builtin://") || install.detached || install.forked {
         return Ok(SkillTrust::local(contains_scripts));
     }
 
@@ -787,7 +784,6 @@ mod tests {
 
         assert_eq!(trust, DiscoveryOriginTrust::VerifiedPublicHttps);
         assert!(trust.permits_acquisition());
-        assert!(discovery_origin_is_public(url));
         assert_eq!(discovery_origin_warning(trust, url), None);
     }
 
@@ -798,7 +794,6 @@ mod tests {
 
         assert_eq!(trust, DiscoveryOriginTrust::UnverifiedRemote);
         assert!(trust.permits_acquisition());
-        assert!(!discovery_origin_is_public(url));
         let warning =
             discovery_origin_warning(trust, url).expect("an unverified origin warns on use");
         assert!(
@@ -1259,7 +1254,7 @@ mod tests {
         // reviewed import reports its facts through `contains_scripts` and
         // `review` instead of through a warning.
         assert!(trust.contains_scripts);
-        assert!(!trust.has_warnings());
+        assert!(trust.warnings.is_empty());
         assert_eq!(
             trust.review.as_ref(),
             Some(&approved_review("sha256:effective"))

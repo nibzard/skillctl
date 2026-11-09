@@ -11,8 +11,9 @@ use serde_json::json;
 use crate::{
     app::AppContext,
     error::AppError,
-    history::{HistoryLedger, resolve_installed_skill},
+    history::HistoryLedger,
     response::AppResponse,
+    skill::resolve_installed_skill,
     source::{current_timestamp, stored_import_root},
     state::{InstallRecord, LocalStateStore, ManagedSkillRef, ReviewDecision, TrustReviewRecord},
     trust::{self, ReviewIndex, SkillTrust, TrustState},
@@ -117,7 +118,6 @@ fn install_trust(
     let reviews = ReviewIndex::load(store)?;
     trust::trust_for_install_record(
         install,
-        false,
         Some(&effective_root(context, install)?),
         reviews.approved_for_install(install),
     )
@@ -167,10 +167,15 @@ fn review_status(
                 install.skill.scope.as_str()
             )
         }
-        TrustState::LocalTrusted => format!(
-            "{skill} in {} scope is locally trusted and needs no review.",
-            install.skill.scope.as_str()
-        ),
+        // `ensure_review_supported` refuses the builtin, detached, and forked
+        // installs that `trust_for_install_record` marks locally trusted, so
+        // that state cannot reach the report. Re-run the guard instead of
+        // duplicating its refusal, keeping one source of truth if the two ever
+        // disagree.
+        TrustState::LocalTrusted => {
+            ensure_review_supported(install)?;
+            unreachable!("the review guard accepted a locally trusted install");
+        }
     };
 
     let mut response = AppResponse::success("review")

@@ -37,6 +37,9 @@ const HOLD_UNTIL_ENV: &str = "SKILLCTL_LIFECYCLE_HOLD";
 /// at the first boundary it reaches.
 const HOLD_AT_ENV: &str = "SKILLCTL_LIFECYCLE_HOLD_AT";
 /// Environment variable bounding how long a held transaction waits.
+///
+/// The value goes through the shared env-millisecond parser, so a configured
+/// zero still waits one millisecond instead of timing out on the first poll.
 const HOLD_TIMEOUT_ENV: &str = "SKILLCTL_LIFECYCLE_HOLD_TIMEOUT_MS";
 /// Default wait for a held transaction.
 const DEFAULT_HOLD_TIMEOUT: Duration = Duration::from_secs(60);
@@ -179,7 +182,11 @@ fn hold_at_boundary(operation: &str, label: &str) -> Result<(), AppError> {
         return Ok(());
     }
 
-    let deadline = Instant::now() + env_timeout(HOLD_TIMEOUT_ENV).unwrap_or(DEFAULT_HOLD_TIMEOUT);
+    let deadline = Instant::now()
+        + state::env_millisecond_timeout(
+            env::var(HOLD_TIMEOUT_ENV).ok().as_deref(),
+            DEFAULT_HOLD_TIMEOUT,
+        );
     while !Path::new(&sentinel).exists() {
         if Instant::now() >= deadline {
             return Err(AppError::FilesystemOperation {
@@ -192,11 +199,4 @@ fn hold_at_boundary(operation: &str, label: &str) -> Result<(), AppError> {
     }
 
     Ok(())
-}
-
-fn env_timeout(name: &str) -> Option<Duration> {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(Duration::from_millis)
 }

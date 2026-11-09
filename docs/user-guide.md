@@ -202,11 +202,14 @@ declares, and recorded as a `well-known` import whose pinned revision is that
 verified digest. Use `skillctl discover <url>` first to see what an index
 declares.
 
-An origin-trust policy gates every discovery read. A loopback origin serves a
-local index. An HTTPS origin that is not a verified publisher installs with a
-warning, and its telemetry events stay suppressed. A plain-HTTP origin off
-loopback is refused, because an attacker on the network could serve an index
-whose artifacts match the digests the attacker declared.
+An origin-trust policy gates every discovery read, not only the index fetch: an
+artifact URL the index declares is evaluated against the same policy before it
+is downloaded, and every redirect hop is re-evaluated too, so an index read from
+a permitted origin cannot move a download onto a transport the policy refuses.
+A loopback origin serves a local index. An HTTPS origin that is not a verified
+publisher installs with a warning, and its telemetry events stay suppressed. A
+plain-HTTP origin off loopback is refused, because an attacker on the network
+could serve an index whose artifacts match the digests the attacker declared.
 
 `skillctl discover <url>` prints the index report without installing. The
 report is read-only: it writes no workspace file and touches no local state.
@@ -623,6 +626,12 @@ When one file holds both a copy edit and an unpinned overlay edit, a repair
 keeps one of them. `overlay` and `fork` keep the copy edit, because preserving
 an unmanaged edit is what they exist to do. `discard` backs the copy edit up and
 projects the overlay. Review the overlay change before you run either.
+
+The same rule protects an overlay edit that a pinned lockfile already records.
+When the copy edit and that overlay edit both change the same imported file, the
+copy edit wins the overlay, the variant it replaces is copied to a durable
+backup under `~/.skillctl/store/discards/`, and the report names the backup
+path, so neither edit is lost silently.
 
 ## Restoring A Team Checkout
 

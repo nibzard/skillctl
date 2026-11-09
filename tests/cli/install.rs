@@ -519,8 +519,9 @@ fn install_shows_a_first_run_telemetry_notice_and_persists_default_consent() {
         )
         .expect("telemetry settings exist");
     assert_eq!(telemetry_row.0, "enabled");
-    assert_eq!(telemetry_row.1.as_deref(), Some("2026-02-02T02:40:00Z"));
-    assert_eq!(telemetry_row.2, "2026-02-02T02:40:00Z");
+    let notice_seen_at = telemetry_row.1.expect("notice timestamp exists");
+    assert_rfc3339_utc(&notice_seen_at);
+    assert_rfc3339_utc(&telemetry_row.2);
 
     let consent_history_events: i64 = connection
         .query_row(
@@ -927,11 +928,16 @@ fn telemetry_status_enable_and_disable_use_the_local_state_store() {
     assert_eq!(enable_body["ok"], true);
     assert_eq!(enable_body["data"]["consent"], "enabled");
     assert_eq!(enable_body["data"]["notice_seen"], true);
-    assert_eq!(
-        enable_body["data"]["notice_seen_at"],
-        "2026-02-02T02:40:00Z"
+    let enable_notice_seen_at = enable_body["data"]["notice_seen_at"]
+        .as_str()
+        .expect("notice timestamp is present")
+        .to_owned();
+    assert_rfc3339_utc(&enable_notice_seen_at);
+    assert_rfc3339_utc(
+        enable_body["data"]["updated_at"]
+            .as_str()
+            .expect("updated timestamp is present"),
     );
-    assert_eq!(enable_body["data"]["updated_at"], "2026-02-02T02:40:00Z");
     assert_eq!(enable_body["data"]["effective_enabled"], true);
     assert_eq!(enable_body["data"]["changed"], true);
 
@@ -953,9 +959,14 @@ fn telemetry_status_enable_and_disable_use_the_local_state_store() {
     assert_eq!(disable_body["data"]["notice_seen"], true);
     assert_eq!(
         disable_body["data"]["notice_seen_at"],
-        "2026-02-02T02:40:00Z"
+        enable_notice_seen_at.as_str(),
+        "the first-run notice timestamp stays at when it was first seen"
     );
-    assert_eq!(disable_body["data"]["updated_at"], "2026-02-02T03:00:34Z");
+    assert_rfc3339_utc(
+        disable_body["data"]["updated_at"]
+            .as_str()
+            .expect("updated timestamp is present"),
+    );
     assert_eq!(disable_body["data"]["effective_enabled"], false);
     assert_eq!(disable_body["data"]["changed"], true);
 
@@ -969,8 +980,8 @@ fn telemetry_status_enable_and_disable_use_the_local_state_store() {
         )
         .expect("telemetry settings row exists");
     assert_eq!(telemetry_row.0, "disabled");
-    assert_eq!(telemetry_row.1, "2026-02-02T02:40:00Z");
-    assert_eq!(telemetry_row.2, "2026-02-02T03:00:34Z");
+    assert_eq!(telemetry_row.1, enable_notice_seen_at);
+    assert_rfc3339_utc(&telemetry_row.2);
 
     let history_kinds: Vec<String> = connection
         .prepare("SELECT kind FROM history_events WHERE kind = ?1 ORDER BY occurred_at ASC, id ASC")

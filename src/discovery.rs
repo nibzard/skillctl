@@ -19,6 +19,14 @@
 //! - The declared SHA-256 digest is verified over the fetched bytes before the
 //!   content is used, as the RFC requires. A mismatch is a validation failure
 //!   and the bytes are discarded.
+//! - The origin-trust policy gates every read, not only the index read: an
+//!   artifact URL an index declares is evaluated against the policy before it
+//!   is fetched, so an index read from a permitted origin still cannot name an
+//!   artifact origin the policy refuses.
+//! - HTTP redirects are followed one hop at a time, and every hop is
+//!   re-evaluated against the origin-trust policy, so a redirect cannot move a
+//!   read onto a transport or host the policy did not permit for the URL
+//!   skillctl names. See [`HttpTransport`].
 //! - `skill-md` artifacts are staged as a synthetic skill directory under the
 //!   direct-skill packaging root.
 //! - `archive` artifacts are unpacked in process, never through a shell tool,
@@ -60,6 +68,13 @@ const MAX_INDEX_BYTES: u64 = 4 * 1024 * 1024;
 /// rejected before it is hashed or unpacked, which also bounds the memory one
 /// fetch can hold.
 const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Most redirect hops one discovery fetch follows.
+///
+/// Every hop is re-checked against the origin-trust policy, so a chain that
+/// exceeds this limit fails loudly instead of reading whatever the loop ends
+/// on.
+const MAX_REDIRECT_HOPS: usize = 5;
 
 /// Artifact distribution type declared by a discovery index entry.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -124,13 +139,6 @@ impl ArtifactDigest {
     /// Return the full digest string as declared.
     pub fn as_str(&self) -> &str {
         &self.value
-    }
-
-    /// Return the 64 lowercase hexadecimal characters without the prefix.
-    pub fn hex(&self) -> &str {
-        self.value
-            .strip_prefix("sha256:")
-            .unwrap_or(self.value.as_str())
     }
 }
 
@@ -223,25 +231,32 @@ pub fn resolve_target(raw: &str) -> Result<DiscoveryTarget, AppError> {
 /// Absolute URLs are used as declared. Path-absolute URLs resolve against the
 /// index origin, and relative URLs resolve against the index URL's directory,
 /// both following RFC 3986 section 5.
+///
+/// An absolute URL must be an HTTP or HTTPS URL with a host name, whatever
+/// branch resolves it: a URL such as `mailto:` or `data:` has no host, so it
+/// never falls through to the join, which would return it unchanged.
 pub fn resolve_artifact_url(index_url: &Url, declared: &str) -> Result<Url, String> {
     let trimmed = declared.trim();
     if trimmed.is_empty() {
         return Err("must not be empty".to_string());
     }
 
-    if let Ok(absolute) = Url::parse(trimmed)
-        && absolute.has_host()
-    {
-        return if matches!(absolute.scheme(), "http" | "https") {
-            Ok(absolute)
-        } else {
-            Err(format!(
+    if let Ok(absolute) = Url::parse(trimmed) {
+        if !matches!(absolute.scheme(), "http" | "https") {
+            return Err(format!(
                 "unsupported scheme '{}'; use http or https",
                 absolute.scheme()
-            ))
-        };
+            ));
+        }
+        if !absolute.has_host() {
+            return Err("must include a host name".to_string());
+        }
+        return Ok(absolute);
     }
 
+    // Only relative references reach the join, and a relative reference
+    // inherits the index URL's scheme and host, both of which resolve_target
+    // already validated.
     index_url
         .join(trimmed)
         .map_err(|source| format!("cannot be resolved against the index URL: {source}"))
@@ -335,12 +350,12 @@ pub fn parse_index(body: &str, index_url: &Url) -> Result<DiscoveryIndex, AppErr
                 format!("{label} field 'description' must not be empty"),
             ));
         }
-        if description.len() > 1_024 {
+        if description.chars().count() > 1_024 {
             return Err(discovery_validation(
                 input,
                 format!(
                     "{label} field 'description' must be at most 1024 characters, found {}",
-                    description.len()
+                    description.chars().count()
                 ),
             ));
         }
@@ -379,11 +394,38 @@ pub fn parse_index(body: &str, index_url: &Url) -> Result<DiscoveryIndex, AppErr
     })
 }
 
+/// One fetched discovery document together with the URL that served it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FetchedDocument {
+    /// URL whose response produced the body: the requested URL, or the last
+    /// redirect hop the origin-trust policy permitted.
+    ///
+    /// The document's relative artifact URLs resolve against this URL, so
+    /// consumers that report an origin or classify one name the host that
+    /// actually served the bytes instead of the URL the redirect started from.
+    pub url: Url,
+    /// Document bytes.
+    pub body: Vec<u8>,
+}
+
 /// Network access for discovery documents and artifacts.
 ///
 /// The trait keeps fetch side effects out of the pure resolution and
 /// validation logic so discovery can be tested without a network.
 pub trait DiscoveryTransport {
+    /// Fetch the discovery index document at `url` and name the URL that
+    /// served it.
+    ///
+    /// The default implementation does not follow redirects, so it reports the
+    /// URL it was asked for. [`HttpTransport`] overrides this to follow every
+    /// hop the origin-trust policy permits and name the final URL.
+    fn fetch_resolved(&self, url: &Url) -> Result<FetchedDocument, AppError> {
+        self.fetch(url).map(|body| FetchedDocument {
+            url: url.clone(),
+            body,
+        })
+    }
+
     /// Fetch the raw bytes of the discovery index document at `url`.
     fn fetch(&self, url: &Url) -> Result<Vec<u8>, AppError>;
 
@@ -392,6 +434,12 @@ pub trait DiscoveryTransport {
 }
 
 /// Default HTTPS transport for discovery documents and artifacts.
+///
+/// The transport never lets the HTTP library follow a redirect by itself.
+/// Every hop is re-evaluated against the origin-trust policy through
+/// [`ensure_redirect_permitted`] before the next request is made, so a
+/// `Location` header cannot move a read onto a transport the policy refuses or
+/// onto a host the URL skillctl records never described.
 #[derive(Clone, Copy, Debug)]
 pub struct HttpTransport {
     /// Connect timeout in seconds.
@@ -410,52 +458,132 @@ impl Default for HttpTransport {
 }
 
 impl DiscoveryTransport for HttpTransport {
+    fn fetch_resolved(&self, url: &Url) -> Result<FetchedDocument, AppError> {
+        self.get_resolved(url, MAX_INDEX_BYTES, "index document")
+    }
+
     fn fetch(&self, url: &Url) -> Result<Vec<u8>, AppError> {
-        self.get(url, MAX_INDEX_BYTES, "index document")
-            .map_err(|message| AppError::DiscoveryFetch {
-                url: url.to_string(),
-                message,
-            })
+        self.get_resolved(url, MAX_INDEX_BYTES, "index document")
+            .map(|fetched| fetched.body)
     }
 
     fn fetch_artifact(&self, url: &Url) -> Result<Vec<u8>, AppError> {
-        self.get(url, MAX_ARTIFACT_BYTES, "downloaded artifact")
-            .map_err(|message| AppError::DiscoveryFetch {
-                url: url.to_string(),
-                message,
-            })
+        self.get_resolved(url, MAX_ARTIFACT_BYTES, "downloaded artifact")
+            .map(|fetched| fetched.body)
     }
 }
 
 impl HttpTransport {
-    /// GET `url` and return at most `max_bytes` bytes of `what`.
+    /// GET `url`, follow the redirects the origin-trust policy permits, and
+    /// return at most `max_bytes` bytes of `what` with the URL that served
+    /// them.
     ///
     /// Reading stops one byte past the limit so an oversized body is reported
     /// instead of being silently truncated.
-    fn get(&self, url: &Url, max_bytes: u64, what: &str) -> Result<Vec<u8>, String> {
+    fn get_resolved(
+        &self,
+        url: &Url,
+        max_bytes: u64,
+        what: &str,
+    ) -> Result<FetchedDocument, AppError> {
         let agent = ureq::AgentBuilder::new()
+            .redirects(0)
             .timeout_connect(Duration::from_secs(self.connect_timeout_seconds))
             .timeout(Duration::from_secs(self.request_timeout_seconds))
             .user_agent(concat!("skillctl/", env!("CARGO_PKG_VERSION")))
             .build();
 
-        let response = agent
-            .get(url.as_str())
-            .call()
-            .map_err(fetch_failure_message)?;
+        let mut current = url.clone();
+        for _ in 0..MAX_REDIRECT_HOPS {
+            let response =
+                agent
+                    .get(current.as_str())
+                    .call()
+                    .map_err(|error| AppError::DiscoveryFetch {
+                        url: current.to_string(),
+                        message: fetch_failure_message(error),
+                    })?;
 
-        let mut body = Vec::new();
-        response
-            .into_reader()
-            .take(max_bytes.saturating_add(1))
-            .read_to_end(&mut body)
-            .map_err(|source| format!("failed to read the response body: {source}"))?;
-        if body.len() as u64 > max_bytes {
-            return Err(format!("{what} is larger than the {max_bytes} byte limit"));
+            if (300..399).contains(&response.status()) {
+                let Some(location) = response.header("location") else {
+                    return Err(AppError::DiscoveryFetch {
+                        url: current.to_string(),
+                        message: format!(
+                            "origin responded with HTTP {} without a Location header",
+                            response.status()
+                        ),
+                    });
+                };
+                let next = current
+                    .join(location)
+                    .map_err(|source| AppError::DiscoveryFetch {
+                        url: current.to_string(),
+                        message: format!(
+                            "cannot resolve the redirect target '{location}': {source}"
+                        ),
+                    })?;
+                ensure_redirect_permitted(url, &next)?;
+                current = next;
+                continue;
+            }
+
+            let mut body = Vec::new();
+            response
+                .into_reader()
+                .take(max_bytes.saturating_add(1))
+                .read_to_end(&mut body)
+                .map_err(|source| AppError::DiscoveryFetch {
+                    url: current.to_string(),
+                    message: format!("failed to read the response body: {source}"),
+                })?;
+            if body.len() as u64 > max_bytes {
+                return Err(AppError::DiscoveryFetch {
+                    url: current.to_string(),
+                    message: format!("{what} is larger than the {max_bytes} byte limit"),
+                });
+            }
+
+            return Ok(FetchedDocument { url: current, body });
         }
 
-        Ok(body)
+        Err(AppError::DiscoveryFetch {
+            url: url.to_string(),
+            message: format!("origin redirected more than {MAX_REDIRECT_HOPS} times"),
+        })
     }
+}
+
+/// Whether one redirect hop may be followed while fetching `requested`.
+///
+/// The `Location` header is attacker-influenced input, so both checks re-run
+/// for every hop:
+///
+/// - The full origin-trust policy must permit the hop URL, which refuses a
+///   downgrade to plain HTTP off loopback and every non-HTTP(S) scheme.
+/// - The hop may not change the origin-trust classification of the URL
+///   skillctl names. Consumers such as telemetry classify the URL the user
+///   supplied and the lockfile records, so a verified publisher must not lend
+///   its classification to another host, and a loopback index must not move a
+///   read onto a remote one.
+pub(crate) fn ensure_redirect_permitted(requested: &Url, hop: &Url) -> Result<(), AppError> {
+    crate::trust::ensure_discovery_origin_permits_acquisition(hop.as_str())?;
+
+    let requested_trust = crate::trust::discovery_origin_trust(requested.as_str());
+    let hop_trust = crate::trust::discovery_origin_trust(hop.as_str());
+    if requested_trust != hop_trust {
+        return Err(AppError::DiscoveryValidation {
+            input: requested.to_string(),
+            message: format!(
+                "the origin trust policy refuses the redirect to '{hop}': it would move the \
+                 read from a {} origin to a {} origin, and the URL skillctl records must name \
+                 the origin that serves the content",
+                requested_trust.as_str(),
+                hop_trust.as_str()
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 /// Describe a `ureq` failure without exposing library internals.
@@ -502,16 +630,19 @@ pub fn discover_with_transport(
     // Reading an index is acquisition too, so the origin-trust policy gates it:
     // an origin the policy refuses is never read, and one it did not verify is
     // named in a warning instead of passing silently.
-    let origin_trust =
-        crate::trust::ensure_discovery_origin_permits_acquisition(target.index_url.as_str())?;
-    let body = transport.fetch(&target.index_url)?;
-    let document = String::from_utf8(body).map_err(|_| {
+    crate::trust::ensure_discovery_origin_permits_acquisition(target.index_url.as_str())?;
+    let fetched = transport.fetch_resolved(&target.index_url)?;
+    let document = String::from_utf8(fetched.body).map_err(|_| {
         discovery_validation(
             target.index_url.as_str(),
             "index document is not valid UTF-8",
         )
     })?;
-    let index = parse_index(&document, &target.index_url)?;
+    // The document's relative artifact URLs resolve against the URL that
+    // served it, and the trust a consumer reports is the trust of that URL,
+    // not of the URL a redirect started from.
+    let index = parse_index(&document, &fetched.url)?;
+    let origin_trust = crate::trust::discovery_origin_trust(fetched.url.as_str());
 
     let skills: Vec<Value> = index
         .entries
@@ -544,9 +675,24 @@ pub fn discover_with_transport(
             "skills": skills,
         }));
     if let Some(warning) =
-        crate::trust::discovery_origin_warning(origin_trust, target.index_url.as_str())
+        crate::trust::discovery_origin_warning(origin_trust, fetched.url.as_str())
     {
         response = response.with_warning(warning);
+    }
+    // An index may point artifacts at another origin. Acquisition gates that
+    // origin separately, and an origin the policy did not verify is named in a
+    // warning here too, so an unverified artifact origin never hides behind a
+    // trusted index origin.
+    let mut warned_artifact_origins = std::collections::BTreeSet::new();
+    for entry in &index.entries {
+        let artifact_trust = crate::trust::discovery_origin_trust(entry.url.as_str());
+        if artifact_trust != origin_trust
+            && warned_artifact_origins.insert(entry.url.to_string())
+            && let Some(warning) =
+                crate::trust::discovery_origin_warning(artifact_trust, entry.url.as_str())
+        {
+            response = response.with_warning(warning);
+        }
     }
     for warning in &index.skipped {
         response = response.with_warning(warning.clone());
@@ -571,13 +717,6 @@ pub struct FetchedArtifact {
     pub digest: ArtifactDigest,
     /// Verified artifact bytes.
     pub bytes: Vec<u8>,
-}
-
-impl FetchedArtifact {
-    /// Number of verified bytes.
-    pub fn byte_size(&self) -> u64 {
-        self.bytes.len() as u64
-    }
 }
 
 /// One verified discovery artifact staged as a local install source.
@@ -618,6 +757,12 @@ fn fetch_artifact_within(
     transport: &dyn DiscoveryTransport,
     max_bytes: u64,
 ) -> Result<FetchedArtifact, AppError> {
+    // Reading an artifact is acquisition too, so the origin-trust policy gates
+    // the artifact URL itself: an index read from a permitted origin may still
+    // declare an artifact on an origin the policy refuses, and the digest the
+    // same document declares cannot vouch for the transport it arrives over.
+    crate::trust::ensure_discovery_origin_permits_acquisition(entry.url.as_str())?;
+
     let bytes = transport
         .fetch_artifact(&entry.url)
         .map_err(|error| match error {
@@ -698,14 +843,14 @@ pub fn lookup_index_entry(
     transport: &dyn DiscoveryTransport,
 ) -> Result<IndexLookup, AppError> {
     let target = resolve_target(index_url)?;
-    let body = transport.fetch(&target.index_url)?;
-    let document = String::from_utf8(body).map_err(|_| {
+    let fetched = transport.fetch_resolved(&target.index_url)?;
+    let document = String::from_utf8(fetched.body).map_err(|_| {
         discovery_validation(
             target.index_url.as_str(),
             "index document is not valid UTF-8",
         )
     })?;
-    let index = parse_index(&document, &target.index_url)?;
+    let index = parse_index(&document, &fetched.url)?;
 
     Ok(index
         .entries
@@ -813,22 +958,27 @@ mod tests {
         }
     }
 
-    /// Transport that serves prepared artifact responses by URL path.
+    /// Transport that serves prepared responses by full URL.
+    ///
+    /// Matching the full URL, not only the path, lets a test observe that a
+    /// fetch was skipped: an entry may declare an artifact on another origin,
+    /// and the double serves digest-matching bytes there, so a refusal proves
+    /// the gate ran before the transport was asked for anything.
     struct ArtifactTransport {
         responses: Vec<(String, Result<Vec<u8>, String>)>,
     }
 
     impl ArtifactTransport {
-        /// Serve `body` at `path`.
-        fn new(path: &str, body: Result<Vec<u8>, String>) -> Self {
+        /// Serve `body` at `url`.
+        fn new(url: &str, body: Result<Vec<u8>, String>) -> Self {
             Self {
-                responses: vec![(path.to_string(), body)],
+                responses: vec![(url.to_string(), body)],
             }
         }
 
         fn lookup(&self, url: &Url) -> Result<Vec<u8>, AppError> {
-            for (path, body) in &self.responses {
-                if url.path() == path {
+            for (served_url, body) in &self.responses {
+                if url.as_str() == served_url {
                     return match body {
                         Ok(bytes) => Ok(bytes.clone()),
                         Err(message) => Err(AppError::DiscoveryFetch {
@@ -856,22 +1006,38 @@ mod tests {
         }
     }
 
-    /// One index entry whose digest matches `bytes`, served at `path`.
-    fn artifact_entry(
+    /// Artifact URL on the example origin a path declares.
+    fn example_url(path: &str) -> String {
+        format!("https://example.com{path}")
+    }
+
+    /// One index entry whose digest matches `bytes`, served at `url`.
+    fn artifact_entry_at_url(
         name: &str,
         artifact_type: ArtifactType,
-        path: &str,
+        url: &str,
         bytes: &[u8],
     ) -> DiscoveryEntry {
         DiscoveryEntry {
             name: name.to_string(),
             artifact_type,
             description: "Does one thing well.".to_string(),
-            declared_url: path.to_string(),
-            url: Url::parse(&format!("https://example.com{path}")).expect("artifact url parses"),
+            declared_url: url.to_string(),
+            url: Url::parse(url).expect("artifact url parses"),
             digest: ArtifactDigest::parse(&format!("sha256:{}", sha256_hex(bytes)))
                 .expect("digest parses"),
         }
+    }
+
+    /// One index entry whose digest matches `bytes`, served at `path` on the
+    /// example origin.
+    fn artifact_entry(
+        name: &str,
+        artifact_type: ArtifactType,
+        path: &str,
+        bytes: &[u8],
+    ) -> DiscoveryEntry {
+        artifact_entry_at_url(name, artifact_type, &example_url(path), bytes)
     }
 
     /// A `SKILL.md` body for the skill called `name`.
@@ -963,7 +1129,7 @@ mod tests {
     }
 
     #[test]
-    fn absolute_artifact_urls_are_kept_and_other_schemes_are_rejected() {
+    fn absolute_artifact_urls_are_kept_and_non_http_schemes_are_rejected() {
         let resolved = resolve_artifact_url(
             &index_url(),
             "https://cdn.example.com/v2/git-workflow/SKILL.md",
@@ -974,9 +1140,28 @@ mod tests {
             "https://cdn.example.com/v2/git-workflow/SKILL.md",
         );
 
-        assert!(resolve_artifact_url(&index_url(), "ftp://cdn.example.com/skill.md").is_err());
-        assert!(resolve_artifact_url(&index_url(), "").is_err());
-        assert!(resolve_artifact_url(&index_url(), "   ").is_err());
+        // A URL with a host and a URL without one are both refused by the same
+        // scheme rule. A host-less URL must never fall through to the join,
+        // which would return the absolute reference unchanged.
+        let mailto = resolve_artifact_url(&index_url(), "mailto:ops@example.com")
+            .expect_err("a mailto URL is not an artifact URL");
+        assert!(
+            mailto.contains("unsupported scheme 'mailto'"),
+            "unexpected reason: {mailto}"
+        );
+        for declared in [
+            "ftp://cdn.example.com/skill.md",
+            "mailto:ops@example.com",
+            "data:text/plain,hello",
+            "file:/tmp/skill.tar.gz",
+            "",
+            "   ",
+        ] {
+            assert!(
+                resolve_artifact_url(&index_url(), declared).is_err(),
+                "'{declared}' must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -990,7 +1175,6 @@ mod tests {
         let digest =
             ArtifactDigest::parse(&format!("sha256:{}", hex64("c4d5e6f7"))).expect("digest parses");
         assert_eq!(digest.as_str(), format!("sha256:{}", hex64("c4d5e6f7")));
-        assert_eq!(digest.hex(), hex64("c4d5e6f7"));
     }
 
     #[test]
@@ -1134,6 +1318,38 @@ mod tests {
     }
 
     #[test]
+    fn description_limits_count_characters_not_bytes() {
+        // 700 of these characters are 2,100 UTF-8 bytes, so the entry stays
+        // inside a 1024-character limit only when the limit counts characters.
+        let description = "検".repeat(700);
+        assert!(description.len() > 1_024);
+        let document = index_json(&[format!(
+            "{{\"name\":\"code-review\",\"type\":\"skill-md\",\
+             \"description\":\"{description}\",\"url\":\"a/SKILL.md\",\
+             \"digest\":\"sha256:{}\"}}",
+            hex64("c4d5e6f7")
+        )]);
+
+        let index = parse_index(&document, &index_url())
+            .expect("a description within the character limit parses");
+        assert_eq!(index.entries[0].description.chars().count(), 700);
+
+        let too_long = "検".repeat(1_025);
+        let document = index_json(&[format!(
+            "{{\"name\":\"code-review\",\"type\":\"skill-md\",\
+             \"description\":\"{too_long}\",\"url\":\"a/SKILL.md\",\
+             \"digest\":\"sha256:{}\"}}",
+            hex64("c4d5e6f7")
+        )]);
+        let error = parse_index(&document, &index_url())
+            .expect_err("a description past the character limit is rejected");
+        assert!(
+            error.to_string().contains("found 1025"),
+            "the stated count is in characters: {error}"
+        );
+    }
+
+    #[test]
     fn lookup_index_entry_finds_and_misses_entries_by_name() {
         let transport = FixedTransport {
             body: Ok(index_json(&[valid_entry_json(
@@ -1207,6 +1423,35 @@ mod tests {
     }
 
     #[test]
+    fn discover_warns_about_artifact_origins_the_index_origin_did_not_vouch_for() {
+        // The index is read from a loopback origin while its entry declares an
+        // artifact on an unverified remote one, so the report names that
+        // artifact origin instead of letting it hide behind the index origin.
+        let transport = FixedTransport {
+            body: Ok(index_json(&[valid_entry_json(
+                "code-review",
+                "skill-md",
+                "https://cdn.example.com/v2/code-review/SKILL.md",
+            )])
+            .into_bytes()),
+        };
+
+        let response =
+            discover_with_transport(DiscoverRequest::new("http://127.0.0.1:8799"), &transport)
+                .expect("discovery succeeds");
+
+        assert_eq!(response.data["origin_trust"], "loopback");
+        assert!(
+            response.warnings.iter().any(|warning| {
+                warning.contains("https://cdn.example.com/v2/code-review/SKILL.md")
+                    && warning.contains("not on the verified public publisher list")
+            }),
+            "unexpected warnings: {:?}",
+            response.warnings
+        );
+    }
+
+    #[test]
     fn discover_maps_fetch_failures_to_operational_errors() {
         let transport = FixedTransport {
             body: Err("origin responded with HTTP 404".to_string()),
@@ -1236,6 +1481,133 @@ mod tests {
     }
 
     #[test]
+    fn redirect_hops_re_run_the_origin_trust_policy_on_every_hop() {
+        let url = |raw: &str| Url::parse(raw).expect("url parses");
+
+        // A hop that keeps the classification moves the read inside what the
+        // policy already permits for the URL skillctl names.
+        assert!(
+            ensure_redirect_permitted(
+                &url("https://skills.example.com/index.json"),
+                &url("https://cdn.skills.example.com/v2/index.json"),
+            )
+            .is_ok()
+        );
+        assert!(
+            ensure_redirect_permitted(
+                &url("http://127.0.0.1:8799/index.json"),
+                &url("http://localhost:9000/index.json"),
+            )
+            .is_ok()
+        );
+
+        // A downgrade to plain HTTP off loopback is refused by the same policy
+        // that gates the first request.
+        let error = ensure_redirect_permitted(
+            &url("https://skills.example.com/index.json"),
+            &url("http://mirror.example.net/index.json"),
+        )
+        .expect_err("a downgrade to plain HTTP is refused");
+        assert!(matches!(error, AppError::DiscoveryValidation { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("origin trust policy refuses this discovery origin"),
+            "unexpected refusal: {error}"
+        );
+
+        // A hop that changes the classification of the named URL is refused
+        // too: a verified publisher cannot lend its classification to another
+        // host, and a loopback index cannot move a read onto a remote one.
+        let error = ensure_redirect_permitted(
+            &url("https://www.russ.cloud/.well-known/agent-skills/index.json"),
+            &url("https://private.internal.example.net/index.json"),
+        )
+        .expect_err("a verified origin cannot transfer its classification");
+        assert!(matches!(error, AppError::DiscoveryValidation { .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains("verified-public-https") && message.contains("unverified-remote"),
+            "the refusal names both classifications: {message}"
+        );
+        assert!(
+            ensure_redirect_permitted(
+                &url("http://127.0.0.1:8799/index.json"),
+                &url("https://skills.example.com/index.json"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fetch_artifact_refuses_an_artifact_origin_the_policy_blocks() {
+        // An index read from a permitted origin may still declare its artifact
+        // on a plain-HTTP one. The double serves digest-matching bytes at that
+        // exact URL, so only the origin-trust gate can refuse here: with the
+        // gate missing, the fetch would succeed and the digest would match.
+        let bytes = skill_md("code-review").into_bytes();
+        let entry = artifact_entry_at_url(
+            "code-review",
+            ArtifactType::SkillMd,
+            "http://mirror.example.com/artifacts/SKILL.md",
+            &bytes,
+        );
+        let transport =
+            ArtifactTransport::new("http://mirror.example.com/artifacts/SKILL.md", Ok(bytes));
+
+        let error = fetch_artifact(&entry, &transport)
+            .expect_err("an artifact origin the policy refuses is never fetched");
+
+        assert!(
+            matches!(error, AppError::DiscoveryValidation { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("origin trust policy refuses this discovery origin"),
+            "the refusal names the policy: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("http://mirror.example.com/artifacts/SKILL.md"),
+            "the refusal names the artifact origin: {error}"
+        );
+        assert_eq!(
+            error.exit_status(),
+            crate::error::ExitStatus::ValidationFailure
+        );
+    }
+
+    #[test]
+    fn fetch_artifact_reads_an_artifact_origin_the_policy_permits() {
+        // An HTTPS artifact origin the policy did not verify permits the
+        // acquisition the way an unverified index origin does: the declared
+        // digest still verifies the fetched bytes.
+        let bytes = skill_md("code-review").into_bytes();
+        let entry = artifact_entry_at_url(
+            "code-review",
+            ArtifactType::SkillMd,
+            "https://cdn.example.com/artifacts/SKILL.md",
+            &bytes,
+        );
+        let transport = ArtifactTransport::new(
+            "https://cdn.example.com/artifacts/SKILL.md",
+            Ok(bytes.clone()),
+        );
+
+        let fetched = fetch_artifact(&entry, &transport)
+            .expect("an unverified HTTPS artifact origin permits acquisition");
+
+        assert_eq!(fetched.bytes, bytes);
+        assert_eq!(
+            fetched.url.as_str(),
+            "https://cdn.example.com/artifacts/SKILL.md"
+        );
+    }
+
+    #[test]
     fn fetch_artifact_returns_bytes_that_match_the_declared_digest() {
         let bytes = skill_md("code-review").into_bytes();
         let entry = artifact_entry(
@@ -1244,13 +1616,14 @@ mod tests {
             "/artifacts/SKILL.md",
             &bytes,
         );
-        let transport = ArtifactTransport::new("/artifacts/SKILL.md", Ok(bytes.clone()));
+        let transport =
+            ArtifactTransport::new(&example_url("/artifacts/SKILL.md"), Ok(bytes.clone()));
 
         let fetched = fetch_artifact(&entry, &transport).expect("verified artifact is returned");
 
         assert_eq!(fetched.name, "code-review");
         assert_eq!(fetched.artifact_type, ArtifactType::SkillMd);
-        assert_eq!(fetched.byte_size(), bytes.len() as u64);
+        assert_eq!(fetched.bytes.len(), bytes.len());
         assert_eq!(fetched.bytes, bytes);
         assert_eq!(fetched.digest.as_str(), entry.digest.as_str());
     }
@@ -1267,7 +1640,8 @@ mod tests {
         // A digest declared for other bytes, the way a stale index does.
         entry.digest =
             ArtifactDigest::parse(&format!("sha256:{}", hex64("0f1e2d3c"))).expect("digest parses");
-        let transport = ArtifactTransport::new("/artifacts/SKILL.md", Ok(served.clone()));
+        let transport =
+            ArtifactTransport::new(&example_url("/artifacts/SKILL.md"), Ok(served.clone()));
 
         let error =
             fetch_artifact(&entry, &transport).expect_err("a digest mismatch refuses the bytes");
@@ -1304,7 +1678,7 @@ mod tests {
             "/artifacts/demo.tar.gz",
             &served,
         );
-        let transport = ArtifactTransport::new("/artifacts/demo.tar.gz", Ok(served));
+        let transport = ArtifactTransport::new(&example_url("/artifacts/demo.tar.gz"), Ok(served));
 
         let error = fetch_artifact_within(&entry, &transport, 8)
             .expect_err("an oversized artifact is refused before it is used");
@@ -1329,7 +1703,7 @@ mod tests {
             &bytes,
         );
         let transport = ArtifactTransport::new(
-            "/artifacts/SKILL.md",
+            &example_url("/artifacts/SKILL.md"),
             Err("origin responded with HTTP 500".to_string()),
         );
 
@@ -1358,7 +1732,8 @@ mod tests {
             "/artifacts/SKILL.md",
             &bytes,
         );
-        let transport = ArtifactTransport::new("/artifacts/SKILL.md", Ok(bytes.clone()));
+        let transport =
+            ArtifactTransport::new(&example_url("/artifacts/SKILL.md"), Ok(bytes.clone()));
 
         let staged =
             fetch_and_stage_artifact(&entry, &transport).expect("a verified skill-md entry stages");
@@ -1391,7 +1766,7 @@ mod tests {
             "/wrangler.tar.gz",
             &bytes,
         );
-        let transport = ArtifactTransport::new("/wrangler.tar.gz", Ok(bytes));
+        let transport = ArtifactTransport::new(&example_url("/wrangler.tar.gz"), Ok(bytes));
 
         let staged =
             fetch_and_stage_artifact(&entry, &transport).expect("a verified archive stages");
@@ -1424,7 +1799,7 @@ mod tests {
             "/wrangler.tar.gz",
             &bytes,
         );
-        let transport = ArtifactTransport::new("/wrangler.tar.gz", Ok(bytes));
+        let transport = ArtifactTransport::new(&example_url("/wrangler.tar.gz"), Ok(bytes));
 
         let error = fetch_and_stage_artifact(&entry, &transport)
             .expect_err("a traversal archive refuses staging");

@@ -80,7 +80,7 @@ fn workspace_copy_mode_matrix_matches_spec_target_combinations() {
         let workspace = TestWorkspace::new();
         workspace.copy_fixture("canonical-only", "");
         workspace.write_manifest_for_targets(case.targets);
-        workspace.write_lockfile(MINIMAL_LOCKFILE);
+        workspace.write_lockfile(MINIMAL_LOCKFILE.as_str());
 
         let assert = Command::cargo_bin("skillctl")
             .expect("binary exists")
@@ -220,7 +220,7 @@ fn user_copy_mode_matrix_matches_spec_target_combinations() {
         let workspace = TestWorkspace::new();
         workspace.copy_fixture("canonical-only", "source");
         workspace.write_manifest_for_targets(case.targets);
-        workspace.write_lockfile(MINIMAL_LOCKFILE);
+        workspace.write_lockfile(MINIMAL_LOCKFILE.as_str());
 
         let home_path = workspace.home_path();
         let mut cmd = Command::cargo_bin("skillctl").expect("binary exists");
@@ -329,7 +329,7 @@ fn alternate_source_layout_fixtures_install_successfully() {
         let workspace = TestWorkspace::new();
         workspace.copy_fixture(case.fixture, "source");
         workspace.write_manifest_for_targets(&[case.target]);
-        workspace.write_lockfile(MINIMAL_LOCKFILE);
+        workspace.write_lockfile(MINIMAL_LOCKFILE.as_str());
 
         let assert = Command::cargo_bin("skillctl")
             .expect("binary exists")
@@ -381,7 +381,7 @@ fn imported_overlay_fixture_supports_the_override_workflow() {
     let workspace = TestWorkspace::new();
     workspace.copy_fixture("imported-with-overlay", "source");
     workspace.write_manifest_for_targets(&["claude-code"]);
-    workspace.write_lockfile(MINIMAL_LOCKFILE);
+    workspace.write_lockfile(MINIMAL_LOCKFILE.as_str());
 
     Command::cargo_bin("skillctl")
         .expect("binary exists")
@@ -485,7 +485,7 @@ fn private_source_fixture_installs_as_a_local_path_source() {
     let workspace = TestWorkspace::new();
     workspace.copy_fixture("private-source", "private-source");
     workspace.write_manifest_for_targets(&["codex"]);
-    workspace.write_lockfile(MINIMAL_LOCKFILE);
+    workspace.write_lockfile(MINIMAL_LOCKFILE.as_str());
 
     let assert = Command::cargo_bin("skillctl")
         .expect("binary exists")
@@ -514,7 +514,7 @@ fn broken_symlink_fixture_refuses_managed_import_installation() {
     let workspace = TestWorkspace::new();
     workspace.copy_fixture("broken-symlink", "source");
     workspace.write_manifest_for_targets(&["codex"]);
-    workspace.write_lockfile(MINIMAL_LOCKFILE);
+    workspace.write_lockfile(MINIMAL_LOCKFILE.as_str());
 
     Command::cargo_bin("skillctl")
         .expect("binary exists")

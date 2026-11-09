@@ -61,6 +61,50 @@ fn stdout_json(assert: &assert_cmd::assert::Assert) -> Value {
     serde_json::from_slice(&assert.get_output().stdout).expect("stdout is valid json")
 }
 
+/// Serve `301 -> target` for every request on a free loopback port and return
+/// the origin URL.
+///
+/// The static `serve` helper cannot attach a `Location` header, so redirect
+/// coverage needs its own origin.
+fn serve_redirect(target: String) -> String {
+    serve_redirect_location(Box::new(move || target.clone()))
+}
+
+/// Serve a `301` to its own well-known index path for every request, so a
+/// fetch can never leave the redirecting origin.
+fn serve_redirect_to_self() -> String {
+    serve_redirect_location(Box::new(String::new))
+}
+
+fn serve_redirect_location(location: Box<dyn Fn() -> String + Send>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("redirect origin binds a free port");
+    let address = listener
+        .local_addr()
+        .expect("redirect origin reports its address");
+    let self_index_url = format!("http://{address}{INDEX_PATH}");
+
+    thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let mut buffer = [0_u8; 8192];
+            let _ = stream.read(&mut buffer);
+            let declared = location();
+            let target = if declared.is_empty() {
+                self_index_url.as_str()
+            } else {
+                declared.as_str()
+            };
+            let response = format!(
+                "HTTP/1.1 301 Moved Permanently\r\nLocation: {target}\r\nContent-Length: \
+                 0\r\nConnection: close\r\n\r\n",
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    format!("http://{address}")
+}
+
 #[test]
 fn discover_origin_normalizes_to_the_well_known_index_path() {
     let base = serve(vec![route(INDEX_PATH, 200, valid_index())]);
@@ -125,6 +169,10 @@ fn discover_resolves_relative_and_absolute_artifact_urls_against_the_index_url()
 
 #[test]
 fn discover_accepts_absolute_artifact_urls_on_other_origins() {
+    // The loopback index origin is trusted, but the artifact the entry declares
+    // downloads from an unverified remote origin, so the report names that
+    // artifact origin in a warning instead of letting it hide behind the index
+    // origin.
     let base = serve(vec![route(
         INDEX_PATH,
         200,
@@ -141,16 +189,28 @@ fn discover_accepts_absolute_artifact_urls_on_other_origins() {
     )]);
     let workspace = TestWorkspace::new();
 
-    let assert = run_discover(&workspace, &base).code(0);
+    let assert = run_discover(&workspace, &base).code(2);
     let body = stdout_json(&assert);
     let skills = body["data"]["skills"]
         .as_array()
         .expect("skills array exists");
 
+    assert_eq!(body["ok"], true, "unexpected response: {body:#?}");
     assert_eq!(skills.len(), 1, "unexpected skills payload: {skills:#?}");
     assert_eq!(
         skills[0]["url"],
         "https://cdn.example.com/v2/skills/git-workflow/SKILL.md",
+    );
+    assert!(
+        body["warnings"]
+            .as_array()
+            .expect("warnings array exists")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .unwrap_or_default()
+                .contains("https://cdn.example.com/v2/skills/git-workflow/SKILL.md")),
+        "the warning names the artifact origin: {body:#?}",
     );
 }
 
@@ -375,4 +435,80 @@ fn discover_help_documents_usage_and_the_read_only_contract() {
             "skillctl discover https://example.com",
         ))
         .stdout(predicate::str::contains("It is read-only"));
+}
+
+#[test]
+fn discover_follows_a_redirect_the_origin_trust_policy_permits() {
+    // Both the redirecting origin and the index origin are loopback, so the
+    // hop keeps the classification of the URL the user supplied.
+    let final_base = serve(vec![route(INDEX_PATH, 200, valid_index())]);
+    let redirecting = serve_redirect(format!("{final_base}{INDEX_PATH}"));
+    let workspace = TestWorkspace::new();
+
+    let assert = run_discover(&workspace, &redirecting).code(0);
+    let body = stdout_json(&assert);
+
+    assert_eq!(body["ok"], true, "unexpected response: {body:#?}");
+    // The report names the URL the user supplied while the document's relative
+    // artifact URLs resolve against the URL that served the document.
+    assert_eq!(
+        body["data"]["index_url"],
+        format!("{redirecting}{INDEX_PATH}")
+    );
+    assert_eq!(body["data"]["skill_count"], 2);
+    assert_eq!(
+        body["data"]["skills"][0]["url"],
+        format!("{final_base}/.well-known/agent-skills/code-review/SKILL.md"),
+        "relative artifact URLs must resolve against the serving URL: {body:#?}",
+    );
+}
+
+#[test]
+fn discover_refuses_a_redirect_the_origin_trust_policy_does_not_permit() {
+    // A loopback origin may not move the read onto a plain-HTTP host off
+    // loopback. The hop is refused before the target is contacted, so the
+    // unroutable TEST-NET-1 address never receives a request.
+    let redirecting =
+        serve_redirect("http://192.0.2.1:9/.well-known/agent-skills/index.json".to_string());
+    let workspace = TestWorkspace::new();
+
+    let assert = run_discover(&workspace, &redirecting).code(3);
+    let body = stdout_json(&assert);
+
+    assert_eq!(body["ok"], false, "unexpected response: {body:#?}");
+    assert!(
+        body["errors"]
+            .as_array()
+            .expect("errors array exists")
+            .iter()
+            .any(|error| error
+                .as_str()
+                .unwrap_or_default()
+                .contains("origin trust policy refuses")),
+        "the refusal names the origin-trust policy: {body:#?}",
+    );
+}
+
+#[test]
+fn discover_refuses_a_redirect_chain_past_the_hop_limit() {
+    // The origin redirects to its own index URL, so the chain can only end at
+    // the hop limit instead of reading whatever the loop lands on.
+    let looping = serve_redirect_to_self();
+    let workspace = TestWorkspace::new();
+
+    let assert = run_discover(&workspace, &looping).code(1);
+    let body = stdout_json(&assert);
+
+    assert_eq!(body["ok"], false, "unexpected response: {body:#?}");
+    assert!(
+        body["errors"]
+            .as_array()
+            .expect("errors array exists")
+            .iter()
+            .any(|error| error
+                .as_str()
+                .unwrap_or_default()
+                .contains("redirected more than 5 times")),
+        "the failure names the redirect limit: {body:#?}",
+    );
 }

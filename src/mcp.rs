@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::{
     app::{AppContext, InteractionMode, OutputMode, Verbosity},
     cli::{
-        Command, DiscoverArgs, DoctorArgs, InstallArgs, McpCommand, OptionalSkillArg, RestoreArgs,
+        Command, DiscoverArgs, DoctorArgs, InstallArgs, OptionalSkillArg, RestoreArgs,
         RollbackArgs, Scope, SkillArg, TelemetryCommand, UpdateArgs,
     },
     error::AppError,
@@ -78,16 +78,6 @@ pub fn serve(context: &AppContext) -> Result<(), AppError> {
     }
 
     Ok(())
-}
-
-/// Handle the `skillctl mcp` command family.
-pub fn handle_command(
-    _context: &AppContext,
-    command: &McpCommand,
-) -> Result<AppResponse, AppError> {
-    match command {
-        McpCommand::Serve => Ok(AppResponse::success("mcp-serve")),
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

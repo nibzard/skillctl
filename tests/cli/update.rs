@@ -1506,7 +1506,7 @@ fn pin_updates_manifest_lockfile_state_and_projection_metadata() {
         .expect("install record exists");
     assert_eq!(install_row.0, pinned_commit);
     assert_eq!(install_row.1, pinned_effective_version);
-    assert_eq!(install_row.2, "2026-02-02T03:00:34Z");
+    assert_rfc3339_utc(&install_row.2);
 
     let pin_row: (String, String, String, String) = connection
         .query_row(
@@ -1519,7 +1519,7 @@ fn pin_updates_manifest_lockfile_state_and_projection_metadata() {
     assert_eq!(pin_row.0, pinned_commit);
     assert_eq!(pin_row.1, pinned_commit);
     assert_eq!(pin_row.2, pinned_effective_version);
-    assert_eq!(pin_row.3, "2026-02-02T03:00:34Z");
+    assert_rfc3339_utc(&pin_row.3);
 
     let history_kinds: Vec<String> = connection
         .prepare(

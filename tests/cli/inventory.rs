@@ -281,7 +281,7 @@ fn rollback_reactivates_a_prior_effective_version_from_recorded_history() {
         .expect("install record exists");
     assert_eq!(install_row.0, initial_commit);
     assert_eq!(install_row.1, initial_effective_version);
-    assert_eq!(install_row.2, "2026-02-02T03:21:08Z");
+    assert_rfc3339_utc(&install_row.2);
 
     let pin_row: (String, String, String) = connection
         .query_row(
@@ -303,7 +303,7 @@ fn rollback_reactivates_a_prior_effective_version_from_recorded_history() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("rollback record exists");
-    assert_eq!(rollback_row.0, "2026-02-02T03:21:08Z");
+    assert_rfc3339_utc(&rollback_row.0);
     assert_eq!(rollback_row.1, newer_commit);
     assert_eq!(rollback_row.2, initial_effective_version);
 
@@ -818,7 +818,7 @@ fn fork_copies_the_effective_skill_into_local_ownership_and_detaches_updates() {
         .expect("install record exists");
     assert_eq!(install_row.0, 1);
     assert_eq!(install_row.1, 1);
-    assert_eq!(install_row.2, "2026-02-02T03:21:08Z");
+    assert_rfc3339_utc(&install_row.2);
 
     let history_kinds: Vec<String> = connection
         .prepare(

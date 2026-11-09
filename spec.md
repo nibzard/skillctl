@@ -598,6 +598,14 @@ adapters:
 - `copy`: default, reliable.
 - `symlink`: opt-in, warned when target support is unstable.
 
+#### `projection.git_exclude`
+
+How `skillctl init` excludes generated runtime roots from Git:
+
+- `local`: append them to `.git/info/exclude`, which Git never commits. This is the default.
+- `gitignore`: append them to `.gitignore`.
+- `none`: add no exclusions, so generated roots stay visible to Git.
+
 #### `imports`
 
 Imported skills are immutable inputs. Local edits happen through overlays or a deliberate detach or fork workflow.
@@ -996,6 +1004,11 @@ Default is `copy`.
 
 `symlink` mode exists for users who explicitly want it.
 
+Windows grants symlink creation only to elevated processes and Developer Mode
+sessions. A symlink-mode run probes that capability before it writes any
+projection, and a process without it refuses up front with the requirement and
+the copy-mode alternative.
+
 ### 18.3 Risk handling
 
 If a selected target has adapter status `symlink-unstable`, `skillctl` must:
@@ -1309,6 +1322,10 @@ Every TUI action must map to a documented CLI command.
 - `3` validation or conflict failure
 - `4` trust gate blocked operation
 - `5` interactive input required but `--no-input` was set
+
+A reader that closes an output pipe early is not a command failure: the
+process finishes quietly with the command's own documented exit status
+instead of reporting a panic status.
 
 ### 21.6 JSON output contract
 

@@ -18,7 +18,6 @@ use crate::{
     planner,
     response::AppResponse,
     skill,
-    source::SourceKind,
     state::{
         HistoryEntry, HistoryQuery, InstallRecord, LocalStateStore, ManagedScope, ManagedSkillRef,
         PinRecord, RollbackRecord, SkillStateSnapshot, UpdateCheckRecord,
@@ -313,15 +312,8 @@ fn overlay_view(
 }
 
 fn load_manifest_or_default(working_directory: &Path) -> Result<WorkspaceManifest, AppError> {
-    match WorkspaceManifest::load_from_workspace(working_directory) {
-        Ok(manifest) => Ok(manifest),
-        Err(AppError::FilesystemOperation { path, source, .. })
-            if source.kind() == io::ErrorKind::NotFound =>
-        {
-            Ok(WorkspaceManifest::default_at(path))
-        }
-        Err(error) => Err(error),
-    }
+    let (manifest, _) = WorkspaceManifest::load_from_workspace_or_default(working_directory)?;
+    Ok(manifest)
 }
 
 fn overlay_path(
@@ -329,7 +321,6 @@ fn overlay_path(
     overlay_root: &std::path::Path,
 ) -> Result<Option<String>, AppError> {
     match fs::metadata(overlay_root) {
-        Ok(metadata) if metadata.is_dir() => Ok(Some(planner::display_path(context, overlay_root))),
         Ok(_) => Ok(Some(planner::display_path(context, overlay_root))),
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(AppError::FilesystemOperation {
@@ -418,7 +409,7 @@ fn render_skill_card(output: &mut String, skill: &TuiSkillCard) {
     let _ = writeln!(
         output,
         "  installed: {} @ {}",
-        source_label(skill.installed.source_kind),
+        skill.installed.source_kind.label(),
         skill.installed.resolved_revision
     );
     let _ = writeln!(
@@ -591,15 +582,6 @@ fn explain_status_label(status: ExplainStatus) -> &'static str {
         ExplainStatus::Selected => "selected",
         ExplainStatus::Conflict => "conflict",
         ExplainStatus::Missing => "missing",
-    }
-}
-
-fn source_label(kind: SourceKind) -> &'static str {
-    match kind {
-        SourceKind::Git => "git",
-        SourceKind::LocalPath => "local-path",
-        SourceKind::Archive => "archive",
-        SourceKind::WellKnown => "well-known",
     }
 }
 

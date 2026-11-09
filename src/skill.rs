@@ -23,7 +23,7 @@ use crate::{
     materialize, planner,
     response::AppResponse,
     source::{current_timestamp, stored_import_root},
-    state::{LocalStateStore, ManagedScope, ManagedSkillRef, ProjectionRecord},
+    state::{LocalStateStore, ManagedScope, ManagedSkillRef},
 };
 
 /// Default relative path to canonical workspace skills.
@@ -74,8 +74,6 @@ impl SkillName {
 /// Parsed frontmatter for a `SKILL.md` document.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SkillFrontmatter {
-    /// All parsed frontmatter fields, including vendor-specific extensions.
-    pub fields: BTreeMap<String, Value>,
     /// Vendor-specific fields that should be passed through unchanged.
     pub vendor_fields: BTreeMap<String, Value>,
 }
@@ -146,11 +144,6 @@ impl SkillSafetySummary {
     /// Return whether no structured safety metadata is present.
     pub fn is_empty(&self) -> bool {
         self.capabilities.is_empty() && self.credentials.is_empty() && self.dependencies.is_empty()
-    }
-
-    /// Return whether any structured safety metadata is present.
-    pub fn has_entries(&self) -> bool {
-        !self.is_empty()
     }
 
     /// Return any required credentials missing from the current environment.
@@ -265,8 +258,6 @@ pub struct SkillDefinition {
     pub root: PathBuf,
     /// Resolved path to the `SKILL.md` file.
     pub manifest_path: PathBuf,
-    /// Markdown body after the frontmatter block.
-    pub body: String,
     /// Parsed frontmatter, including vendor-specific passthrough fields.
     pub frontmatter: SkillFrontmatter,
     /// Typed safety metadata derived from declarative frontmatter fields.
@@ -274,9 +265,6 @@ pub struct SkillDefinition {
     /// Supported vendor-specific metadata files preserved alongside the skill.
     pub vendor_metadata: SkillVendorMetadata,
 }
-
-/// Parsed canonical workspace skill definition.
-pub type WorkspaceSkill = SkillDefinition;
 
 impl SkillDefinition {
     /// Load, parse, and validate a skill directory.
@@ -300,8 +288,8 @@ impl SkillDefinition {
     ) -> Result<Self, AppError> {
         let root = root.as_ref();
         let manifest_path = manifest_path.into();
-        let (frontmatter_source, body) = split_frontmatter_sections(source, &manifest_path)?;
-        let fields = parse_frontmatter(&frontmatter_source, &manifest_path)?;
+        let frontmatter = frontmatter_source(source, &manifest_path)?;
+        let fields = parse_frontmatter(&frontmatter, &manifest_path)?;
 
         validate_optional_standard_fields(&fields, &manifest_path)?;
         let safety = parse_safety_summary(&fields, &manifest_path)?;
@@ -319,10 +307,8 @@ impl SkillDefinition {
             description: description.to_string(),
             root: root.to_path_buf(),
             manifest_path,
-            body,
             frontmatter: SkillFrontmatter {
                 vendor_fields: extract_vendor_frontmatter(&fields),
-                fields,
             },
             safety,
             vendor_metadata,
@@ -540,7 +526,7 @@ pub fn handle_list(context: &AppContext, _request: ListRequest) -> Result<AppRes
             "projections": snapshot
                 .projections
                 .iter()
-                .map(|projection| projection_view(context, projection))
+                .map(|projection| planner::projection_view(context, projection))
                 .collect::<Result<Vec<_>, _>>()?,
         }));
     }
@@ -628,7 +614,7 @@ pub fn handle_remove(
         materialize::sync_mutation_root_paths(
             &scoped_context,
             &manifest,
-            target_scope(managed_skill.scope),
+            TargetScope::from(managed_skill.scope),
         )?,
         crate::apply::TargetAction::Remove,
     )
@@ -706,7 +692,10 @@ pub fn handle_remove(
                 .join(manifest.layout.skills_dir.as_str())
                 .join(request.skill.as_str());
             transaction.track_path(&local_root)?;
-            if remove_directory_if_exists(&local_root, "remove canonical workspace skill")? {
+            if materialize::remove_directory_if_exists(
+                &local_root,
+                "remove canonical workspace skill",
+            )? {
                 removed_paths.push(planner::display_path(context, &local_root));
             }
         }
@@ -717,7 +706,10 @@ pub fn handle_remove(
             request.skill.as_str(),
         )?;
         transaction.track_path(&stored_source_root)?;
-        if remove_directory_if_exists(&stored_source_root, "remove stored import root")? {
+        if materialize::remove_directory_if_exists(
+            &stored_source_root,
+            "remove stored import root",
+        )? {
             removed_paths.push(stored_source_root.display().to_string());
         }
 
@@ -1228,7 +1220,7 @@ pub fn handle_path(context: &AppContext, request: PathRequest) -> Result<AppResp
         "projections": snapshot
             .projections
             .iter()
-            .map(|projection| projection_view(context, projection))
+            .map(|projection| planner::projection_view(context, projection))
             .collect::<Result<Vec<_>, _>>()?,
     });
     let detail = crate::human::path_detail_lines(&data);
@@ -1262,7 +1254,7 @@ fn canonical_local_path(
     let Some(canonical_root) = canonical_local_root(context, manifest, skill) else {
         return Err(path_refusal(context, manifest, skill));
     };
-    if crate::resolver::is_generated_projection_root(&canonical_root)? {
+    if materialize::is_skillctl_generated_directory(&canonical_root)? {
         // The directory holds a generated copy of some install, not a skill
         // someone authored, so it is not a canonical root the command reports.
         return Err(AppError::ResolutionValidation {
@@ -1300,7 +1292,7 @@ fn canonical_local_path(
         "projections": snapshot
             .projections
             .iter()
-            .map(|projection| projection_view(context, projection))
+            .map(|projection| planner::projection_view(context, projection))
             .collect::<Result<Vec<_>, _>>()?,
     });
     let detail = crate::human::path_detail_lines(&data);
@@ -1506,7 +1498,7 @@ fn find_manifest_import(
             Some(Scope::User) => import.scope == ManifestScope::User,
             None => true,
         })
-        .map(|import| managed_scope(import.scope))
+        .map(|import| ManagedScope::from(import.scope))
         .collect();
 
     match scopes.as_slice() {
@@ -1516,39 +1508,11 @@ fn find_manifest_import(
     }
 }
 
-fn managed_scope(scope: ManifestScope) -> ManagedScope {
-    match scope {
-        ManifestScope::Workspace => ManagedScope::Workspace,
-        ManifestScope::User => ManagedScope::User,
-    }
-}
-
-fn projection_view(
-    context: &AppContext,
-    projection: &ProjectionRecord,
-) -> Result<serde_json::Value, AppError> {
-    let root = planner::resolve_runtime_root_path(context, &projection.physical_root)?;
-    let projected = root.join(&projection.projected_path);
-
-    Ok(json!({
-        "target": projection.target,
-        "root": planner::display_path(context, &root),
-        "path": planner::display_path(context, &projected),
-        "generated_at": projection.generated_at,
-        "effective_version_hash": projection.effective_version_hash,
-    }))
-}
-
 fn source_type_label(install: &crate::state::InstallRecord) -> &'static str {
     if builtin::is_bundled_install(install) {
         "built-in"
     } else {
-        match install.source_kind {
-            crate::source::SourceKind::Git => "git",
-            crate::source::SourceKind::LocalPath => "local-path",
-            crate::source::SourceKind::Archive => "archive",
-            crate::source::SourceKind::WellKnown => "well-known",
-        }
+        install.source_kind.label()
     }
 }
 
@@ -1564,7 +1528,7 @@ fn planned_root_views(
 
     let plan = planner::plan_target_roots(
         &AdapterRegistry::new(),
-        target_scope(scope),
+        TargetScope::from(scope),
         manifest.projection.policy,
         &manifest.targets,
         &manifest.adapters,
@@ -1677,7 +1641,7 @@ fn toggle_managed_import(
         materialize::sync_mutation_root_paths(
             &scoped_context,
             &manifest,
-            target_scope(managed_skill.scope),
+            TargetScope::from(managed_skill.scope),
         )?,
         crate::apply::TargetAction::Replace,
     )
@@ -1793,29 +1757,6 @@ fn toggle_managed_import(
     })
 }
 
-fn remove_directory_if_exists(path: &Path, action: &'static str) -> Result<bool, AppError> {
-    match fs::metadata(path) {
-        Ok(metadata) if !metadata.is_dir() => Err(AppError::PathConflict {
-            path: path.to_path_buf(),
-            expected: "directory",
-        }),
-        Ok(_) => {
-            fs::remove_dir_all(path).map_err(|source| AppError::FilesystemOperation {
-                action,
-                path: path.to_path_buf(),
-                source,
-            })?;
-            Ok(true)
-        }
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(source) => Err(AppError::FilesystemOperation {
-            action: "inspect directory",
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
-}
-
 fn managed_import<'a>(
     manifest: &'a WorkspaceManifest,
     skill: &ManagedSkillRef,
@@ -1836,13 +1777,6 @@ fn manifest_scope(scope: ManagedScope) -> ManifestScope {
     match scope {
         ManagedScope::Workspace => ManifestScope::Workspace,
         ManagedScope::User => ManifestScope::User,
-    }
-}
-
-fn target_scope(scope: ManagedScope) -> TargetScope {
-    match scope {
-        ManagedScope::Workspace => TargetScope::Workspace,
-        ManagedScope::User => TargetScope::User,
     }
 }
 
@@ -1877,10 +1811,12 @@ fn read_skill_manifest(path: &Path) -> Result<String, AppError> {
     }
 }
 
-fn split_frontmatter_sections(
-    source: &str,
-    skill_path: &Path,
-) -> Result<(String, String), AppError> {
+/// Return the frontmatter block of a `SKILL.md` document.
+///
+/// The markdown body is validated only for its closing delimiter and is not
+/// retained: overlays and projections copy the raw file bytes, so no consumer
+/// needs the parsed body.
+fn frontmatter_source(source: &str, skill_path: &Path) -> Result<String, AppError> {
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let mut lines = source.lines();
 
@@ -1892,33 +1828,27 @@ fn split_frontmatter_sections(
     }
 
     let mut frontmatter_lines = Vec::new();
-    let mut body_lines = Vec::new();
-    let mut in_body = false;
+    let mut closed = false;
 
     for line in lines {
-        if !in_body && line == "---" {
-            in_body = true;
+        if !closed && line == "---" {
+            closed = true;
             continue;
         }
 
-        if in_body {
-            body_lines.push(line);
-        } else {
+        if !closed {
             frontmatter_lines.push(line);
         }
     }
 
-    if !in_body {
+    if !closed {
         return Err(skill_validation(
             skill_path,
             "SKILL.md frontmatter must end with a closing '---' delimiter",
         ));
     }
 
-    Ok((
-        frontmatter_lines.join("\n"),
-        body_lines.join("\n").trim().to_string(),
-    ))
+    Ok(frontmatter_lines.join("\n"))
 }
 
 fn parse_frontmatter(
@@ -2017,12 +1947,13 @@ fn validate_description(value: &str, skill_path: &Path) -> Result<(), AppError> 
             "SKILL.md field 'description' must not be empty",
         ));
     }
-    if value.len() > 1_024 {
+    let characters = value.chars().count();
+    if characters > 1_024 {
         return Err(skill_validation(
             skill_path,
             format!(
-                "SKILL.md field 'description' must be at most 1024 characters, found {}",
-                value.len()
+                "SKILL.md field 'description' must be at most 1024 characters, found \
+                 {characters}"
             ),
         ));
     }
@@ -2491,10 +2422,6 @@ mod tests {
         assert_eq!(parsed.name, SkillName("release-notes".to_string()));
         assert_eq!(parsed.description, "Summarize a project's release notes.");
         assert_eq!(
-            parsed.body,
-            "# Release Notes\nUse this skill to summarize changes."
-        );
-        assert_eq!(
             parsed.frontmatter.vendor_fields.get("user-invocable"),
             Some(&Value::Bool(true))
         );
@@ -2587,6 +2514,42 @@ mod tests {
 
         assert!(
             error.to_string().contains("must define 'description'"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn description_limit_counts_characters_not_bytes() {
+        // 1024 CJK characters occupy 3072 UTF-8 bytes. The limit is 1024
+        // characters, so a description at the limit must parse.
+        let skill = TestSkillDir::new("release-notes");
+        skill.write(
+            SKILL_MANIFEST_FILE,
+            &format!(
+                "---\nname: release-notes\ndescription: {}\n---\n",
+                "漢".repeat(1024)
+            ),
+        );
+
+        let parsed = SkillDefinition::load_from_dir(skill.path())
+            .expect("a description of 1024 characters parses");
+        assert_eq!(parsed.description.chars().count(), 1024);
+
+        let skill = TestSkillDir::new("release-notes");
+        skill.write(
+            SKILL_MANIFEST_FILE,
+            &format!(
+                "---\nname: release-notes\ndescription: {}\n---\n",
+                "漢".repeat(1025)
+            ),
+        );
+
+        let error = SkillDefinition::load_from_dir(skill.path())
+            .expect_err("a description beyond 1024 characters is rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("must be at most 1024 characters, found 1025"),
             "unexpected error: {error}"
         );
     }

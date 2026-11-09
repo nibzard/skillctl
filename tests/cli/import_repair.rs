@@ -776,9 +776,9 @@ fn remove_clears_a_stale_pin_behind_a_recorded_install() {
         .as_array()
         .unwrap_or_else(|| panic!("skills array exists: {list:#?}"));
     assert!(
-        skills
+        !skills
             .iter()
-            .all(|skill| skill["skill"] != "release-notes" && skill["scope"] != "workspace"),
+            .any(|skill| skill["skill"] == "release-notes" && skill["scope"] == "workspace"),
         "the removed import should leave no managed skill behind: {list:#?}"
     );
 

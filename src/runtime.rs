@@ -226,7 +226,10 @@ fn dispatch(command: &Command, context: &AppContext) -> Result<AppResponse, AppE
         Command::Clean => materialize::handle_clean(context, materialize::CleanRequest),
         Command::Tui => tui::handle_open(context, tui::OpenTuiRequest),
         Command::Telemetry { command } => telemetry::handle_command(context, command),
-        Command::Mcp { command } => mcp::handle_command(context, command),
+        // `run_command` runs the stdio server for `mcp serve` before this
+        // dispatch, and the MCP tool bridge never constructs a `Command::Mcp`,
+        // so the family has no dispatchable response envelope.
+        Command::Mcp { .. } => unreachable!("'mcp serve' runs through run_command, not dispatch"),
     }
 }
 
@@ -417,21 +420,22 @@ fn parse_error_command(args: &[OsString]) -> &'static str {
             "discover" => "discover",
             "install" | "i" => "install",
             "remove" => "remove",
-            "sync" => "sync",
+            "sync" | "s" => "sync",
             "restore" => "restore",
             "verify" => "verify",
-            "update" => "update",
+            "update" | "u" => "update",
             "pin" => "pin",
             "rollback" => "rollback",
-            "history" => "history",
-            "doctor" => "doctor",
-            "explain" => "explain",
+            "history" | "hist" => "history",
+            "doctor" | "dr" => "doctor",
+            "explain" | "x" => "explain",
+            "inspect" => "inspect",
             "override" => "override",
             "fork" => "fork",
             "review" => "review",
             "enable" => "enable",
             "disable" => "disable",
-            "path" => "path",
+            "path" | "pt" => "path",
             "validate" => "validate",
             "clean" => "clean",
             "tui" => "tui",
@@ -486,4 +490,121 @@ fn help_text() -> String {
     let mut help = String::from_utf8_lossy(&buffer).into_owned();
     help.push('\n');
     help
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Resolve the stable command id for one raw argument list.
+    fn command_id(args: &[&str]) -> &'static str {
+        let raw: Vec<OsString> = std::iter::once("skillctl")
+            .chain(args.iter().copied())
+            .map(OsString::from)
+            .collect();
+        parse_error_command(&raw)
+    }
+
+    #[test]
+    fn parse_error_command_covers_every_command_and_visible_alias() {
+        let cases = [
+            ("init", "init"),
+            ("list", "list"),
+            ("discover", "discover"),
+            ("install", "install"),
+            ("i", "install"),
+            ("remove", "remove"),
+            ("sync", "sync"),
+            ("s", "sync"),
+            ("restore", "restore"),
+            ("verify", "verify"),
+            ("update", "update"),
+            ("u", "update"),
+            ("pin", "pin"),
+            ("rollback", "rollback"),
+            ("history", "history"),
+            ("hist", "history"),
+            ("doctor", "doctor"),
+            ("dr", "doctor"),
+            ("explain", "explain"),
+            ("x", "explain"),
+            ("inspect", "inspect"),
+            ("override", "override"),
+            ("fork", "fork"),
+            ("review", "review"),
+            ("enable", "enable"),
+            ("disable", "disable"),
+            ("path", "path"),
+            ("pt", "path"),
+            ("validate", "validate"),
+            ("clean", "clean"),
+            ("tui", "tui"),
+        ];
+
+        for (token, expected) in cases {
+            assert_eq!(command_id(&[token]), expected, "token {token:?}");
+        }
+    }
+
+    #[test]
+    fn parse_error_command_maps_nested_telemetry_and_mcp_subcommands() {
+        assert_eq!(command_id(&["telemetry"]), "skillctl");
+        assert_eq!(command_id(&["telemetry", "status"]), "telemetry-status");
+        assert_eq!(command_id(&["telemetry", "enable"]), "telemetry-enable");
+        assert_eq!(command_id(&["telemetry", "disable"]), "telemetry-disable");
+        assert_eq!(command_id(&["mcp"]), "skillctl");
+        assert_eq!(command_id(&["mcp", "serve"]), "mcp-serve");
+    }
+
+    #[test]
+    fn parse_error_command_knows_every_subcommand_clap_declares() {
+        let command = Cli::command();
+        for subcommand in command.get_subcommands() {
+            // `help` is clap's generated subcommand, and `telemetry` and `mcp`
+            // identify through their nested subcommand instead.
+            if subcommand.get_name() == "help" || subcommand.has_subcommands() {
+                continue;
+            }
+
+            assert_eq!(
+                command_id(&[subcommand.get_name()]),
+                subcommand.get_name(),
+                "missing canonical name {:?}",
+                subcommand.get_name(),
+            );
+            for alias in subcommand.get_visible_aliases() {
+                assert_ne!(
+                    command_id(&[alias]),
+                    "skillctl",
+                    "missing visible alias {alias:?} of {:?}",
+                    subcommand.get_name(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn json_parse_error_envelope_names_the_invoked_command() {
+        let cases = [
+            (vec!["--json", "inspect"], "inspect"),
+            (vec!["--json", "s", "--bogus"], "sync"),
+            (vec!["--json", "pt"], "path"),
+        ];
+
+        for (arguments, expected) in cases {
+            let mut raw = vec!["skillctl"];
+            raw.extend(arguments.iter().copied());
+            let result = run_from_args(raw).expect("parse failure renders a result");
+            assert_eq!(
+                result.exit_status,
+                ExitStatus::ValidationFailure,
+                "args: {arguments:?}",
+            );
+            let body: serde_json::Value = serde_json::from_str(result.output.stdout.trim())
+                .expect("stdout is a json envelope");
+            assert_eq!(body["command"], expected, "args: {arguments:?}");
+            assert_eq!(body["ok"], false, "args: {arguments:?}");
+            assert!(result.output.stderr.is_empty(), "args: {arguments:?}");
+        }
+    }
 }

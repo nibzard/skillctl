@@ -35,6 +35,9 @@ use crate::{
     },
 };
 
+/// Field and serialization rules the manifest and the lockfile share.
+pub(crate) mod portable;
+
 /// Default relative path to the workspace lockfile.
 pub const DEFAULT_LOCKFILE_PATH: &str = ".agents/skillctl.lock";
 /// Current supported lockfile schema version.
@@ -370,7 +373,7 @@ impl LockedImport {
                 format!(
                     "imports.{id} has a '{}' source, so it must not record a discovery index \
                      entry",
-                    lockfile_kind_label(self.source.kind)
+                    self.source.kind.label()
                 ),
             )),
             (_, None) => Ok(()),
@@ -411,7 +414,7 @@ impl LockedDiscoveryEntry {
                 format!("{prefix}.skill declares an invalid skill name: {reason}"),
             ));
         }
-        validate_source_url(&format!("{prefix}.url"), &self.url, lockfile_path)?;
+        validate_token(&format!("{prefix}.url"), &self.url, lockfile_path)?;
         if !is_canonical_digest(&self.digest) {
             return Err(lockfile_validation(
                 lockfile_path,
@@ -439,7 +442,7 @@ pub struct LockedSource {
 impl LockedSource {
     fn validate(&self, id: &str, lockfile_path: &Path) -> Result<(), AppError> {
         let prefix = format!("imports.{id}.source");
-        validate_source_url(&format!("{prefix}.url"), &self.url, lockfile_path)?;
+        validate_token(&format!("{prefix}.url"), &self.url, lockfile_path)?;
         validate_relative_path(
             &format!("{prefix}.subpath"),
             self.subpath.as_str(),
@@ -591,50 +594,7 @@ where
         path: path.to_path_buf(),
         source,
     })?;
-    Ok(format_lockfile_yaml(&raw))
-}
-
-fn format_lockfile_yaml(raw: &str) -> String {
-    let raw = raw.strip_prefix("---\n").unwrap_or(raw);
-    let mut formatted = String::new();
-    let mut saw_top_level_key = false;
-    let mut in_top_level_sequence = false;
-
-    for line in raw.lines() {
-        let is_top_level_key = !line.is_empty()
-            && !line.starts_with(' ')
-            && !line.starts_with("- ")
-            && line.contains(':');
-        if is_top_level_key && saw_top_level_key {
-            formatted.push('\n');
-        }
-        if is_top_level_key {
-            saw_top_level_key = true;
-            in_top_level_sequence = false;
-            formatted.push_str(line);
-            formatted.push('\n');
-            continue;
-        }
-
-        if line.starts_with("- ") {
-            in_top_level_sequence = true;
-            formatted.push_str("  ");
-            formatted.push_str(line);
-            formatted.push('\n');
-            continue;
-        }
-
-        if in_top_level_sequence && line.starts_with("  ") {
-            formatted.push_str("  ");
-        } else if !line.starts_with(' ') {
-            in_top_level_sequence = false;
-        }
-
-        formatted.push_str(line);
-        formatted.push('\n');
-    }
-
-    formatted
+    Ok(portable::format_document_yaml(&raw))
 }
 
 fn validate_schema_version(
@@ -693,59 +653,15 @@ fn validate_supported_schema_version(
 }
 
 fn validate_identifier(field: &str, value: &str, lockfile_path: &Path) -> Result<(), AppError> {
-    if value.is_empty() {
-        return Err(lockfile_validation(
-            lockfile_path,
-            format!("{field} must not be empty"),
-        ));
-    }
-
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return Err(lockfile_validation(
-            lockfile_path,
-            format!("{field} must not be empty"),
-        ));
-    };
-    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
-        return Err(lockfile_validation(
-            lockfile_path,
-            format!("{field} must start with a lowercase ASCII letter or digit: '{value}'"),
-        ));
-    }
-
-    if !chars
-        .all(|char| char.is_ascii_lowercase() || char.is_ascii_digit() || matches!(char, '-' | '_'))
-    {
-        return Err(lockfile_validation(
-            lockfile_path,
-            format!(
-                "{field} must contain only lowercase ASCII letters, digits, '-' or '_': '{value}'"
-            ),
-        ));
-    }
-
-    Ok(())
-}
-
-fn validate_source_url(field: &str, value: &str, lockfile_path: &Path) -> Result<(), AppError> {
-    validate_non_empty_trimmed(field, value, lockfile_path)?;
-    if value.chars().any(char::is_whitespace) {
-        return Err(lockfile_validation(
-            lockfile_path,
-            format!("{field} must not contain whitespace: '{value}'"),
-        ));
+    if let Some(message) = portable::identifier_error(field, value) {
+        return Err(lockfile_validation(lockfile_path, message));
     }
     Ok(())
 }
 
 fn validate_token(field: &str, value: &str, lockfile_path: &Path) -> Result<(), AppError> {
-    validate_non_empty_trimmed(field, value, lockfile_path)?;
-    if value.chars().any(char::is_whitespace) {
-        return Err(lockfile_validation(
-            lockfile_path,
-            format!("{field} must not contain whitespace: '{value}'"),
-        ));
+    if let Some(message) = portable::token_error(field, value) {
+        return Err(lockfile_validation(lockfile_path, message));
     }
     Ok(())
 }
@@ -755,71 +671,16 @@ fn validate_non_empty_trimmed(
     value: &str,
     lockfile_path: &Path,
 ) -> Result<(), AppError> {
-    if value.trim().is_empty() {
-        return Err(lockfile_validation(
-            lockfile_path,
-            format!("{field} must not be empty"),
-        ));
+    if let Some(message) = portable::non_empty_trimmed_error(field, value) {
+        return Err(lockfile_validation(lockfile_path, message));
     }
-    if value.trim() != value {
-        return Err(lockfile_validation(
-            lockfile_path,
-            format!("{field} must not contain leading or trailing whitespace"),
-        ));
-    }
-    if value.chars().any(char::is_control) {
-        return Err(lockfile_validation(
-            lockfile_path,
-            format!("{field} must not contain control characters"),
-        ));
-    }
-
     Ok(())
 }
 
 fn validate_relative_path(field: &str, value: &str, lockfile_path: &Path) -> Result<(), AppError> {
-    validate_non_empty_trimmed(field, value, lockfile_path)?;
-
-    if value.starts_with('/') {
-        return Err(lockfile_validation(
-            lockfile_path,
-            format!("{field} must be relative, found absolute path '{value}'"),
-        ));
+    if let Some(message) = portable::relative_path_error(field, value) {
+        return Err(lockfile_validation(lockfile_path, message));
     }
-    if value.contains('\\') {
-        return Err(lockfile_validation(
-            lockfile_path,
-            format!("{field} must use '/' separators: '{value}'"),
-        ));
-    }
-    if value.contains(':') {
-        return Err(lockfile_validation(
-            lockfile_path,
-            format!("{field} must not contain ':' so it remains portable: '{value}'"),
-        ));
-    }
-    if value.ends_with('/') {
-        return Err(lockfile_validation(
-            lockfile_path,
-            format!("{field} must not end with '/': '{value}'"),
-        ));
-    }
-
-    for segment in value.split('/') {
-        if segment.is_empty() {
-            return Err(lockfile_validation(
-                lockfile_path,
-                format!("{field} must not contain empty path segments: '{value}'"),
-            ));
-        }
-        if matches!(segment, "." | "..") {
-            return Err(lockfile_validation(
-                lockfile_path,
-                format!("{field} must not contain '.' or '..' segments: '{value}'"),
-            ));
-        }
-    }
-
     Ok(())
 }
 
@@ -827,16 +688,6 @@ fn lockfile_validation(path: &Path, message: impl Into<String>) -> AppError {
     AppError::LockfileValidation {
         path: path.to_path_buf(),
         message: message.into(),
-    }
-}
-
-/// Stable label of one locked source kind, for validation messages.
-fn lockfile_kind_label(kind: SourceKind) -> &'static str {
-    match kind {
-        SourceKind::Git => "git",
-        SourceKind::LocalPath => "local-path",
-        SourceKind::Archive => "archive",
-        SourceKind::WellKnown => "well-known",
     }
 }
 
@@ -1212,6 +1063,22 @@ mod tests {
                 .to_string()
                 .contains("imports.ai-sdk.source.subpath must not contain '.' or '..' segments"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn lockfile_validation_rejects_windows_reserved_import_keys() {
+        let reserved = full_lockfile().replace("  ai-sdk:", "  con:");
+        assert_ne!(reserved, full_lockfile());
+
+        let error = WorkspaceLockfile::from_yaml_str(DEFAULT_LOCKFILE_PATH, &reserved)
+            .expect_err("a reserved device name cannot name an import");
+
+        assert!(
+            error
+                .to_string()
+                .contains("imports key must not use a Windows reserved device name: 'con'"),
+            "unexpected error: {error}",
         );
     }
 

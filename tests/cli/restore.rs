@@ -450,6 +450,28 @@ fn restore_and_verify_refuse_content_that_no_longer_matches_the_pin() {
         report["data"]["imports"][0]["integrity"]["status"],
         "mismatch"
     );
+
+    // The import is a Git source this machine can reach, so the portability
+    // reason must blame the mismatched cache, not an unavailable local path.
+    assert_eq!(
+        report["data"]["imports"][0]["portability"]["source_kind"],
+        "git"
+    );
+    assert_eq!(
+        report["data"]["imports"][0]["portability"]["restorable"],
+        json!(false)
+    );
+    let reason = report["data"]["imports"][0]["portability"]["reason"]
+        .as_str()
+        .expect("reason is a string");
+    assert!(
+        reason.contains("the cached content no longer matches its pin"),
+        "the reason must name the mismatched cache: {reason}"
+    );
+    assert!(
+        !reason.contains("local path"),
+        "a git import must not be blamed on an unavailable local path: {reason}"
+    );
 }
 
 #[test]
@@ -485,6 +507,61 @@ fn verify_reports_a_tampered_retained_artifact_without_repairing_it() {
                 .expect("warning is a string")
                 .contains("retained artifact for 'release-notes' failed verification")),
         "verify must report the tampered artifact: {report:#?}"
+    );
+}
+
+#[test]
+fn verify_keeps_its_warnings_visible_beside_an_integrity_failure() {
+    let fixture = RestoreFixture::new();
+    let modern = String::from_utf8(lockfile_bytes(&fixture.author)).expect("lockfile is utf-8");
+    // A legacy entry records no canonical bundle digest, which verify reports
+    // as a warning, and which leaves a tampered cache unrepairable.
+    let legacy = rewrite_legacy_lockfile(&modern);
+
+    let clone = fixture.clone_portable_state();
+    clone.write_lockfile(&legacy);
+    let home = clone.home_path();
+    restore(&clone, &home, &["--frozen"])
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let stored_manifest = clone
+        .workspace_import_root("release-notes")
+        .join(".agents/skills/release-notes/SKILL.md");
+    fs::write(&stored_manifest, "# tampered\n").expect("cached content is modified");
+
+    let output = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(clone.path())
+        .env("HOME", &home)
+        .args(["--json", "verify"])
+        .output()
+        .expect("command runs");
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "the tampered cache fails verification"
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("stdout is valid json");
+    assert_eq!(report["ok"], false, "verify fails: {report:#?}");
+
+    // `counts` must never report warnings the response body hides.
+    let warnings = report["warnings"]
+        .as_array()
+        .expect("warnings are attached");
+    assert_eq!(
+        warnings.len() as u64,
+        report["data"]["counts"]["warnings"]
+            .as_u64()
+            .expect("warning count is reported"),
+        "every counted warning must be attached: {report:#?}"
+    );
+    assert!(
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .expect("warning is a string")
+            .contains("records no canonical bundle digest")),
+        "the legacy-digest hint stays visible beside the failure: {report:#?}"
     );
 }
 
@@ -684,6 +761,15 @@ fn restore_reports_nonportable_local_path_sources_instead_of_guessing() {
     assert_eq!(
         report["data"]["imports"][0]["portability"]["restorable"].as_bool(),
         Some(false)
+    );
+    // The local-path wording is reserved for this case: missing content, an
+    // unreachable local source, and no verified retained artifact.
+    assert_eq!(
+        report["data"]["imports"][0]["portability"]["reason"],
+        concat!(
+            "the recorded source is a local path that is unavailable here and no verified ",
+            "artifact is retained"
+        )
     );
     assert_eq!(
         report["data"]["imports"][0]["freshness"]["upstream_check"],
@@ -1552,5 +1638,278 @@ fn verify_refuses_instead_of_calling_a_lockfile_only_checkout_stale() {
     assert!(
         !report.to_lowercase().contains("stale"),
         "an invented empty declaration must not label the pin: {report}"
+    );
+}
+
+/// Author checkout whose manifest pins one workspace import and one user
+/// import, so a restore has to reconstruct two scopes from one portable pair.
+struct MixedScopeFixture {
+    author: TestWorkspace,
+}
+
+impl MixedScopeFixture {
+    fn new() -> Self {
+        let workspace = TestWorkspace::new();
+        workspace.write_manifest(concat!(
+            "version: 1\n",
+            "\n",
+            "targets:\n",
+            "  - claude-code\n",
+        ));
+        workspace.write_skill_source("git-source", "release-notes");
+        workspace.init_git_repo("git-source");
+        workspace.write_skill_source("user-git-source", "ai-sdk");
+        workspace.init_git_repo("user-git-source");
+        let home = workspace.home_path();
+
+        install(&workspace, &home, &workspace.git_repo_url("git-source"));
+        install_scoped(
+            &workspace,
+            &home,
+            &workspace.git_repo_url("user-git-source"),
+            "ai-sdk",
+            "user",
+        );
+
+        Self { author: workspace }
+    }
+
+    /// Clone only the declared portable state into a new checkout.
+    fn clone_portable_state(&self) -> TestWorkspace {
+        let clone = TestWorkspace::new();
+        copy_portable_state(&self.author, &clone);
+        clone
+    }
+
+    /// The effective-version digest the author's lockfile pins for one import.
+    fn pinned_effective_version(&self, import_id: &str) -> String {
+        self.author.read_lockfile_yaml()["imports"][import_id]["hashes"]["effective_version"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{import_id} pins an effective version"))
+            .to_string()
+    }
+}
+
+/// Install one import under an explicit scope.
+fn install_scoped(
+    workspace: &TestWorkspace,
+    home: &Path,
+    source: &str,
+    name: &str,
+    scope: &str,
+) -> Value {
+    let assert = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", home)
+        .args([
+            "--json",
+            "--no-input",
+            "--name",
+            name,
+            "--scope",
+            scope,
+            "install",
+            source,
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let body: Value =
+        serde_json::from_slice(&assert.get_output().stdout).expect("stdout is valid json");
+    assert_eq!(body["ok"], true, "install failed: {body:#?}");
+    body
+}
+
+/// Restore with an explicit global scope flag.
+fn restore_with_scope(
+    workspace: &TestWorkspace,
+    home: &Path,
+    scope: &str,
+    flags: &[&str],
+) -> assert_cmd::assert::Assert {
+    let mut args = vec!["--json", "--scope", scope, "restore"];
+    args.extend_from_slice(flags);
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", home)
+        .args(&args)
+        .assert()
+}
+
+/// `(physical_root, effective_version_hash)` of one skill's projection records,
+/// read straight from the state database a restore refreshes.
+fn projection_state(home: &Path, scope: &str, skill_id: &str) -> Vec<(String, String)> {
+    let connection =
+        Connection::open(home.join(".skillctl/state.db")).expect("state database opens");
+    let mut statement = connection
+        .prepare(
+            "SELECT physical_root, effective_version_hash FROM projection_records \
+             WHERE scope = ?1 AND skill_id = ?2 ORDER BY physical_root",
+        )
+        .expect("projection query prepares");
+    statement
+        .query_map(params![scope, skill_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .expect("projection query runs")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("projection rows read")
+}
+
+#[test]
+fn restore_materializes_each_scope_of_a_mixed_manifest() {
+    let fixture = MixedScopeFixture::new();
+    let workspace_effective = fixture.pinned_effective_version("release-notes");
+    let user_effective = fixture.pinned_effective_version("ai-sdk");
+
+    // A teammate clones the portable state with a fresh home and runs the
+    // documented default-scope restore.
+    let clone = fixture.clone_portable_state();
+    let fresh_home = clone.home_path();
+    let assert = restore(&clone, &fresh_home, &["--frozen"])
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let body: Value =
+        serde_json::from_slice(&assert.get_output().stdout).expect("stdout is valid json");
+    assert_eq!(body["ok"], true, "restore failed: {body:#?}");
+    let restored: BTreeMap<&str, &Value> = body["data"]["imports"]
+        .as_array()
+        .expect("imports report")
+        .iter()
+        .map(|import| (import["skill"].as_str().expect("skill is a string"), import))
+        .collect();
+    assert_eq!(restored.len(), 2, "both imports are reported: {body:#?}");
+    assert_eq!(restored["release-notes"]["scope"], "workspace");
+    assert_eq!(
+        restored["release-notes"]["restored_from"],
+        "source-at-locked-revision"
+    );
+    assert_eq!(restored["ai-sdk"]["scope"], "user");
+    assert_eq!(
+        restored["ai-sdk"]["restored_from"],
+        "source-at-locked-revision"
+    );
+    assert_eq!(restored["ai-sdk"]["verified"], true);
+
+    // Both scopes were materialized, each into its own runtime roots.
+    assert!(
+        clone
+            .path()
+            .join(".claude/skills/release-notes/SKILL.md")
+            .is_file(),
+        "the workspace import is projected into the workspace root"
+    );
+    assert!(
+        fresh_home.join(".claude/skills/ai-sdk/SKILL.md").is_file(),
+        "the user import is projected into the user root"
+    );
+
+    // Each scope's projection state survives and describes its own projection:
+    // the user record carries the user root and the user effective digest, not
+    // a workspace one.
+    assert_eq!(
+        projection_state(&fresh_home, "workspace", "release-notes"),
+        vec![(".claude/skills".to_string(), workspace_effective)],
+        "the workspace record must describe the workspace projection"
+    );
+    assert_eq!(
+        projection_state(&fresh_home, "user", "ai-sdk"),
+        vec![("~/.claude/skills".to_string(), user_effective)],
+        "the user record must describe the user projection"
+    );
+
+    // A mixed restore reports each scope's projections separately.
+    let reported_scopes: Vec<&str> = body["data"]["scope_projections"]
+        .as_array()
+        .expect("a mixed restore reports per-scope projections")
+        .iter()
+        .map(|entry| entry["scope"].as_str().expect("scope is a string"))
+        .collect();
+    assert_eq!(reported_scopes, vec!["workspace", "user"]);
+
+    let report = verify(&clone, &fresh_home);
+    assert_eq!(report["ok"], true, "verify failed: {report:#?}");
+    assert_eq!(report["data"]["counts"]["verified"].as_u64(), Some(2));
+}
+
+#[test]
+fn restore_with_an_explicit_user_scope_still_restores_the_workspace_scope() {
+    let fixture = MixedScopeFixture::new();
+
+    // The invocation selects the user scope, but the committed manifest pins a
+    // workspace import too, so a restore reconstructs both.
+    let clone = fixture.clone_portable_state();
+    let fresh_home = clone.home_path();
+    let assert = restore_with_scope(&clone, &fresh_home, "user", &["--frozen"])
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let body: Value =
+        serde_json::from_slice(&assert.get_output().stdout).expect("stdout is valid json");
+    assert_eq!(body["ok"], true, "restore failed: {body:#?}");
+
+    assert!(
+        clone
+            .path()
+            .join(".claude/skills/release-notes/SKILL.md")
+            .is_file(),
+        "the workspace import is projected even under --scope user"
+    );
+    assert!(
+        fresh_home.join(".claude/skills/ai-sdk/SKILL.md").is_file(),
+        "the user import is projected into the user root"
+    );
+    assert_eq!(
+        projection_state(&fresh_home, "workspace", "release-notes").len(),
+        1,
+        "the user-scope restore must not wipe the workspace projection record"
+    );
+    assert_eq!(
+        projection_state(&fresh_home, "user", "ai-sdk").len(),
+        1,
+        "the user projection record is written"
+    );
+}
+
+#[test]
+fn an_empty_home_env_refuses_instead_of_rooting_stores_at_the_working_directory() {
+    let fixture = RestoreFixture::new();
+    let clone = fixture.clone_portable_state();
+
+    // A CI job may export HOME with an empty value. The state resolver has
+    // always filtered it, and every home-rooted store shares that resolver,
+    // so the command refuses instead of silently rooting the artifact and
+    // import stores at the working directory.
+    let output = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(clone.path())
+        .env("HOME", "")
+        .env_remove("USERPROFILE")
+        .env_remove("HOMEDRIVE")
+        .env_remove("HOMEPATH")
+        .args(["--json", "verify"])
+        .output()
+        .expect("verify runs");
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        !output.status.success(),
+        "an empty HOME must not verify as if the workspace held stores: {text}"
+    );
+    assert!(
+        text.contains("failed to determine a home directory"),
+        "expected the home-directory refusal, found: {text}"
+    );
+    assert!(
+        !clone.path().join(".skillctl").exists(),
+        "no store may be rooted at the working directory"
     );
 }

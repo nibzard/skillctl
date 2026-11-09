@@ -206,7 +206,6 @@ fn tui_renders_a_read_only_dashboard_without_writing_history() {
         .expect("binary exists")
         .current_dir(workspace.path())
         .env("HOME", workspace.home_path())
-        .env("SOURCE_DATE_EPOCH", "1770000000")
         .args([
             "--no-input",
             "--name",
@@ -222,7 +221,6 @@ fn tui_renders_a_read_only_dashboard_without_writing_history() {
         .expect("binary exists")
         .current_dir(workspace.path())
         .env("HOME", workspace.home_path())
-        .env("SOURCE_DATE_EPOCH", "1770000060")
         .args(["override", "release-notes"])
         .assert()
         .success()
@@ -232,7 +230,6 @@ fn tui_renders_a_read_only_dashboard_without_writing_history() {
         .expect("binary exists")
         .current_dir(workspace.path())
         .env("HOME", workspace.home_path())
-        .env("SOURCE_DATE_EPOCH", "1770000120")
         .args(["update", "release-notes"])
         .assert()
         .success()
@@ -300,7 +297,6 @@ fn tui_json_output_aggregates_skill_state_for_the_selected_skill() {
         .expect("binary exists")
         .current_dir(workspace.path())
         .env("HOME", workspace.home_path())
-        .env("SOURCE_DATE_EPOCH", "1770000000")
         .args([
             "--no-input",
             "--name",
@@ -316,7 +312,6 @@ fn tui_json_output_aggregates_skill_state_for_the_selected_skill() {
         .expect("binary exists")
         .current_dir(workspace.path())
         .env("HOME", workspace.home_path())
-        .env("SOURCE_DATE_EPOCH", "1770000060")
         .args(["override", "release-notes"])
         .assert()
         .success()
@@ -326,7 +321,6 @@ fn tui_json_output_aggregates_skill_state_for_the_selected_skill() {
         .expect("binary exists")
         .current_dir(workspace.path())
         .env("HOME", workspace.home_path())
-        .env("SOURCE_DATE_EPOCH", "1770000120")
         .args(["update", "release-notes"])
         .assert()
         .success()
@@ -360,13 +354,21 @@ fn tui_json_output_aggregates_skill_state_for_the_selected_skill() {
         "skillctl --scope workspace update release-notes"
     );
     assert_eq!(body["data"]["history"]["skill"], "release-notes");
+    let entries = body["data"]["history"]["entries"]
+        .as_array()
+        .expect("entries array exists");
     assert!(
-        body["data"]["history"]["entries"]
-            .as_array()
-            .expect("entries array exists")
+        entries
             .iter()
             .any(|entry| entry["kind"] == "overlay-created"),
         "unexpected history payload: {body:#?}",
+    );
+    // The three commands above usually share one wall-clock second, so this
+    // ordering rides the row-id tiebreak of the history query, not distinct
+    // timestamps: the newest event, the update check, still leads the list.
+    assert_eq!(
+        entries[0]["kind"], "update-check",
+        "history stays newest-first when timestamps tie: {body:#?}",
     );
 }
 
@@ -387,7 +389,6 @@ fn tui_reports_manifest_configured_overlay_roots() {
         .expect("binary exists")
         .current_dir(workspace.path())
         .env("HOME", workspace.home_path())
-        .env("SOURCE_DATE_EPOCH", "1770000000")
         .args([
             "--no-input",
             "--name",
@@ -403,7 +404,6 @@ fn tui_reports_manifest_configured_overlay_roots() {
         .expect("binary exists")
         .current_dir(workspace.path())
         .env("HOME", workspace.home_path())
-        .env("SOURCE_DATE_EPOCH", "1770000060")
         .args(["override", "release-notes"])
         .assert()
         .success()
@@ -413,7 +413,6 @@ fn tui_reports_manifest_configured_overlay_roots() {
         .expect("binary exists")
         .current_dir(workspace.path())
         .env("HOME", workspace.home_path())
-        .env("SOURCE_DATE_EPOCH", "1770000120")
         .args(["disable", "release-notes"])
         .assert()
         .success()

@@ -118,12 +118,6 @@ pub enum AppError {
         /// Path to the invalid git metadata file.
         path: PathBuf,
     },
-    /// The command has no implementation yet.
-    #[error("command '{command}' is not implemented yet")]
-    NotYetImplemented {
-        /// Stable command identifier.
-        command: &'static str,
-    },
     /// The command requires interactive input.
     #[error("interactive input is required for command '{command}'")]
     InputRequired {
@@ -263,6 +257,20 @@ pub enum AppError {
         /// Validation message.
         message: String,
     },
+    /// A git clone or fetch could not move data from the source.
+    ///
+    /// The network operation itself failed, which says nothing about the
+    /// source's validity, so the failure maps to the same operational exit
+    /// status a discovery fetch reports. A source that answered but does not
+    /// serve the locked revision stays a validation failure through
+    /// [`AppError::SourceValidation`].
+    #[error("failed to fetch from git source '{url}': {message}")]
+    GitTransport {
+        /// Repository URL that could not be fetched.
+        url: String,
+        /// Git failure description.
+        message: String,
+    },
     /// Canonical bundle capture, parsing, or verification failed.
     #[error("canonical bundle is invalid: {message}")]
     BundleValidation {
@@ -347,9 +355,15 @@ pub enum AppError {
         reason: String,
     },
     /// Another process held the shared state coordination lock too long.
+    ///
+    /// The message names the wait control, because the sibling SQLite busy
+    /// timeout governs a different wait and a reader that meets this failure
+    /// needs the knob that changes it.
     #[error(
         "timed out after {waited_ms} ms waiting to {purpose} because the shared state lock \
-         '{path}' is held by {holder}"
+         '{path}' is held by {holder}. Set SKILLCTL_LOCK_TIMEOUT_MS to change how long this \
+         command waits. SKILLCTL_STATE_BUSY_TIMEOUT_MS and the SQLite busy timeout control a \
+         different wait"
     )]
     LocalStateLockTimeout {
         /// Path to the coordination lock.
@@ -487,7 +501,6 @@ impl AppError {
             | Self::PathConflict { .. }
             | Self::FilesystemOperation { .. }
             | Self::InvalidGitDirFile { .. }
-            | Self::NotYetImplemented { .. }
             | Self::JsonRender { .. } => ExitStatus::OperationalError,
             Self::PlannerValidation { .. }
             | Self::ResolutionValidation { .. }
@@ -515,9 +528,9 @@ impl AppError {
             | Self::DiscoveryArtifactDigestMismatch { .. }
             | Self::DiscoveryArtifactRejected { .. } => ExitStatus::ValidationFailure,
             Self::TrustGateBlocked { .. } => ExitStatus::TrustGateBlocked,
-            Self::DiscoveryFetch { .. } | Self::DiscoveryArtifactFetch { .. } => {
-                ExitStatus::OperationalError
-            }
+            Self::DiscoveryFetch { .. }
+            | Self::DiscoveryArtifactFetch { .. }
+            | Self::GitTransport { .. } => ExitStatus::OperationalError,
             Self::LocalStateLockTimeout { .. } => ExitStatus::OperationalError,
             Self::LocalStateBusyTimeout { .. } => ExitStatus::OperationalError,
             Self::ExternalCommand { .. }
@@ -618,6 +631,36 @@ mod tests {
     }
 
     #[test]
+    fn a_lock_timeout_failure_names_the_wait_it_exhausted() {
+        let error = AppError::LocalStateLockTimeout {
+            path: PathBuf::from("/home/user/.skillctl/state.db.lock"),
+            purpose: "bootstrap local state",
+            waited_ms: 15_000,
+            holder: "pid=4242 purpose=run lifecycle transaction".to_string(),
+        };
+
+        assert_eq!(error.exit_status(), ExitStatus::OperationalError);
+        assert_eq!(error.exit_status().code(), 1);
+        let message = error.to_string();
+        assert!(
+            message.contains("SKILLCTL_LOCK_TIMEOUT_MS"),
+            "the failure names the wait control: {message}"
+        );
+        assert!(
+            message.contains("SKILLCTL_STATE_BUSY_TIMEOUT_MS"),
+            "the failure separates the SQLite busy wait: {message}"
+        );
+        assert!(
+            message.contains("timed out after 15000 ms"),
+            "the failure states the wait it used: {message}"
+        );
+        assert!(
+            message.contains("pid=4242"),
+            "the failure names the holder it blamed: {message}"
+        );
+    }
+
+    #[test]
     fn a_busy_timeout_failure_names_the_wait_it_exhausted() {
         let error = AppError::LocalStateBusyTimeout {
             path: PathBuf::from("/home/user/.skillctl/state.db"),
@@ -644,6 +687,30 @@ mod tests {
         assert!(
             message.contains("timed out after 60000 ms"),
             "the failure states the wait it used: {message}"
+        );
+    }
+
+    #[test]
+    fn a_git_transport_failure_is_an_operational_failure() {
+        let error = AppError::GitTransport {
+            url: "https://example.invalid/skills.git".to_string(),
+            message: "git fetch failed: could not resolve host".to_string(),
+        };
+
+        assert_eq!(error.exit_status(), ExitStatus::OperationalError);
+        assert_eq!(error.exit_status().code(), 1);
+        let message = error.to_string();
+        assert!(
+            message.contains("failed to fetch from git source"),
+            "the failure names the git fetch it lost: {message}",
+        );
+        assert!(
+            message.contains("https://example.invalid/skills.git"),
+            "the failure names the source it could not reach: {message}",
+        );
+        assert!(
+            message.contains("could not resolve host"),
+            "the failure keeps the git diagnosis: {message}",
         );
     }
 

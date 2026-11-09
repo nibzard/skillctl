@@ -103,7 +103,7 @@ fn override_creates_a_minimal_overlay_and_updates_manifest_lockfile_and_state() 
         .expect("install record exists");
     assert_eq!(state_row.0, overlay_hash);
     assert_eq!(state_row.1, effective_version);
-    assert_eq!(state_row.2, "2026-02-02T03:00:34Z");
+    assert_rfc3339_utc(&state_row.2);
 
     let pin_effective_version: Option<String> = connection
         .query_row(
@@ -1050,5 +1050,214 @@ fn a_frozen_restore_unlocks_override_and_fork_in_a_lockfile_only_checkout() {
         !fixture.manifest().contains("id: release-notes"),
         "the fork must remove the managed import: {}",
         fixture.manifest(),
+    );
+}
+
+/// An overlay file without a counterpart in the stored import aborts workspace
+/// resolution for every skill, so the pinning command must refuse it before it
+/// writes any hash instead of pinning content the next `sync` rejects.
+#[test]
+fn override_refuses_to_pin_an_overlay_file_that_does_not_map() {
+    let workspace = TestWorkspace::new();
+    workspace.write_skill_source("shared-skills", "release-notes");
+    workspace.write_file(
+        "shared-skills/.agents/skills/release-notes/notes.md",
+        "# Notes\n",
+    );
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--no-input", "override", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    // The user believes overlays are additive and drops an unmapped file in.
+    workspace.write_file(".agents/overlays/release-notes/extra.md", "# Extra\n");
+    let lockfile_before = fs::read_to_string(workspace.path().join(".agents/skillctl.lock"))
+        .expect("lockfile is readable");
+
+    let output = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--json", "--no-input", "override", "release-notes"])
+        .output()
+        .expect("command runs");
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "the re-pin must refuse as a validation failure"
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "the JSON run reports the refusal in its body"
+    );
+    let body: Value = serde_json::from_slice(&output.stdout).expect("stdout is valid json");
+    assert_eq!(body["ok"], false, "the refusal is a failure: {body:#?}");
+    let message = body["errors"][0].as_str().expect("error exists");
+    assert!(
+        message.contains("does not map to an imported file") && message.contains("extra.md"),
+        "the refusal must name the unmapped file: {message}"
+    );
+    assert!(
+        message.contains("remove the unmatched overlay file"),
+        "the refusal must name the repair: {message}"
+    );
+
+    assert_eq!(
+        fs::read_to_string(workspace.path().join(".agents/skillctl.lock"))
+            .expect("lockfile is readable"),
+        lockfile_before,
+        "the refusal must not move the pinned hashes"
+    );
+
+    // A file the stored import holds pins fine, so the rule is the mapping and
+    // not the re-pin itself.
+    fs::remove_file(
+        workspace
+            .path()
+            .join(".agents/overlays/release-notes/extra.md"),
+    )
+    .expect("the unmapped file is removed");
+    workspace.write_file(".agents/overlays/release-notes/notes.md", "# Team notes\n");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .args(["--json", "--no-input", "override", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+}
+
+/// A re-pin that moves the pinned overlay digest rewrites pinned state, so it
+/// must leave a ledger entry the way every sibling mutation does.
+#[test]
+fn an_override_re_pin_that_moves_the_pinned_overlay_records_history() {
+    let workspace = TestWorkspace::new();
+    workspace.write_skill_source("shared-skills", "release-notes");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770000000")
+        .args([
+            "--no-input",
+            "--name",
+            "release-notes",
+            "install",
+            "shared-skills",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770001234")
+        .args(["--no-input", "override", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let overlay_history = || -> Vec<(String, String)> {
+        let connection = Connection::open(workspace.home_path().join(".skillctl/state.db"))
+            .expect("state database opens");
+        connection
+            .prepare(
+                "SELECT kind, summary FROM history_events WHERE skill_id = ?1 \
+                 ORDER BY occurred_at ASC, id ASC",
+            )
+            .expect("statement prepares")
+            .query_map(params!["release-notes"], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .expect("history query succeeds")
+            .collect::<Result<_, _>>()
+            .expect("history rows decode")
+    };
+
+    assert_eq!(
+        overlay_history()
+            .into_iter()
+            .filter(|(kind, _)| kind == "overlay-created")
+            .collect::<Vec<_>>(),
+        vec![(
+            "overlay-created".to_string(),
+            "Created overlay for release-notes".to_string(),
+        )],
+        "sanity: the creation run recorded one overlay event"
+    );
+
+    let overlay_path = workspace
+        .path()
+        .join(".agents/overlays/release-notes/SKILL.md");
+    let mut contents = fs::read_to_string(&overlay_path).expect("overlay manifest exists");
+    contents.push_str("\nlocal note\n");
+    fs::write(&overlay_path, contents).expect("overlay file updated");
+
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770002468")
+        .args(["--no-input", "override", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let overlay_events: Vec<(String, String)> = overlay_history()
+        .into_iter()
+        .filter(|(kind, _)| kind == "overlay-created")
+        .collect();
+    assert_eq!(
+        overlay_events.last(),
+        Some(&(
+            "overlay-created".to_string(),
+            "Re-pinned overlay for release-notes".to_string(),
+        )),
+        "the re-pin must record its own overlay event: {overlay_events:?}"
+    );
+
+    // An idempotent re-run moves no hash, so it records nothing new.
+    Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.home_path())
+        .env("SOURCE_DATE_EPOCH", "1770002468")
+        .args(["--no-input", "override", "release-notes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+    let count_after_idempotent_run = overlay_history()
+        .into_iter()
+        .filter(|(kind, _)| kind == "overlay-created")
+        .count();
+    assert_eq!(
+        count_after_idempotent_run,
+        overlay_events.len(),
+        "a re-pin that moves nothing records nothing"
     );
 }

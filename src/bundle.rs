@@ -19,6 +19,9 @@
 //!   characters. Windows-reserved device names are rejected.
 //! * Entries are sorted by path bytes and carry a file digest, a size in bytes,
 //!   and a mode of `file`, `executable`, or `directory`.
+//! * The observed mode stays in the inventory, but the digest payload
+//!   normalizes regular files to one tag, so a tree digests identically on
+//!   platforms without permission bits, such as Windows.
 //! * Every distributed file is inventoried, not only `SKILL.md`. Transport
 //!   metadata such as timestamps is never hashed.
 //! * Content is hashed exactly as supplied. No line-ending, Unicode, or
@@ -26,7 +29,8 @@
 //! * Symlinks, hard links, device nodes, FIFOs, sockets, duplicate normalized
 //!   paths, and case or Unicode-simple-fold path collisions are rejected.
 //! * File count, entry count, total bytes, per-file bytes, path depth, path
-//!   length, and segment length are bounded by [`BundleLimits`].
+//!   length, and segment length are bounded by [`BundleLimits`]. A tree that
+//!   exceeds a bound is rejected before its content is hashed.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -41,7 +45,18 @@ use sha2::{Digest, Sha256};
 use crate::error::AppError;
 
 /// Current canonical bundle manifest format version.
-pub const CANONICAL_BUNDLE_FORMAT_VERSION: u32 = 1;
+///
+/// Version 2 stops hashing the executable permission bit. Platforms without
+/// mode bits, such as Windows, cannot observe that bit, so the same tree
+/// digested differently per platform and a pinned digest never verified
+/// across them. The observed mode is still recorded in the inventory.
+///
+/// Migration: version 1 manifests remain readable and digest with the
+/// version 1 payload, so retained artifacts stay verifiable under their
+/// recorded digest. A lockfile pin recorded under version 1 no longer
+/// matches a fresh capture; reinstall the import to record a version 2
+/// pin.
+pub const CANONICAL_BUNDLE_FORMAT_VERSION: u32 = 2;
 
 /// Prefix carried by every canonical bundle digest.
 pub const BUNDLE_DIGEST_PREFIX: &str = "sha256:";
@@ -94,12 +109,15 @@ impl Default for BundleLimits {
 
 impl BundleLimits {
     /// Reject a single file that exceeds the per-file or total size bound.
+    ///
+    /// `prior_bytes` is the sum of the file sizes already accepted; it does
+    /// not include `size`.
     fn check_file(
         &self,
         root: &Path,
         path: &str,
         size: u64,
-        running_total: u64,
+        prior_bytes: u64,
     ) -> Result<(), AppError> {
         if size > self.max_file_bytes {
             return Err(bundle_error(
@@ -110,7 +128,7 @@ impl BundleLimits {
                 ),
             ));
         }
-        if running_total.saturating_add(size) > self.max_total_bytes {
+        if prior_bytes.saturating_add(size) > self.max_total_bytes {
             return Err(bundle_error(
                 root,
                 format!(
@@ -160,12 +178,18 @@ pub enum BundleEntryMode {
 }
 
 impl BundleEntryMode {
-    /// Stable tag used inside the digest payload.
-    const fn tag(self) -> &'static str {
-        match self {
-            Self::File => "file",
-            Self::Executable => "executable",
-            Self::Directory => "directory",
+    /// Stable tag used inside the digest payload of one format version.
+    ///
+    /// Version 1 recorded the executable permission bit, which platforms
+    /// without mode bits cannot observe, so the same tree digested
+    /// differently per platform. Version 2 hashes regular files as one tag
+    /// so the digest depends only on paths, content, and sizes. The observed
+    /// mode stays in the inventory.
+    const fn payload_tag(self, format_version: u32) -> &'static str {
+        match (self, format_version) {
+            (Self::Executable, 1) => "executable",
+            (Self::File, _) | (Self::Executable, _) => "file",
+            (Self::Directory, _) => "directory",
         }
     }
 }
@@ -259,16 +283,16 @@ impl BundleManifest {
         }
 
         let mut relatives = Vec::new();
-        collect_tree(root, root, &mut relatives, limits)?;
+        let mut counts = EntryCounts::default();
+        collect_tree(root, root, &mut relatives, limits, &mut counts)?;
 
         let mut entries = Vec::with_capacity(relatives.len());
         let mut total_bytes = 0_u64;
-        let mut directories = 0_usize;
-        let mut files = 0_usize;
 
         for relative in relatives {
             let path = normalize_relative_path(&relative)
                 .map_err(|message| bundle_error(root, message))?;
+            check_path_bounds(&path, limits).map_err(|message| bundle_error(root, message))?;
             let full_path = root.join(&relative);
             let entry_metadata = fs::symlink_metadata(&full_path).map_err(|source| {
                 AppError::FilesystemOperation {
@@ -279,7 +303,6 @@ impl BundleManifest {
             })?;
 
             if entry_metadata.is_dir() {
-                directories += 1;
                 entries.push(BundleEntry {
                     path,
                     mode: BundleEntryMode::Directory,
@@ -290,9 +313,8 @@ impl BundleManifest {
             }
 
             let size = entry_metadata.len();
-            total_bytes = total_bytes.saturating_add(size);
             limits.check_file(root, &path, size, total_bytes)?;
-            files += 1;
+            total_bytes = total_bytes.saturating_add(size);
             entries.push(BundleEntry {
                 path,
                 mode: if is_executable(&entry_metadata) {
@@ -306,7 +328,6 @@ impl BundleManifest {
         }
 
         entries.sort_by(|left, right| left.path.cmp(&right.path));
-        limits.check_counts(root, files, directories)?;
         let manifest = Self {
             format_version: CANONICAL_BUNDLE_FORMAT_VERSION,
             entries,
@@ -336,7 +357,7 @@ impl BundleManifest {
         for entry in &self.entries {
             payload.extend_from_slice(entry.path.as_bytes());
             payload.push(0);
-            payload.extend_from_slice(entry.mode.tag().as_bytes());
+            payload.extend_from_slice(entry.mode.payload_tag(self.format_version).as_bytes());
             payload.push(0);
             payload.extend_from_slice(entry.digest.as_deref().unwrap_or("").as_bytes());
             payload.push(0);
@@ -507,12 +528,123 @@ impl BundleManifest {
     }
 }
 
-/// Collect every relative path below `root`, rejecting unsupported entry types.
+/// Running entry counts guarded while a tree is collected.
+///
+/// Counting during collection rejects a tree that exceeds an entry-count
+/// bound before any content is hashed, as `docs/bundle-format.md` requires.
+#[derive(Default)]
+struct EntryCounts {
+    files: usize,
+    directories: usize,
+}
+
+/// Return the bundle refusal message when `path` is hard-linked content.
+///
+/// The refusal is the documented outcome on every platform: hard links hide
+/// independent content changes, including links whose second name lies
+/// outside the bundle. Unix reads the link count from metadata. Windows
+/// metadata carries no link count, so the check there asks the kernel for
+/// it through `GetFileInformationByHandle`; the equivalent `MetadataExt`
+/// accessors are still unstable.
+fn hard_link_violation(metadata: &fs::Metadata, path: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() > 1 {
+            return Some(hard_link_refusal(path));
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = metadata;
+        match windows_hard_links::link_count(path) {
+            Ok(count) if count > 1 => return Some(hard_link_refusal(path)),
+            Ok(_) => {}
+            Err(source) => {
+                return Some(format!(
+                    "file '{}' cannot be inspected for hard links: {source}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (metadata, path);
+    }
+    None
+}
+
+/// Windows link-count lookup through the kernel handle-information query.
+#[cfg(windows)]
+mod windows_hard_links {
+    use std::fs::File;
+    use std::io;
+    use std::os::windows::io::{AsRawHandle, RawHandle};
+    use std::path::Path;
+
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        file_attributes: u32,
+        creation_time: [u32; 2],
+        last_access_time: [u32; 2],
+        last_write_time: [u32; 2],
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(
+            file: RawHandle,
+            information: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    /// Number of directory entries that share the file at `path`.
+    pub(super) fn link_count(path: &Path) -> io::Result<u32> {
+        let file = File::open(path)?;
+        let mut information = ByHandleFileInformation {
+            file_attributes: 0,
+            creation_time: [0; 2],
+            last_access_time: [0; 2],
+            last_write_time: [0; 2],
+            volume_serial_number: 0,
+            file_size_high: 0,
+            file_size_low: 0,
+            number_of_links: 0,
+            file_index_high: 0,
+            file_index_low: 0,
+        };
+        // SAFETY: `file` holds an open handle and `information` is a valid,
+        // correctly sized output buffer for the duration of the call.
+        let result = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
+        if result == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(information.number_of_links)
+    }
+}
+
+fn hard_link_refusal(path: &Path) -> String {
+    format!(
+        "hard-linked file '{}' cannot be bundled; hard links hide independent content changes",
+        path.display()
+    )
+}
+
+/// Collect every relative path below `root`, rejecting unsupported entry types
+/// and trees that exceed the entry-count bounds.
 fn collect_tree(
     root: &Path,
     current: &Path,
     relatives: &mut Vec<PathBuf>,
     limits: &BundleLimits,
+    counts: &mut EntryCounts,
 ) -> Result<(), AppError> {
     let depth = match current.strip_prefix(root) {
         Ok(relative) => relative.components().count(),
@@ -562,6 +694,8 @@ fn collect_tree(
             ));
         }
         if file_type.is_dir() {
+            counts.directories += 1;
+            limits.check_counts(root, counts.files, counts.directories)?;
             relatives.push(
                 path.strip_prefix(root)
                     .map_err(|_| AppError::BundleValidation {
@@ -573,7 +707,7 @@ fn collect_tree(
                     })?
                     .to_path_buf(),
             );
-            collect_tree(root, &path, relatives, limits)?;
+            collect_tree(root, &path, relatives, limits, counts)?;
             continue;
         }
         if !file_type.is_file() {
@@ -585,16 +719,11 @@ fn collect_tree(
                 ),
             ));
         }
-        if hard_linked(&metadata) {
-            return Err(bundle_error(
-                root,
-                format!(
-                    "hard-linked file '{}' cannot be bundled; hard links hide independent \
-                     content changes",
-                    path.display()
-                ),
-            ));
+        if let Some(message) = hard_link_violation(&metadata, &path) {
+            return Err(bundle_error(root, message));
         }
+        counts.files += 1;
+        limits.check_counts(root, counts.files, counts.directories)?;
         relatives.push(
             path.strip_prefix(root)
                 .map_err(|_| AppError::BundleValidation {
@@ -612,6 +741,12 @@ fn collect_tree(
 }
 
 /// Normalize one relative path into its canonical bundle form.
+///
+/// This enforces the lexical path rules of `docs/bundle-format.md`: valid
+/// UTF-8, relative `/`-separated segments, no reserved device names, and no
+/// characters that are not portable. The path length, segment length, and
+/// depth bounds are enforced separately at capture time, where the active
+/// [`BundleLimits`] are known; see [`check_path_bounds`].
 pub fn normalize_relative_path(path: &Path) -> Result<String, String> {
     let mut segments = Vec::new();
     for component in path.components() {
@@ -635,7 +770,6 @@ pub fn normalize_relative_path(path: &Path) -> Result<String, String> {
         return Err("bundle paths must not be empty".to_string());
     }
 
-    let mut bytes = 0_usize;
     for segment in &segments {
         if segment.is_empty() {
             return Err(format!(
@@ -662,24 +796,43 @@ pub fn normalize_relative_path(path: &Path) -> Result<String, String> {
                 "path segment '{segment}' is a reserved device name on Windows"
             ));
         }
-        let segment_bytes = segment.len();
-        if segment_bytes > 255 {
-            return Err(format!(
-                "path segment '{segment}' is {segment_bytes} bytes, which exceeds the 255 byte \
-                 segment limit"
-            ));
-        }
-        bytes += segment_bytes + 1;
-    }
-
-    if bytes > 1024 {
-        return Err(format!(
-            "path '{}' is {bytes} bytes, which exceeds the 1024 byte path limit",
-            path.display()
-        ));
     }
 
     Ok(segments.join("/"))
+}
+
+/// Enforce the documented path length, segment length, and depth bounds on
+/// one normalized bundle path.
+fn check_path_bounds(path: &str, limits: &BundleLimits) -> Result<(), String> {
+    let bytes = path.len();
+    if bytes > limits.max_path_bytes {
+        return Err(format!(
+            "path '{path}' is {bytes} bytes, which exceeds the {} byte path limit",
+            limits.max_path_bytes
+        ));
+    }
+
+    for segment in path.split('/') {
+        let segment_bytes = segment.len();
+        if segment_bytes > limits.max_segment_bytes {
+            return Err(format!(
+                "path segment '{segment}' is {segment_bytes} bytes, which exceeds the {} byte \
+                 segment limit",
+                limits.max_segment_bytes
+            ));
+        }
+    }
+
+    let depth = path.split('/').count();
+    if depth > limits.max_path_depth {
+        return Err(format!(
+            "path '{path}' is {depth} segments deep, which exceeds the {} segment path depth \
+             limit",
+            limits.max_path_depth
+        ));
+    }
+
+    Ok(())
 }
 
 /// Hash one regular file with SHA-256 and return the canonical digest string.
@@ -714,20 +867,6 @@ fn is_executable(metadata: &fs::Metadata) -> bool {
     {
         use std::os::unix::fs::PermissionsExt;
         metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = metadata;
-        false
-    }
-}
-
-/// Whether a regular file has more than one hard link.
-fn hard_linked(metadata: &fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        metadata.nlink() > 1
     }
     #[cfg(not(unix))]
     {
@@ -841,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn bundle_digest_covers_paths_modes_sizes_and_content() {
+    fn bundle_digest_covers_paths_sizes_and_content() {
         let base = BundleFixture::new("sensitivity");
         base.write("SKILL.md", "one\n");
         let baseline = base.manifest().digest();
@@ -878,10 +1017,11 @@ mod tests {
         fs::set_permissions(&script, fs::Permissions::from_mode(0o644))
             .expect("executable bit cleared");
         let cleared = fixture.manifest();
-        assert_ne!(
+        assert_eq!(
             manifest.digest(),
             cleared.digest(),
-            "permission changes must change the bundle digest"
+            "permission changes must not change the bundle digest: platforms without \
+             permission bits derive the same digest for the same tree"
         );
     }
 
@@ -1010,6 +1150,105 @@ mod tests {
     }
 
     #[test]
+    fn bundle_total_size_at_the_limit_is_accepted() {
+        let limits = BundleLimits {
+            max_file_bytes: 4,
+            max_total_bytes: 8,
+            ..BundleLimits::default()
+        };
+
+        let fixture = BundleFixture::new("total-at-limit");
+        fixture.write("one", "aaaa");
+        fixture.write("two", "bbbb");
+
+        let manifest = BundleManifest::capture_with_limits(&fixture.root, &limits)
+            .expect("a bundle summing exactly to the total limit is accepted");
+        assert_eq!(manifest.total_bytes(), 8);
+    }
+
+    #[test]
+    fn entry_count_bounds_are_enforced_before_hashing() {
+        // The tree breaks the total-size bound from its second file, so only a
+        // count check that runs during collection can report the count bound.
+        let limits = BundleLimits {
+            max_file_entries: 2,
+            max_total_bytes: 1,
+            ..BundleLimits::default()
+        };
+
+        let fixture = BundleFixture::new("counts-before-hashing");
+        fixture.write("a", "1");
+        fixture.write("b", "2");
+        fixture.write("c", "3");
+
+        let error = BundleManifest::capture_with_limits(&fixture.root, &limits)
+            .expect_err("count bounds are rejected before content is hashed");
+        assert!(
+            error.to_string().contains("file limit"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn path_length_limit_counts_exact_path_bytes() {
+        // Four 250 byte segments plus a 20 byte segment and four separators
+        // sum to exactly the documented 1024 byte maximum.
+        let at_limit = format!(
+            "{}/{}/{}/{}/{}",
+            "a".repeat(250),
+            "b".repeat(250),
+            "c".repeat(250),
+            "d".repeat(250),
+            "e".repeat(20),
+        );
+        assert_eq!(at_limit.len(), 1024);
+
+        let fixture = BundleFixture::new("path-at-limit");
+        fixture.write(&at_limit, "content\n");
+        BundleManifest::capture(&fixture.root)
+            .expect("a path of exactly 1024 bytes is at the documented limit");
+
+        let over_limit = format!("{at_limit}x");
+        assert_eq!(over_limit.len(), 1025);
+        let fixture = BundleFixture::new("path-over-limit");
+        fixture.write(&over_limit, "content\n");
+        let error = BundleManifest::capture(&fixture.root)
+            .expect_err("a path beyond the byte limit is rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("path limit"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("is 1025 bytes"),
+            "the reported length must be the real path length: {message}"
+        );
+    }
+
+    #[test]
+    fn path_depth_limit_applies_to_file_entries() {
+        // Thirty-one nested directories plus the file give 32 segments.
+        let at_limit = format!("{}/file", vec!["d"; 31].join("/"));
+        assert_eq!(at_limit.matches('/').count() + 1, 32);
+
+        let fixture = BundleFixture::new("depth-at-limit");
+        fixture.write(&at_limit, "content\n");
+        BundleManifest::capture(&fixture.root)
+            .expect("a file at 32 segments is at the documented depth limit");
+
+        let over_limit = format!("d/{}", at_limit);
+        assert_eq!(over_limit.matches('/').count() + 1, 33);
+        let fixture = BundleFixture::new("depth-over-limit");
+        fixture.write(&over_limit, "content\n");
+        let error = BundleManifest::capture(&fixture.root)
+            .expect_err("a file at 33 segments is beyond the depth limit");
+        assert!(
+            error.to_string().contains("depth"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn manifest_json_round_trips_and_rejects_unsorted_entries() {
         let fixture = BundleFixture::new("roundtrip");
         fixture.write("SKILL.md", "# skill\n");
@@ -1077,8 +1316,9 @@ mod tests {
     /// Pins the committed fixture digest, which is the hash-format
     /// compatibility boundary described in `tests/fixtures/bundle/README.md`.
     ///
-    /// The value was reproduced independently from the documented payload rules,
-    /// so a change here means the format changed, not just the implementation.
+    /// The values were reproduced independently from the documented payload
+    /// rules, so a change here means the format changed, not just the
+    /// implementation.
     #[test]
     fn committed_fixture_digest_is_pinned() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bundle/canonical");
@@ -1110,6 +1350,17 @@ mod tests {
         );
         assert_eq!(
             manifest.digest(),
+            "sha256:367c651e157b6b28646d3627d147b67b66da58bb5b0692ae3fabba35caaf937b",
+            "version 2 normalizes regular files to one payload tag, so the digest no \
+             longer depends on platform permission bits"
+        );
+
+        // Version 1 digests keep their payload rules so retained version 1
+        // artifacts stay verifiable under their recorded digest.
+        let mut version_one = manifest;
+        version_one.format_version = 1;
+        assert_eq!(
+            version_one.digest(),
             "sha256:0766869ba27a516348be813c39a52a8ca862ce7338708117a1b0044e9d86bc0f"
         );
     }

@@ -2,6 +2,16 @@ use super::*;
 
 const CLAUDE_MANIFEST: &str = concat!("version: 1\n", "\n", "targets:\n", "  - claude-code\n",);
 
+/// A manifest that projects one skill into two distinct roots, so a copy in
+/// each root can hold a different edit of the same file.
+const TWO_ROOT_MANIFEST: &str = concat!(
+    "version: 1\n",
+    "\n",
+    "targets:\n",
+    "  - claude-code\n",
+    "  - codex\n",
+);
+
 struct UpdateFixture {
     workspace: TestWorkspace,
     installed_revision: String,
@@ -9,9 +19,21 @@ struct UpdateFixture {
 
 impl UpdateFixture {
     fn install() -> Self {
+        Self::install_with(CLAUDE_MANIFEST, &[])
+    }
+
+    /// Install with an explicit manifest and extra files committed into the
+    /// skill source at the revision the install pins.
+    fn install_with(manifest: &str, extra_source_files: &[(&str, &str)]) -> Self {
         let workspace = TestWorkspace::new();
-        workspace.write_manifest(CLAUDE_MANIFEST);
+        workspace.write_manifest(manifest);
         workspace.write_skill_source("git-source", "release-notes");
+        for (relative_path, contents) in extra_source_files {
+            workspace.write_file(
+                &format!("git-source/.agents/skills/release-notes/{relative_path}"),
+                contents,
+            );
+        }
         workspace.init_git_repo("git-source");
         let repo_url = workspace.git_repo_url("git-source");
 
@@ -70,10 +92,13 @@ impl UpdateFixture {
     }
 
     fn edit_projected_copy(&self, note: &str) {
+        self.edit_copy_at(".claude/skills/release-notes/SKILL.md", note);
+    }
+
+    /// Edit one generated copy of the skill, wherever its root projects it.
+    fn edit_copy_at(&self, relative_copy: &str, note: &str) {
         fs::write(
-            self.workspace
-                .path()
-                .join(".claude/skills/release-notes/SKILL.md"),
+            self.workspace.path().join(relative_copy),
             concat!(
                 "---\n",
                 "name: release-notes\n",
@@ -274,7 +299,7 @@ fn update_apply_rolls_back_when_the_transaction_fails_after_the_state_write() {
 #[test]
 fn an_interrupted_apply_leaves_an_explicit_recoverable_operation() {
     let fixture = UpdateFixture::install();
-    fixture.advance_upstream("Updated upstream release notes helper.");
+    let upstream_revision = fixture.advance_upstream("Updated upstream release notes helper.");
 
     let terminated = Command::cargo_bin("skillctl")
         .expect("binary exists")
@@ -311,8 +336,10 @@ fn an_interrupted_apply_leaves_an_explicit_recoverable_operation() {
         .unwrap_or("<missing>")
         .to_string();
     assert!(
-        revision == fixture.installed_revision || revision.len() == 40,
-        "recovery leaves a coherent revision: {revision}"
+        revision == fixture.installed_revision || revision == upstream_revision,
+        "recovery leaves the pin on the installed revision {installed} or the applied upstream \
+         revision {upstream_revision}, not {revision}",
+        installed = fixture.installed_revision,
     );
 }
 
@@ -397,6 +424,343 @@ fn update_apply_preserves_edits_as_an_overlay() {
         .expect("projection exists")
         .contains("keep my edit"),
         "the projected copy still shows the preserved edit"
+    );
+}
+
+/// Two roots can hold two different edits of the same file. Both copies share
+/// one overlay, so the move must keep both variants: the winner lives in the
+/// overlay and drives the rebuilt copies, and the loser is backed up durably
+/// and reported, never overwritten silently.
+#[test]
+fn overlay_preservation_keeps_both_variants_of_conflicting_edits() {
+    let fixture = UpdateFixture::install_with(TWO_ROOT_MANIFEST, &[]);
+    fixture.advance_upstream("Updated upstream release notes helper.");
+    fixture.edit_copy_at(".claude/skills/release-notes/SKILL.md", "claude root edit");
+    fixture.edit_copy_at(".agents/skills/release-notes/SKILL.md", "neutral root edit");
+
+    let body = fixture.run_json(&[
+        "update",
+        "release-notes",
+        "--apply",
+        "--strategy",
+        "overlay",
+    ]);
+    assert_eq!(body["ok"], true, "the apply keeps both variants: {body:#?}");
+
+    let overlay = fs::read_to_string(
+        fixture
+            .workspace
+            .path()
+            .join(".agents/overlays/release-notes/SKILL.md"),
+    )
+    .expect("the overlay file exists");
+    let claude_wins = overlay.contains("claude root edit");
+    let neutral_wins = overlay.contains("neutral root edit");
+    assert!(
+        claude_wins ^ neutral_wins,
+        "the overlay holds exactly one variant: {overlay}"
+    );
+    let (winning_note, losing_note) = if claude_wins {
+        ("claude root edit", "neutral root edit")
+    } else {
+        ("neutral root edit", "claude root edit")
+    };
+
+    let discarded = body["data"]["discarded"]
+        .as_array()
+        .expect("the discarded list exists");
+    let replaced = discarded
+        .iter()
+        .find(|entry| {
+            entry["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("overlays/release-notes/SKILL.md"))
+        })
+        .expect("the replaced overlay variant is reported")
+        .clone();
+    assert!(
+        replaced["skill"] == "release-notes",
+        "the replaced variant names its skill: {replaced}"
+    );
+    let backup = replaced["backup"].as_str().expect("the backup path exists");
+    assert!(
+        backup.contains(".skillctl/store/discards"),
+        "the replaced variant lives in the durable store: {backup}"
+    );
+    assert!(
+        fs::read_to_string(PathBuf::from(backup).join("SKILL.md"))
+            .expect("the backed-up overlay variant exists")
+            .contains(losing_note),
+        "the losing edit stays recoverable at {backup}"
+    );
+
+    for copy in [
+        ".claude/skills/release-notes/SKILL.md",
+        ".agents/skills/release-notes/SKILL.md",
+    ] {
+        let contents = fs::read_to_string(fixture.workspace.path().join(copy))
+            .expect("the rebuilt copy exists");
+        assert!(
+            contents.contains(winning_note) && !contents.contains(losing_note),
+            "the rebuilt copy at {copy} materializes the overlay variant: {contents}"
+        );
+    }
+}
+
+/// The managed overlay can only replace imported files, so a copy that holds a
+/// file the import never provided must be refused before the in-transaction
+/// sync meets an overlay it cannot resolve. The refusal names the file and the
+/// fork strategy that keeps it.
+#[test]
+fn the_overlay_strategy_refuses_files_the_import_does_not_provide() {
+    let fixture = UpdateFixture::install();
+    fixture.advance_upstream("Updated upstream release notes helper.");
+    fixture
+        .workspace
+        .write_file(".claude/skills/release-notes/notes.md", "# local notes\n");
+    let before = fixture.lockfile_digest();
+
+    let body = fixture.run_json(&[
+        "update",
+        "release-notes",
+        "--apply",
+        "--strategy",
+        "overlay",
+    ]);
+
+    assert_eq!(body["ok"], false);
+    let error = body["errors"][0].as_str().expect("error exists");
+    assert!(
+        error.contains("notes.md"),
+        "the refusal names the file it cannot map: {error}"
+    );
+    assert!(
+        error.contains("update release-notes --apply --strategy fork"),
+        "the refusal names the strategy that keeps the file: {error}"
+    );
+    assert_eq!(
+        fixture.lockfile_digest(),
+        before,
+        "the refused apply mutates nothing"
+    );
+    assert!(
+        fs::read_to_string(
+            fixture
+                .workspace
+                .path()
+                .join(".claude/skills/release-notes/notes.md")
+        )
+        .expect("the copy is restored")
+        .contains("local notes"),
+        "the unrepresentable file is not dropped"
+    );
+    assert!(
+        !fixture
+            .workspace
+            .path()
+            .join(".agents/overlays/release-notes")
+            .exists(),
+        "no poisoned overlay survives the refusal"
+    );
+}
+
+/// An overlay entry replaces a file, so a deleted file cannot survive the
+/// move: the copy would be rebuilt and the file would return without a word.
+/// The refusal names the deletion instead of silently reverting the edit.
+#[test]
+fn the_overlay_strategy_refuses_files_the_copy_deleted() {
+    let fixture = UpdateFixture::install_with(
+        CLAUDE_MANIFEST,
+        &[("reference.md", "release note reference\n")],
+    );
+    fixture.advance_upstream("Updated upstream release notes helper.");
+    fs::remove_file(
+        fixture
+            .workspace
+            .path()
+            .join(".claude/skills/release-notes/reference.md"),
+    )
+    .expect("the projected reference is deleted");
+    let before = fixture.lockfile_digest();
+
+    let body = fixture.run_json(&[
+        "update",
+        "release-notes",
+        "--apply",
+        "--strategy",
+        "overlay",
+    ]);
+
+    assert_eq!(body["ok"], false);
+    let error = body["errors"][0].as_str().expect("error exists");
+    assert!(
+        error.contains("reference.md"),
+        "the refusal names the deleted file: {error}"
+    );
+    assert!(
+        error.contains("deletes files"),
+        "the refusal explains what the copy did: {error}"
+    );
+    assert_eq!(
+        fixture.lockfile_digest(),
+        before,
+        "the refused apply mutates nothing"
+    );
+    assert!(
+        !fixture
+            .workspace
+            .path()
+            .join(".claude/skills/release-notes/reference.md")
+            .exists(),
+        "the deletion edit is not silently reverted while refused"
+    );
+}
+
+/// A file the import never provided cannot live in a managed overlay, but a
+/// fork detaches into local canonical ownership, so the overlay only ferries
+/// the file into the forked copy. The fork must keep it.
+#[test]
+fn a_fork_keeps_files_the_import_does_not_provide() {
+    let fixture = UpdateFixture::install();
+    fixture.advance_upstream("Updated upstream release notes helper.");
+    fixture
+        .workspace
+        .write_file(".claude/skills/release-notes/notes.md", "# local notes\n");
+
+    let body = fixture.run_json(&["update", "release-notes", "--apply", "--strategy", "fork"]);
+
+    assert_eq!(body["ok"], true, "the fork applies: {body:#?}");
+    assert!(
+        fs::read_to_string(
+            fixture
+                .workspace
+                .path()
+                .join(".agents/skills/release-notes/notes.md")
+        )
+        .expect("the forked copy keeps the file")
+        .contains("local notes"),
+        "a user-created file survives the fork"
+    );
+    assert!(
+        fixture.workspace.read_lockfile_yaml()["imports"]["release-notes"].is_null(),
+        "forking releases the managed import"
+    );
+}
+
+/// An overlay entry replaces a file, so a deleted file cannot ride a fork's
+/// overlay ferry either: the fork rebuilds the copy from the stored import and
+/// the file would return without a word. Both fork entries must give this
+/// input the same refusal the overlay strategy gives it.
+#[test]
+fn a_fork_refuses_edits_that_delete_imported_files() {
+    let fixture = UpdateFixture::install_with(
+        CLAUDE_MANIFEST,
+        &[("reference.md", "release note reference\n")],
+    );
+    fs::remove_file(
+        fixture
+            .workspace
+            .path()
+            .join(".claude/skills/release-notes/reference.md"),
+    )
+    .expect("the projected reference is deleted");
+    let before = fixture.lockfile_digest();
+
+    let body = fixture.run_json(&["fork", "release-notes"]);
+
+    assert_eq!(
+        body["ok"], false,
+        "the direct fork refuses the deletion: {body:#?}"
+    );
+    let error = body["errors"][0].as_str().expect("error exists");
+    assert!(
+        error.contains("reference.md") && error.contains("deletes files"),
+        "the refusal names the deleted file: {error}"
+    );
+    assert_eq!(
+        fixture.lockfile_digest(),
+        before,
+        "the refused fork mutates nothing"
+    );
+    assert!(
+        !fixture
+            .workspace
+            .path()
+            .join(".agents/overlays/release-notes")
+            .exists(),
+        "no overlay survives the refusal"
+    );
+
+    // The same state through the update fork must hear the same refusal.
+    fixture.advance_upstream("Updated upstream release notes helper.");
+    let body = fixture.run_json(&["update", "release-notes", "--apply", "--strategy", "fork"]);
+    assert_eq!(body["ok"], false, "the update fork refuses too: {body:#?}");
+    let error = body["errors"][0].as_str().expect("error exists");
+    assert!(
+        error.contains("reference.md") && error.contains("deletes files"),
+        "both fork entries share one refusal: {error}"
+    );
+}
+
+/// A revision that deletes a file an overlay edits would leave an overlay no
+/// sync can resolve, and the rollback would restore a tree where nothing looks
+/// wrong. Every strategy must refuse up front and name the overlay file.
+#[test]
+fn an_update_refuses_a_revision_that_drops_an_overlay_edited_file() {
+    let fixture = UpdateFixture::install_with(
+        CLAUDE_MANIFEST,
+        &[("templates/header.md", "# upstream header\n")],
+    );
+    fixture.run(&["override", "release-notes"]).success();
+    fixture.workspace.write_file(
+        ".agents/overlays/release-notes/templates/header.md",
+        "# team header\n",
+    );
+    fixture.run(&["override", "release-notes"]).success();
+
+    fs::remove_file(
+        fixture
+            .workspace
+            .path()
+            .join("git-source/.agents/skills/release-notes/templates/header.md"),
+    )
+    .expect("the upstream template is removed");
+    fixture
+        .workspace
+        .commit_all("git-source", "remove the template upstream");
+
+    let before = fixture.lockfile_digest();
+    for strategy in ["clean", "overlay", "discard"] {
+        let body =
+            fixture.run_json(&["update", "release-notes", "--apply", "--strategy", strategy]);
+        assert_eq!(
+            body["ok"], false,
+            "the {strategy} strategy must refuse the move: {body:#?}"
+        );
+        let error = body["errors"][0].as_str().expect("error exists");
+        assert!(
+            error.contains("templates/header.md")
+                && error.contains("no longer contains")
+                && error.contains("skillctl fork release-notes"),
+            "the {strategy} refusal names the overlay file and its exits: {error}"
+        );
+    }
+
+    assert_eq!(
+        fixture.lockfile_digest(),
+        before,
+        "the refused moves leave the pin alone"
+    );
+    assert!(
+        fs::read_to_string(
+            fixture
+                .workspace
+                .path()
+                .join(".agents/overlays/release-notes/templates/header.md")
+        )
+        .expect("the overlay edit survives")
+        .contains("team header"),
+        "the overlay edit is not dropped while refused"
     );
 }
 
@@ -639,7 +1003,7 @@ fn a_stale_plan_fails_before_any_mutation() {
 #[test]
 fn a_tampered_plan_document_is_rejected() {
     let fixture = UpdateFixture::install();
-    let new_revision = fixture.advance_upstream("Updated upstream release notes helper.");
+    fixture.advance_upstream("Updated upstream release notes helper.");
     let plan_path = fixture.workspace.path().join("update-plan.json");
     fixture.run(&["update", "--plan", "update-plan.json"]);
 
@@ -666,7 +1030,6 @@ fn a_tampered_plan_document_is_rejected() {
             .join("release-notes")
             .exists()
     );
-    let _ = new_revision;
 }
 
 #[test]
@@ -868,6 +1231,70 @@ fn a_forked_skill_does_not_block_a_clean_apply_for_other_skills() {
             .expect("resolved revision exists"),
         new_revision.as_str(),
         "the applied skill moves upstream: {lockfile:?}",
+    );
+}
+
+/// The fork's overlay ferry rides the fork's own guarded transaction. A fork
+/// that fails after the preservation — here because the canonical destination
+/// is a hand-authored directory — must roll the overlay and its manifest
+/// declaration back, because a declared overlay holding a file with no
+/// imported base refuses every graph-resolving command for the whole
+/// workspace.
+#[test]
+fn a_failed_fork_leaves_no_declared_overlay_behind() {
+    let fixture = UpdateFixture::install_with(TWO_ROOT_MANIFEST, &[]);
+    fixture.edit_copy_at(".claude/skills/release-notes/SKILL.md", "keep my edit");
+
+    // A hand-authored canonical destination makes the fork refuse after the
+    // preservation step has ferried the edit into a fresh overlay.
+    let canonical = fixture
+        .workspace
+        .path()
+        .join(".agents/skills/release-notes");
+    let metadata = canonical.join(".skillctl-projection.json");
+    assert!(
+        metadata.is_file(),
+        "the generated canonical copy exists before it is made hand-authored"
+    );
+    fs::remove_file(&metadata).expect("projection metadata is removed");
+    let before = fixture.lockfile_digest();
+
+    let body = fixture.run_json(&["fork", "release-notes"]);
+
+    assert_eq!(
+        body["ok"], false,
+        "the fork refuses the hand-authored destination: {body:#?}"
+    );
+    let error = body["errors"][0].as_str().expect("error exists");
+    assert!(
+        error.contains("hand-authored"),
+        "the refusal names the hand-authored destination: {error}"
+    );
+    assert!(
+        !fixture
+            .workspace
+            .path()
+            .join(".agents/overlays/release-notes")
+            .exists(),
+        "the ferried overlay is rolled back with the failed fork"
+    );
+    let manifest = fs::read_to_string(fixture.workspace.path().join(".agents/skillctl.yaml"))
+        .expect("the manifest is readable");
+    assert!(
+        !manifest.contains("overrides"),
+        "the failed fork declares no overlay: {manifest}"
+    );
+    assert_eq!(
+        fixture.lockfile_digest(),
+        before,
+        "the failed fork leaves the pin alone"
+    );
+
+    // The workspace still resolves, so nothing dead-ends the next command.
+    let listed = fixture.run_json(&["list"]);
+    assert_eq!(
+        listed["ok"], true,
+        "the workspace still resolves: {listed:#?}"
     );
 }
 
@@ -1410,5 +1837,48 @@ fn list_json_fits_the_stored_update_check_to_the_applied_revision() {
     assert_eq!(
         skill_after_recheck["latest_update"]["outcome"], "update-available",
         "a waiting update stays visible in list: {skill_after_recheck:#?}"
+    );
+}
+
+#[test]
+fn a_missing_git_binary_reports_the_external_command_not_a_temp_path() {
+    let fixture = UpdateFixture::install();
+    let new_revision = fixture.advance_upstream("Advanced for the missing-binary pin.");
+
+    // A pin checks its revision out with git before the guarded transaction
+    // opens. When git itself cannot launch, the failure names the git binary
+    // the way install does, instead of blaming the staging checkout path the
+    // user cannot inspect.
+    let output = Command::cargo_bin("skillctl")
+        .expect("binary exists")
+        .current_dir(fixture.workspace.path())
+        .env("HOME", fixture.workspace.home_path())
+        .env("PATH", "")
+        .args([
+            "--json",
+            "--no-input",
+            "pin",
+            "release-notes",
+            new_revision.as_str(),
+        ])
+        .output()
+        .expect("pin runs");
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        !output.status.success(),
+        "the pin must fail without git on PATH: {text}"
+    );
+    assert!(
+        text.contains("failed to run external command 'git'"),
+        "expected the external-command failure, found: {text}"
+    );
+    assert!(
+        !text.contains("clone pinned git source"),
+        "the failure must not blame the checkout path: {text}"
     );
 }

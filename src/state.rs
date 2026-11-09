@@ -17,7 +17,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    adapter::TargetRuntime, error::AppError, history::HistoryEventKind, source::SourceKind,
+    adapter::{TargetRuntime, TargetScope},
+    error::AppError,
+    history::HistoryEventKind,
+    source::SourceKind,
 };
 
 mod codec;
@@ -36,6 +39,7 @@ pub use self::journal::{
 
 pub(crate) use self::journal::{JournalState, OperationJournal, recover_interrupted_operations};
 pub(crate) use self::lock::CoordinationGuard;
+pub(crate) use self::schema::resolve_home_directory;
 
 /// Current schema version for `.agents/skillctl.yaml`.
 pub const CURRENT_MANIFEST_VERSION: u32 = 1;
@@ -406,6 +410,15 @@ impl ManagedScope {
         match self {
             Self::Workspace => "workspace",
             Self::User => "user",
+        }
+    }
+}
+
+impl From<ManagedScope> for TargetScope {
+    fn from(scope: ManagedScope) -> Self {
+        match scope {
+            ManagedScope::Workspace => Self::Workspace,
+            ManagedScope::User => Self::User,
         }
     }
 }
@@ -961,11 +974,26 @@ impl LocalStateStore {
                 source,
             })?;
         configure_connection(&connection, &path)?;
+        // Bootstrap decides for itself whether it may write: the unlocked pass
+        // validates read-only and reports the schema work it found instead of
+        // performing it, so `list`, `history`, `doctor`, and every other read
+        // stay available while a lifecycle writer holds the lock, and a
+        // database that changed underneath the pass — for example through a
+        // concurrent crash-recovery restore — is migrated by a coordinated
+        // pass instead of an unlocked one. The SQLite busy timeout covers the
+        // unlocked reads.
+        match bootstrap_connection(&mut connection, &path, &workspace_key, false)
+            .map_err(|error| unreadable_state_database(&path, error))?
         {
-            let _guard = self::lock::acquire(&path, "bootstrap local state")?;
-            if let Err(error) = bootstrap_connection(&mut connection, &path, &workspace_key) {
-                return Err(unreadable_state_database(&path, error));
+            BootstrapOutcome::NeedsCoordination => {
+                let _guard = self::lock::acquire(&path, "bootstrap local state")?;
+                if let Err(error) =
+                    bootstrap_connection(&mut connection, &path, &workspace_key, true)
+                {
+                    return Err(unreadable_state_database(&path, error));
+                }
             }
+            BootstrapOutcome::Validated | BootstrapOutcome::Wrote => {}
         }
 
         Ok(Self {
@@ -992,7 +1020,7 @@ impl LocalStateStore {
                 source,
             })?;
         configure_connection(&connection, &path)?;
-        bootstrap_connection(&mut connection, &path, &workspace_key)?;
+        bootstrap_connection(&mut connection, &path, &workspace_key, true)?;
 
         Ok(Self {
             path,
@@ -1269,71 +1297,32 @@ impl LocalStateStore {
                 local_state_query(&self.path, "prepare projection records query", source)
             })?;
 
-        let mut records = Vec::new();
         if let Some(skill) = skill {
             validate_skill_ref(&self.path, skill)?;
-            let rows = statement
-                .query_map(
-                    params![
-                        skill.scope.as_str(),
-                        self.workspace_key_for_scope(skill.scope),
-                        skill.skill_id
-                    ],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, String>(5)?,
-                            row.get::<_, String>(6)?,
-                            row.get::<_, String>(7)?,
-                            row.get::<_, String>(8)?,
-                        ))
-                    },
-                )
-                .map_err(|source| {
-                    local_state_query(&self.path, "query projection records", source)
-                })?;
-
-            for row in rows {
-                let row = row.map_err(|source| {
-                    local_state_query(&self.path, "read projection record", source)
-                })?;
-                records.push(decode_projection_record(&self.path, row)?);
-            }
+            query_record_list(
+                &self.path,
+                &mut statement,
+                "query projection records",
+                "read projection record",
+                params![
+                    skill.scope.as_str(),
+                    self.workspace_key_for_scope(skill.scope),
+                    skill.skill_id
+                ],
+                map_projection_row,
+                decode_projection_record,
+            )
         } else {
-            let rows = statement
-                .query_map(
-                    params![self.workspace_key.as_str(), GLOBAL_WORKSPACE_KEY],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, String>(5)?,
-                            row.get::<_, String>(6)?,
-                            row.get::<_, String>(7)?,
-                            row.get::<_, String>(8)?,
-                        ))
-                    },
-                )
-                .map_err(|source| {
-                    local_state_query(&self.path, "query projection records", source)
-                })?;
-
-            for row in rows {
-                let row = row.map_err(|source| {
-                    local_state_query(&self.path, "read projection record", source)
-                })?;
-                records.push(decode_projection_record(&self.path, row)?);
-            }
+            query_record_list(
+                &self.path,
+                &mut statement,
+                "query projection records",
+                "read projection record",
+                params![self.workspace_key.as_str(), GLOBAL_WORKSPACE_KEY],
+                map_projection_row,
+                decode_projection_record,
+            )
         }
-
-        Ok(records)
     }
 
     /// Insert or update the current projection record for a managed skill.
@@ -1415,71 +1404,32 @@ impl LocalStateStore {
                 local_state_query(&self.path, "prepare update checks query", source)
             })?;
 
-        let mut records = Vec::new();
         if let Some(skill) = skill {
             validate_skill_ref(&self.path, skill)?;
-            let rows = statement
-                .query_map(
-                    params![
-                        skill.scope.as_str(),
-                        self.workspace_key_for_scope(skill.scope),
-                        skill.skill_id
-                    ],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, String>(5)?,
-                            row.get::<_, Option<String>>(6)?,
-                            row.get::<_, String>(7)?,
-                            row.get::<_, i64>(8)?,
-                            row.get::<_, i64>(9)?,
-                            row.get::<_, Option<String>>(10)?,
-                            row.get::<_, Option<String>>(11)?,
-                        ))
-                    },
-                )
-                .map_err(|source| local_state_query(&self.path, "query update checks", source))?;
-
-            for row in rows {
-                let row = row
-                    .map_err(|source| local_state_query(&self.path, "read update check", source))?;
-                records.push(decode_update_check_record(&self.path, row)?);
-            }
+            query_record_list(
+                &self.path,
+                &mut statement,
+                "query update checks",
+                "read update check",
+                params![
+                    skill.scope.as_str(),
+                    self.workspace_key_for_scope(skill.scope),
+                    skill.skill_id
+                ],
+                map_update_check_row,
+                decode_update_check_record,
+            )
         } else {
-            let rows = statement
-                .query_map(
-                    params![self.workspace_key.as_str(), GLOBAL_WORKSPACE_KEY],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, String>(5)?,
-                            row.get::<_, Option<String>>(6)?,
-                            row.get::<_, String>(7)?,
-                            row.get::<_, i64>(8)?,
-                            row.get::<_, i64>(9)?,
-                            row.get::<_, Option<String>>(10)?,
-                            row.get::<_, Option<String>>(11)?,
-                        ))
-                    },
-                )
-                .map_err(|source| local_state_query(&self.path, "query update checks", source))?;
-
-            for row in rows {
-                let row = row
-                    .map_err(|source| local_state_query(&self.path, "read update check", source))?;
-                records.push(decode_update_check_record(&self.path, row)?);
-            }
+            query_record_list(
+                &self.path,
+                &mut statement,
+                "query update checks",
+                "read update check",
+                params![self.workspace_key.as_str(), GLOBAL_WORKSPACE_KEY],
+                map_update_check_row,
+                decode_update_check_record,
+            )
         }
-
-        Ok(records)
     }
 
     /// Load the most recent update check for one managed skill.
@@ -1508,22 +1458,7 @@ impl LocalStateStore {
                     self.workspace_key_for_scope(skill.scope),
                     skill.skill_id
                 ],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                        row.get::<_, String>(7)?,
-                        row.get::<_, i64>(8)?,
-                        row.get::<_, i64>(9)?,
-                        row.get::<_, Option<String>>(10)?,
-                        row.get::<_, Option<String>>(11)?,
-                    ))
-                },
+                map_update_check_row,
             )
             .optional()
             .map_err(|source| local_state_query(&self.path, "load latest update check", source))?;
@@ -1570,69 +1505,32 @@ impl LocalStateStore {
                 local_state_query(&self.path, "prepare local modifications query", source)
             })?;
 
-        let mut records = Vec::new();
         if let Some(skill) = skill {
             validate_skill_ref(&self.path, skill)?;
-            let rows = statement
-                .query_map(
-                    params![
-                        skill.scope.as_str(),
-                        self.workspace_key_for_scope(skill.scope),
-                        skill.skill_id
-                    ],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, String>(5)?,
-                            row.get::<_, Option<String>>(6)?,
-                            row.get::<_, Option<String>>(7)?,
-                        ))
-                    },
-                )
-                .map_err(|source| {
-                    local_state_query(&self.path, "query local modifications", source)
-                })?;
-
-            for row in rows {
-                let row = row.map_err(|source| {
-                    local_state_query(&self.path, "read local modification", source)
-                })?;
-                records.push(decode_local_modification_record(&self.path, row)?);
-            }
+            query_record_list(
+                &self.path,
+                &mut statement,
+                "query local modifications",
+                "read local modification",
+                params![
+                    skill.scope.as_str(),
+                    self.workspace_key_for_scope(skill.scope),
+                    skill.skill_id
+                ],
+                map_local_modification_row,
+                decode_local_modification_record,
+            )
         } else {
-            let rows = statement
-                .query_map(
-                    params![self.workspace_key.as_str(), GLOBAL_WORKSPACE_KEY],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, String>(5)?,
-                            row.get::<_, Option<String>>(6)?,
-                            row.get::<_, Option<String>>(7)?,
-                        ))
-                    },
-                )
-                .map_err(|source| {
-                    local_state_query(&self.path, "query local modifications", source)
-                })?;
-
-            for row in rows {
-                let row = row.map_err(|source| {
-                    local_state_query(&self.path, "read local modification", source)
-                })?;
-                records.push(decode_local_modification_record(&self.path, row)?);
-            }
+            query_record_list(
+                &self.path,
+                &mut statement,
+                "query local modifications",
+                "read local modification",
+                params![self.workspace_key.as_str(), GLOBAL_WORKSPACE_KEY],
+                map_local_modification_row,
+                decode_local_modification_record,
+            )
         }
-
-        Ok(records)
     }
 
     /// Insert one immutable local modification record.
@@ -1766,67 +1664,32 @@ impl LocalStateStore {
                 local_state_query(&self.path, "prepare rollback records query", source)
             })?;
 
-        let mut records = Vec::new();
         if let Some(skill) = skill {
             validate_skill_ref(&self.path, skill)?;
-            let rows = statement
-                .query_map(
-                    params![
-                        skill.scope.as_str(),
-                        self.workspace_key_for_scope(skill.scope),
-                        skill.skill_id
-                    ],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, String>(5)?,
-                            row.get::<_, String>(6)?,
-                        ))
-                    },
-                )
-                .map_err(|source| {
-                    local_state_query(&self.path, "query rollback records", source)
-                })?;
-
-            for row in rows {
-                let row = row.map_err(|source| {
-                    local_state_query(&self.path, "read rollback record", source)
-                })?;
-                records.push(decode_rollback_record(&self.path, row)?);
-            }
+            query_record_list(
+                &self.path,
+                &mut statement,
+                "query rollback records",
+                "read rollback record",
+                params![
+                    skill.scope.as_str(),
+                    self.workspace_key_for_scope(skill.scope),
+                    skill.skill_id
+                ],
+                map_rollback_row,
+                decode_rollback_record,
+            )
         } else {
-            let rows = statement
-                .query_map(
-                    params![self.workspace_key.as_str(), GLOBAL_WORKSPACE_KEY],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, String>(5)?,
-                            row.get::<_, String>(6)?,
-                        ))
-                    },
-                )
-                .map_err(|source| {
-                    local_state_query(&self.path, "query rollback records", source)
-                })?;
-
-            for row in rows {
-                let row = row.map_err(|source| {
-                    local_state_query(&self.path, "read rollback record", source)
-                })?;
-                records.push(decode_rollback_record(&self.path, row)?);
-            }
+            query_record_list(
+                &self.path,
+                &mut statement,
+                "query rollback records",
+                "read rollback record",
+                params![self.workspace_key.as_str(), GLOBAL_WORKSPACE_KEY],
+                map_rollback_row,
+                decode_rollback_record,
+            )
         }
-
-        Ok(records)
     }
 
     /// Insert one immutable rollback record.
@@ -1920,65 +1783,32 @@ impl LocalStateStore {
             })
             .map_err(|source| local_state_query(&self.path, "prepare history query", source))?;
 
-        let mut entries = Vec::new();
-        if let Some(skill) = &query.skill {
+        let mut entries = if let Some(skill) = &query.skill {
             validate_skill_ref(&self.path, skill)?;
-            let rows = statement
-                .query_map(
-                    params![
-                        skill.scope.as_str(),
-                        self.workspace_key_for_scope(skill.scope),
-                        skill.skill_id
-                    ],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, Option<String>>(3)?,
-                            row.get::<_, Option<String>>(4)?,
-                            row.get::<_, Option<String>>(5)?,
-                            row.get::<_, String>(6)?,
-                            row.get::<_, String>(7)?,
-                            row.get::<_, Option<String>>(8)?,
-                        ))
-                    },
-                )
-                .map_err(|source| local_state_query(&self.path, "query history entries", source))?;
-
-            for row in rows {
-                let row = row.map_err(|source| {
-                    local_state_query(&self.path, "read history entry", source)
-                })?;
-                entries.push(decode_history_entry(&self.path, row)?);
-            }
+            query_record_list(
+                &self.path,
+                &mut statement,
+                "query history entries",
+                "read history entry",
+                params![
+                    skill.scope.as_str(),
+                    self.workspace_key_for_scope(skill.scope),
+                    skill.skill_id
+                ],
+                map_history_entry_row,
+                decode_history_entry,
+            )
         } else {
-            let rows = statement
-                .query_map(
-                    params![self.workspace_key.as_str(), GLOBAL_WORKSPACE_KEY],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, Option<String>>(3)?,
-                            row.get::<_, Option<String>>(4)?,
-                            row.get::<_, Option<String>>(5)?,
-                            row.get::<_, String>(6)?,
-                            row.get::<_, String>(7)?,
-                            row.get::<_, Option<String>>(8)?,
-                        ))
-                    },
-                )
-                .map_err(|source| local_state_query(&self.path, "query history entries", source))?;
-
-            for row in rows {
-                let row = row.map_err(|source| {
-                    local_state_query(&self.path, "read history entry", source)
-                })?;
-                entries.push(decode_history_entry(&self.path, row)?);
-            }
-        }
+            query_record_list(
+                &self.path,
+                &mut statement,
+                "query history entries",
+                "read history entry",
+                params![self.workspace_key.as_str(), GLOBAL_WORKSPACE_KEY],
+                map_history_entry_row,
+                decode_history_entry,
+            )
+        }?;
 
         if let Some(limit) = query.limit {
             entries.truncate(limit);
@@ -2003,11 +1833,18 @@ impl LocalStateStore {
     }
 
     /// Execute a multi-write operation in one SQLite transaction.
+    ///
+    /// The write runs while the coordination lock is held, the way every other
+    /// store mutation does, so a check-mode update that records its rows
+    /// outside a lifecycle transaction still coordinates with a guarded
+    /// writer. A lifecycle transaction that already holds the lock reenters
+    /// it, so callers inside `run_guarded` keep working unchanged.
     pub(crate) fn with_transaction<T>(
         &mut self,
         operation: &'static str,
         work: impl FnOnce(&Connection, &Path) -> Result<T, AppError>,
     ) -> Result<T, AppError> {
+        let _guard = self.coordinate(operation)?;
         let transaction = self
             .connection
             .transaction()
@@ -2018,6 +1855,33 @@ impl LocalStateStore {
             .map_err(|source| local_state_query(&self.path, operation, source))?;
         Ok(result)
     }
+}
+
+/// Run one prepared record-list query and decode every row it returns.
+///
+/// Every list method shares this loop for its all-rows and filtered
+/// statements, so the two statements of one list map and decode rows through
+/// the same functions instead of drifting copies of one closure.
+fn query_record_list<Row, Record>(
+    path: &Path,
+    statement: &mut rusqlite::Statement<'_>,
+    query_action: &'static str,
+    read_action: &'static str,
+    params: &[&dyn rusqlite::ToSql],
+    map_row: fn(&rusqlite::Row<'_>) -> rusqlite::Result<Row>,
+    decode: fn(&Path, Row) -> Result<Record, AppError>,
+) -> Result<Vec<Record>, AppError> {
+    let rows = statement
+        .query_map(params, map_row)
+        .map_err(|source| local_state_query(path, query_action, source))?;
+
+    let mut records = Vec::new();
+    for row in rows {
+        let row = row.map_err(|source| local_state_query(path, read_action, source))?;
+        records.push(decode(path, row)?);
+    }
+
+    Ok(records)
 }
 
 /// Rewrite a store failure caused by an unreadable database file.
@@ -2074,9 +1938,19 @@ fn state_busy_timeout() -> Duration {
 /// A missing or invalid value falls back to the default, matching how the
 /// coordination lock treats `SKILLCTL_LOCK_TIMEOUT_MS`.
 fn state_busy_timeout_from_env(value: Option<&str>) -> Duration {
+    env_millisecond_timeout(value, DEFAULT_STATE_BUSY_TIMEOUT)
+}
+
+/// Resolve one environment-sourced millisecond timeout.
+///
+/// A missing or invalid value falls back to `default`. A configured zero is
+/// clamped to one millisecond, so a zero timeout always means one retry
+/// instead of a wait that ends before it starts. Every millisecond timeout
+/// the crate reads from the environment goes through this parser.
+pub(crate) fn env_millisecond_timeout(value: Option<&str>, default: Duration) -> Duration {
     value
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .map_or(DEFAULT_STATE_BUSY_TIMEOUT, |milliseconds| {
+        .map_or(default, |milliseconds| {
             Duration::from_millis(milliseconds.max(1))
         })
 }
@@ -2156,7 +2030,7 @@ pub(crate) fn upsert_install_record_in(
                 record.skill.scope.as_str(),
                 workspace_key,
                 record.skill.skill_id,
-                source_kind_as_str(record.source_kind),
+                record.source_kind.label(),
                 record.source_url,
                 record.source_subpath,
                 record.resolved_revision,
@@ -2544,6 +2418,12 @@ pub fn repair_state(
     build_recovery_report(working_directory, report, true)
 }
 
+/// Journal state of an operation that has not finished or failed yet.
+///
+/// Mirrors `JournalState::Active.as_str()`, which stays private to the journal
+/// module.
+const ACTIVE_JOURNAL_STATE: &str = "active";
+
 fn build_recovery_report(
     working_directory: &Path,
     mut report: StateRecoveryReport,
@@ -2556,8 +2436,22 @@ fn build_recovery_report(
     report.state_database_exists = database_path.exists();
     report.migration_backups = journal::migration_backups(&state_root);
 
-    report.pending_operations = journal::pending_operations(&state_root)?
+    // This inspection holds no coordination lock, so an active journal may
+    // belong to a live lifecycle transaction: a journal exists on disk only
+    // while its owner holds the coordination lock. The lock is asked after the
+    // journals were read, so an operation that starts between the two steps is
+    // seen holding the lock. An active journal under a held lock is an
+    // operation in progress, not an interrupted one, and stays unreported;
+    // needs-review journals always belong to an operation that finished, so
+    // they stay reported.
+    let pending = journal::pending_operations(&state_root)?;
+    let operation_in_progress = pending
+        .iter()
+        .any(|operation| operation.state == ACTIVE_JOURNAL_STATE)
+        && lock::is_held(&database_path);
+    report.pending_operations = pending
         .into_iter()
+        .filter(|operation| !operation_in_progress || operation.state != ACTIVE_JOURNAL_STATE)
         .map(|operation| PendingOperationView {
             id: operation.id,
             operation: operation.operation,
@@ -2779,5 +2673,133 @@ fn local_state_validation(path: &Path, message: impl Into<String>) -> AppError {
     AppError::LocalStateValidation {
         path: path.to_path_buf(),
         message: message.into(),
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_coordination_tests {
+    use super::*;
+
+    #[test]
+    fn a_validated_current_schema_bootstraps_without_coordination() {
+        let temp = tempfile::tempdir().expect("tempdir exists");
+        let database = temp.path().join("state.db");
+        // Opening the store bootstraps the schema to the current version with
+        // no stranded legacy tables, which is the state every reader meets.
+        LocalStateStore::open_at(&database).expect("store opens");
+
+        let mut connection = Connection::open(&database).expect("database opens");
+        assert_eq!(
+            bootstrap_connection(&mut connection, &database, "workspace", false)
+                .expect("unlocked bootstrap succeeds"),
+            BootstrapOutcome::Validated,
+            "a current schema with no stranded tables bootstraps read-only"
+        );
+    }
+
+    #[test]
+    fn a_missing_schema_defers_to_a_coordinated_bootstrap() {
+        let temp = tempfile::tempdir().expect("tempdir exists");
+        let database = temp.path().join("state.db");
+        let mut connection = Connection::open(&database).expect("empty database opens");
+
+        assert_eq!(
+            bootstrap_connection(&mut connection, &database, "workspace", false)
+                .expect("unlocked bootstrap succeeds"),
+            BootstrapOutcome::NeedsCoordination,
+            "a database without a version marker reports the schema creation it \
+             may not perform unlocked"
+        );
+        assert_eq!(
+            bootstrap_connection(&mut connection, &database, "workspace", true)
+                .expect("coordinated bootstrap succeeds"),
+            BootstrapOutcome::Wrote,
+            "a coordinated bootstrap creates the schema"
+        );
+    }
+
+    #[test]
+    fn an_outdated_schema_defers_instead_of_migrating_unlocked() {
+        let temp = tempfile::tempdir().expect("tempdir exists");
+        let database = temp.path().join("state.db");
+        LocalStateStore::open_at(&database).expect("store opens");
+
+        // The window the unlock probe used to miss: a concurrent
+        // crash-recovery restore can rewrite the committed schema version
+        // between two readings, so the unlocked pass must find the older
+        // version and refuse to write it, not migrate it.
+        let mut connection = Connection::open(&database).expect("database opens");
+        connection
+            .pragma_update(None, "user_version", 3u32)
+            .expect("schema version drops");
+
+        assert_eq!(
+            bootstrap_connection(&mut connection, &database, "workspace", false)
+                .expect("unlocked bootstrap succeeds"),
+            BootstrapOutcome::NeedsCoordination,
+            "an outdated schema reports the migration it may not perform unlocked"
+        );
+        let found = schema_version(&connection, &database).expect("version reads");
+        assert_eq!(
+            found, 3,
+            "the unlocked bootstrap leaves the older version untouched"
+        );
+
+        assert_eq!(
+            bootstrap_connection(&mut connection, &database, "workspace", true)
+                .expect("coordinated bootstrap succeeds"),
+            BootstrapOutcome::Wrote,
+            "a coordinated bootstrap migrates the schema"
+        );
+    }
+
+    #[test]
+    fn stranded_legacy_tables_defer_to_a_coordinated_bootstrap() {
+        let temp = tempfile::tempdir().expect("tempdir exists");
+        let database = temp.path().join("state.db");
+        LocalStateStore::open_at(&database).expect("store opens");
+
+        let mut connection = Connection::open(&database).expect("database opens");
+        connection
+            .execute("CREATE TABLE install_records_v1 (placeholder TEXT)", [])
+            .expect("stranded legacy table appears");
+
+        assert_eq!(
+            bootstrap_connection(&mut connection, &database, "workspace", false)
+                .expect("unlocked bootstrap succeeds"),
+            BootstrapOutcome::NeedsCoordination,
+            "stranded legacy tables report the recovery they need"
+        );
+        let stranded: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'install_records_v1')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("table presence reads");
+        assert!(
+            stranded,
+            "the unlocked bootstrap leaves the stranded table in place"
+        );
+    }
+
+    #[test]
+    fn an_unsupported_schema_is_refused_read_only() {
+        let temp = tempfile::tempdir().expect("tempdir exists");
+        let database = temp.path().join("state.db");
+        let mut connection = Connection::open(&database).expect("database opens");
+        connection
+            .execute_batch(
+                "CREATE TABLE placeholder (placeholder TEXT); \
+                 PRAGMA user_version = 99;",
+            )
+            .expect("unsupported database is prepared");
+
+        let error = bootstrap_connection(&mut connection, &database, "workspace", false)
+            .expect_err("an unsupported version is refused by validation");
+        assert!(
+            matches!(error, AppError::LocalStateValidation { .. }),
+            "the refusal is a validation failure: {error}"
+        );
     }
 }

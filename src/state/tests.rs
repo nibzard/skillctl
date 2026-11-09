@@ -645,6 +645,14 @@ CREATE TABLE history_events (
     id INTEGER PRIMARY KEY, kind TEXT NOT NULL, scope TEXT, skill_id TEXT, target TEXT,
     occurred_at TEXT NOT NULL, summary TEXT NOT NULL, details_json TEXT
 );
+CREATE INDEX idx_update_checks_skill_time
+    ON update_checks (scope, skill_id, checked_at DESC, id DESC);
+CREATE INDEX idx_local_modifications_skill_time
+    ON local_modifications (scope, skill_id, detected_at DESC, id DESC);
+CREATE INDEX idx_rollback_records_skill_time
+    ON rollback_records (scope, skill_id, rolled_back_at DESC, id DESC);
+CREATE INDEX idx_history_events_skill_time
+    ON history_events (scope, skill_id, occurred_at DESC, id DESC);
 INSERT INTO install_records VALUES
     ('workspace', 'release-notes', 'git', 'https://example.com/release-notes.git',
      '.agents/skills/release-notes', 'aaaaaaaaaaaaaaaa', 'bbbbbbbbbbbbbbbb',
@@ -739,6 +747,23 @@ fn legacy_table_names(path: &Path) -> Vec<String> {
         .expect("table query runs")
         .collect::<Result<Vec<_>, _>>()
         .expect("table names read")
+}
+
+/// Secondary index name to the table it is attached to.
+fn secondary_index_tables(path: &Path) -> BTreeMap<String, String> {
+    let connection = Connection::open(path).expect("database opens");
+    let mut statement = connection
+        .prepare(
+            "SELECT name, tbl_name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'",
+        )
+        .expect("index query prepares");
+    statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .expect("index query runs")
+        .collect::<Result<BTreeMap<_, _>, _>>()
+        .expect("index attachments read")
 }
 
 fn create_legacy_v1_database(path: &Path) {
@@ -938,6 +963,22 @@ fn migration_copies_every_table_with_counts_and_identities() {
         assert!(
             !table.ends_with("_v1"),
             "legacy table {table} must be dropped after migration"
+        );
+    }
+
+    // Renaming the v1 tables keeps their indexes under the same names, so the
+    // migration must drop and recreate every index on the current tables.
+    let indexes = secondary_index_tables(&path);
+    for (index, table) in [
+        ("idx_update_checks_skill_time", "update_checks"),
+        ("idx_local_modifications_skill_time", "local_modifications"),
+        ("idx_rollback_records_skill_time", "rollback_records"),
+        ("idx_history_events_skill_time", "history_events"),
+    ] {
+        assert_eq!(
+            indexes.get(index).map(String::as_str),
+            Some(table),
+            "{index} must be recreated on {table}"
         );
     }
 }
@@ -1450,15 +1491,15 @@ fn state_connections_wait_longer_than_the_default_busy_timeout() {
 #[test]
 fn busy_timeout_falls_back_to_the_default_when_unset_or_invalid() {
     assert_eq!(
-        state_busy_timeout_from_env(None),
+        env_millisecond_timeout(None, DEFAULT_STATE_BUSY_TIMEOUT),
         DEFAULT_STATE_BUSY_TIMEOUT
     );
     assert_eq!(
-        state_busy_timeout_from_env(Some("")),
+        env_millisecond_timeout(Some(""), DEFAULT_STATE_BUSY_TIMEOUT),
         DEFAULT_STATE_BUSY_TIMEOUT
     );
     assert_eq!(
-        state_busy_timeout_from_env(Some("not-a-number")),
+        env_millisecond_timeout(Some("not-a-number"), DEFAULT_STATE_BUSY_TIMEOUT),
         DEFAULT_STATE_BUSY_TIMEOUT
     );
 }
@@ -1466,17 +1507,37 @@ fn busy_timeout_falls_back_to_the_default_when_unset_or_invalid() {
 #[test]
 fn busy_timeout_accepts_an_override() {
     assert_eq!(
-        state_busy_timeout_from_env(Some("1500")),
+        env_millisecond_timeout(Some("1500"), DEFAULT_STATE_BUSY_TIMEOUT),
         Duration::from_millis(1500)
     );
     assert_eq!(
-        state_busy_timeout_from_env(Some(" 1500 ")),
+        env_millisecond_timeout(Some(" 1500 "), DEFAULT_STATE_BUSY_TIMEOUT),
         Duration::from_millis(1500)
     );
     assert_eq!(
-        state_busy_timeout_from_env(Some("0")),
+        env_millisecond_timeout(Some("0"), DEFAULT_STATE_BUSY_TIMEOUT),
         Duration::from_millis(1),
         "a zero override still allows one retry instead of disabling the wait"
+    );
+}
+
+#[test]
+fn env_millisecond_timeout_serves_every_caller_with_one_zero_behavior() {
+    // The lifecycle hold timeout reads the same parser as the busy timeout
+    // and the coordination lock, so a configured zero means one millisecond
+    // everywhere instead of a hold that times out on its first poll.
+    assert_eq!(
+        env_millisecond_timeout(Some("0"), Duration::from_secs(60)),
+        Duration::from_millis(1)
+    );
+    assert_eq!(
+        env_millisecond_timeout(Some("250"), Duration::from_secs(60)),
+        Duration::from_millis(250)
+    );
+    assert_eq!(
+        env_millisecond_timeout(None, Duration::from_secs(15)),
+        Duration::from_secs(15),
+        "a missing value falls back to the caller's default"
     );
 }
 
@@ -1958,6 +2019,25 @@ fn create_v5_database(path: &Path, workspace: &Path) {
             forked: false,
         })
         .expect("v5 install records");
+    // Schema v5 already carried `apply_blocked_by`, so a genuine v5 database
+    // can hold a check that recorded why it held back an apply.
+    HistoryLedger::new(&mut store)
+        .record_update_check_with_trust(
+            &UpdateCheckRecord {
+                id: None,
+                skill: ManagedSkillRef::new(ManagedScope::Workspace, "delta"),
+                checked_at: "2026-11-07T09:30:00Z".to_string(),
+                pinned_revision: "aaaaaaaaaaaaaaaa".to_string(),
+                latest_revision: Some("bbbbbbbbbbbbbbbb".to_string()),
+                outcome: UpdateCheckOutcome::Blocked,
+                overlay_detected: false,
+                local_modification_detected: false,
+                apply_blocked_by: Some(UpdateCheckBlockReason::IncomingScripts),
+                notes: None,
+            },
+            None,
+        )
+        .expect("v5 update check records");
     drop(store);
 
     Connection::open(path)
@@ -2024,6 +2104,23 @@ fn opening_a_v5_database_widens_the_source_kind_check_and_keeps_rows() {
         "the v5 install row survives the rebuild",
     );
 
+    // A block reason is an observation only the recording check could make,
+    // so the rebuild must carry it from the v5 row.
+    let migrated_check = store
+        .latest_update_check(&ManagedSkillRef::new(ManagedScope::Workspace, "delta"))
+        .expect("update check loads")
+        .expect("the v5 check row survives the rebuild");
+    assert_eq!(
+        migrated_check.outcome,
+        UpdateCheckOutcome::Blocked,
+        "the v5 check outcome survives the rebuild",
+    );
+    assert_eq!(
+        migrated_check.apply_blocked_by,
+        Some(UpdateCheckBlockReason::IncomingScripts),
+        "a block reason a v5 database recorded must survive the migration",
+    );
+
     // The rebuilt table must accept the source kind this version writes.
     store
         .upsert_install_record(&InstallRecord {
@@ -2083,9 +2180,12 @@ fn opening_a_v4_database_adds_the_check_block_column_and_keeps_rows() {
         Some("bbbbbbbbbbbbbbbb"),
         "the migrated row keeps the revision it observed",
     );
+    // The v4 table carried no block-reason column, so this can only check the
+    // default the rebuild leaves. Preservation of a recorded reason is covered
+    // by the v5 migration test, whose source table carries the column.
     assert_eq!(
         migrated.apply_blocked_by, None,
-        "a row the older version wrote holds no block reason",
+        "the rebuilt row keeps the column default because the v4 table had no such column",
     );
 
     // The rebuilt table must accept the block reason this version writes.

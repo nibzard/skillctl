@@ -4,7 +4,6 @@ use std::{
     collections::BTreeMap,
     ffi::OsStr,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use serde::Serialize;
@@ -542,11 +541,6 @@ impl<'store> HistoryLedger<'store> {
                 insert_history_entry_in(connection, path, &workspace_key, &entry)
             })
     }
-
-    /// Query history entries from the underlying store.
-    pub fn entries(&self, query: &HistoryQuery) -> Result<Vec<HistoryEntry>, AppError> {
-        self.store.history_entries(query)
-    }
 }
 
 /// Typed request for `skillctl pin`.
@@ -604,162 +598,29 @@ pub fn handle_pin(context: &AppContext, request: PinRequest) -> Result<AppRespon
     // The state store answers the first question, so a name no install covers,
     // such as a canonical local skill, hears that it is not installed even in a
     // workspace that declares no imports at all.
-    let managed_skill = resolve_installed_skill(&store, &request.skill, context.selector.scope)?;
-    // The mutation rewrites the import declaration, so it needs the committed
-    // manifest rather than the documented defaults a bare workspace runs on.
-    let manifest = WorkspaceManifest::load_required_from_workspace(context, "pin")?;
-    // The pin rewrites one lockfile entry, so the lockfile must be there to
-    // rewrite. Its absence refuses with the repairs instead of a raw read
-    // error, because `skillctl init` would write an empty lockfile and drop
-    // every pin the workspace already holds.
-    let lockfile = WorkspaceLockfile::load_required_from_workspace(context, "pin")?;
-    let install_record =
-        store
-            .install_record(&managed_skill)?
-            .ok_or_else(|| AppError::ResolutionValidation {
-                message: format!(
-                    "skill '{}' does not have an installed state record",
-                    request.skill
-                ),
-            })?;
-    ensure_pin_supported(&install_record)?;
-    let expected = crate::apply::capture_expected_import(context, &install_record)?;
+    let managed_skill =
+        skill::resolve_installed_skill(&store, &request.skill, context.selector.scope)?;
+    let prestate =
+        load_revision_move_prestate(&store, context, "pin", &request.skill, &managed_skill)?;
 
-    let scoped_context = context_for_scope(context, managed_skill.scope);
-    let stored_root = stored_import_root(
-        managed_skill.scope,
-        &context.working_directory,
-        &managed_skill.skill_id,
-    )?;
-    let plan = crate::apply::MutationPlanBuilder::new(
-        crate::apply::MutationOperation::Pin,
-        &context.working_directory,
+    // The checkout clones the pinned git source, so it runs before the guarded
+    // transaction opens: the coordination lock must not be held across a
+    // network clone, which can outlast every other command's lock timeout.
+    let checked_out =
+        checkout_git_revision(&prestate.install_record.source_url, &request.reference)?;
+
+    run_guarded_revision_move(
+        context,
+        &request.skill,
+        &managed_skill,
+        prestate,
+        RevisionMove {
+            kind: RevisionMoveKind::Pin,
+            requested_reference: &request.reference,
+            checked_out: &checked_out,
+            recorded_effective_version: None,
+        },
     )
-    .skill(managed_skill.clone())
-    .expect_import(expected)
-    .propose(crate::apply::ProposedImport {
-        import_id: managed_skill.skill_id.clone(),
-        revision: Some(request.reference.clone()),
-        bundle_digest: None,
-        bundle_policy: crate::apply::BundlePolicy::Recompute,
-        summary: format!(
-            "pin '{}' to '{}'",
-            managed_skill.skill_id, request.reference
-        ),
-    })
-    .target(manifest.path.clone(), crate::apply::TargetAction::Update)
-    .target(lockfile.path, crate::apply::TargetAction::Update)
-    .targets(
-        materialize::sync_mutation_root_paths(
-            &scoped_context,
-            &manifest,
-            target_scope(managed_skill.scope),
-        )?,
-        crate::apply::TargetAction::Replace,
-    )
-    .target(stored_root, crate::apply::TargetAction::Replace)
-    .seal();
-
-    crate::apply::run_guarded(&plan, context, |transaction| {
-        transaction.track_state_database()?;
-        let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
-        let mut lockfile = WorkspaceLockfile::load_from_workspace(&context.working_directory)?;
-        let mut store = LocalStateStore::open_default_for(&context.working_directory)?;
-        let install_record = store.install_record(&managed_skill)?.ok_or_else(|| {
-            AppError::ResolutionValidation {
-                message: format!(
-                    "skill '{}' does not have an installed state record",
-                    request.skill
-                ),
-            }
-        })?;
-        ensure_pin_supported(&install_record)?;
-
-        let checked_out = checkout_git_revision(&install_record.source_url, &request.reference)?;
-        // A pin moves the import to a revision the same engine an update apply
-        // uses installs, so the same trust gate decides. The refusal names the
-        // review and the fork that let an explicit revision move through.
-        crate::apply::ensure_revision_apply_is_allowed(
-            context,
-            &store,
-            &lockfile,
-            &install_record,
-            &checked_out.resolved_revision,
-            &checked_out.root,
-            crate::error::TrustGateOperation::Pin,
-        )?;
-        let outcome = crate::apply::apply_import_revision(
-            context,
-            transaction,
-            &mut manifest,
-            &mut lockfile,
-            &managed_skill,
-            &crate::apply::RevisionTarget {
-                manifest_reference: Some(&request.reference),
-                resolved_revision: &checked_out.resolved_revision,
-                source_root: &checked_out.root,
-                discovery: None,
-            },
-        )?;
-
-        let sync_report = materialize::sync_workspace(&scoped_context)?;
-        let timestamp = current_timestamp();
-
-        let updated_install = InstallRecord {
-            resolved_revision: outcome.resolved_revision.clone(),
-            // A pin that names an immutable revision observes nothing upstream,
-            // so no upstream revision is recorded for it.
-            upstream_revision: crate::source::observed_upstream_revision(
-                Some(&request.reference),
-                &outcome.resolved_revision,
-            ),
-            content_hash: outcome.content_hash.clone(),
-            overlay_hash: outcome.overlay_hash.clone(),
-            effective_version_hash: outcome.effective_version_hash.clone(),
-            updated_at: timestamp.clone(),
-            detached: false,
-            forked: false,
-            ..install_record
-        };
-        let pin_record = PinRecord {
-            skill: managed_skill.clone(),
-            requested_reference: request.reference.clone(),
-            resolved_revision: outcome.resolved_revision.clone(),
-            effective_version_hash: Some(outcome.effective_version_hash.clone()),
-            pinned_at: timestamp.clone(),
-        };
-
-        store.upsert_install_record(&updated_install)?;
-        materialize::refresh_projection_state_for_scope(
-            &mut store,
-            context,
-            managed_skill.scope,
-            &sync_report,
-            &timestamp,
-            |ledger| ledger.record_pin(&pin_record).map(|_| ()),
-        )?;
-
-        let mut response = AppResponse::success("pin")
-            .with_summary(format!(
-                "Pinned {} to {}",
-                request.skill, outcome.resolved_revision
-            ))
-            .with_data(json!({
-                "skill": request.skill,
-                "scope": managed_skill.scope.as_str(),
-                "requested_reference": request.reference,
-                "resolved_revision": outcome.resolved_revision,
-                "effective_version_hash": outcome.effective_version_hash,
-                "bundle": outcome.bundle,
-                "diff": outcome.diff,
-                "projection": sync_report,
-            }));
-        for warning in &sync_report.warnings {
-            response = response.with_warning(warning.clone());
-        }
-
-        Ok(response)
-    })
 }
 
 /// Handle `skillctl rollback`.
@@ -770,88 +631,239 @@ pub fn handle_rollback(
     let store = LocalStateStore::open_default_for(&context.working_directory)?;
     // As with `pin`, the state store answers first, so a name no install covers
     // hears that it is not installed instead of a manifest read error.
-    let managed_skill = resolve_installed_skill(&store, &request.skill, context.selector.scope)?;
-    // The rollback rewrites the import declaration, so it needs the committed
+    let managed_skill =
+        skill::resolve_installed_skill(&store, &request.skill, context.selector.scope)?;
+    let prestate =
+        load_revision_move_prestate(&store, context, "rollback", &request.skill, &managed_skill)?;
+
+    // The recorded effective version pairs the target revision with the
+    // overlay that existed when it was recorded. An overlay that changed
+    // since then recomputes to a new effective version, so the move keeps
+    // the current overlay and records that new effective version, exactly
+    // as `pin` does for the same revision.
+    let target =
+        resolve_recorded_version(&store, &managed_skill, &prestate.install_record, &request)?;
+    // As with `pin`, the checkout clones the git source of the recorded
+    // revision before the guarded transaction opens: the coordination lock
+    // must not be held across a network clone, which can outlast every other
+    // command's lock timeout.
+    let checked_out = checkout_git_revision(
+        &prestate.install_record.source_url,
+        &target.resolved_revision,
+    )?;
+
+    run_guarded_revision_move(
+        context,
+        &request.skill,
+        &managed_skill,
+        prestate,
+        RevisionMove {
+            kind: RevisionMoveKind::Rollback,
+            requested_reference: &request.version_or_commit,
+            checked_out: &checked_out,
+            recorded_effective_version: target.effective_version_hash,
+        },
+    )
+}
+
+/// Which revision move one handler runs.
+///
+/// The two moves share their whole guarded sequence and differ only in the
+/// labels they report, the mutation and trust-gate operations they are
+/// classified under, and which records the settled move writes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RevisionMoveKind {
+    /// `pin` records the move through the pin history callback.
+    Pin,
+    /// `rollback` writes the pin row directly and records the rollback.
+    Rollback,
+}
+
+impl RevisionMoveKind {
+    /// Command label, for required-state refusals and the response.
+    const fn command(self) -> &'static str {
+        match self {
+            Self::Pin => "pin",
+            Self::Rollback => "rollback",
+        }
+    }
+
+    /// Mutation operation the plan records.
+    const fn operation(self) -> crate::apply::MutationOperation {
+        match self {
+            Self::Pin => crate::apply::MutationOperation::Pin,
+            Self::Rollback => crate::apply::MutationOperation::Rollback,
+        }
+    }
+
+    /// Trust-gate operation the move is decided under.
+    const fn gate(self) -> crate::error::TrustGateOperation {
+        match self {
+            Self::Pin => crate::error::TrustGateOperation::Pin,
+            Self::Rollback => crate::error::TrustGateOperation::Rollback,
+        }
+    }
+
+    /// Past-tense verb the response summary opens with.
+    const fn summary_verb(self) -> &'static str {
+        match self {
+            Self::Pin => "Pinned",
+            Self::Rollback => "Rolled back",
+        }
+    }
+}
+
+/// The per-command inputs of one guarded revision move.
+struct RevisionMove<'a> {
+    /// Which command the move serves.
+    kind: RevisionMoveKind,
+    /// The reference the request named.
+    requested_reference: &'a str,
+    /// Staged checkout of the revision the move installs.
+    checked_out: &'a CheckedOutSource,
+    /// Recorded effective version a rollback reports back.
+    recorded_effective_version: Option<String>,
+}
+
+/// The pre-state `pin` and `rollback` share.
+struct RevisionMovePrestate {
+    /// Committed manifest whose import declaration the move rewrites.
+    manifest: WorkspaceManifest,
+    /// Committed lockfile whose entry the move rewrites.
+    lockfile: WorkspaceLockfile,
+    /// Install record the move rewrites.
+    install_record: InstallRecord,
+    /// Expected import state the plan pins against a moved workspace.
+    expected: crate::apply::ExpectedImport,
+    /// Context scoped to the skill's own scope.
+    scoped_context: AppContext,
+    /// Stored import root the move replaces.
+    stored_root: PathBuf,
+}
+
+/// Load the pre-state `pin` and `rollback` share.
+///
+/// Both commands require the committed manifest and lockfile, re-read the
+/// install record they rewrite, and plan against the stored import root. A
+/// missing lockfile refuses with the repairs instead of a raw read error,
+/// because `skillctl init` would write an empty lockfile and drop every pin
+/// the workspace already holds.
+fn load_revision_move_prestate(
+    store: &LocalStateStore,
+    context: &AppContext,
+    command: &'static str,
+    skill_name: &str,
+    managed_skill: &ManagedSkillRef,
+) -> Result<RevisionMovePrestate, AppError> {
+    // The mutation rewrites the import declaration, so it needs the committed
     // manifest rather than the documented defaults a bare workspace runs on.
-    let manifest = WorkspaceManifest::load_required_from_workspace(context, "rollback")?;
-    // As with `pin`, the rollback rewrites one lockfile entry, so a missing
-    // lockfile refuses with the repairs rather than the raw read error.
-    let lockfile = WorkspaceLockfile::load_required_from_workspace(context, "rollback")?;
+    let manifest = WorkspaceManifest::load_required_from_workspace(context, command)?;
+    let lockfile = WorkspaceLockfile::load_required_from_workspace(context, command)?;
     let install_record =
         store
-            .install_record(&managed_skill)?
+            .install_record(managed_skill)?
             .ok_or_else(|| AppError::ResolutionValidation {
-                message: format!(
-                    "skill '{}' does not have an installed state record",
-                    request.skill
-                ),
+                message: format!("skill '{skill_name}' does not have an installed state record"),
             })?;
     ensure_pin_supported(&install_record)?;
     let expected = crate::apply::capture_expected_import(context, &install_record)?;
-
     let scoped_context = context_for_scope(context, managed_skill.scope);
     let stored_root = stored_import_root(
         managed_skill.scope,
         &context.working_directory,
         &managed_skill.skill_id,
     )?;
-    let plan = crate::apply::MutationPlanBuilder::new(
-        crate::apply::MutationOperation::Rollback,
-        &context.working_directory,
-    )
-    .skill(managed_skill.clone())
-    .expect_import(expected)
-    .propose(crate::apply::ProposedImport {
-        import_id: managed_skill.skill_id.clone(),
-        revision: Some(request.version_or_commit.clone()),
-        bundle_digest: None,
-        bundle_policy: crate::apply::BundlePolicy::Recompute,
-        summary: format!(
-            "roll '{}' back to '{}'",
-            managed_skill.skill_id, request.version_or_commit
-        ),
+
+    Ok(RevisionMovePrestate {
+        manifest,
+        lockfile,
+        install_record,
+        expected,
+        scoped_context,
+        stored_root,
     })
-    .target(manifest.path.clone(), crate::apply::TargetAction::Update)
-    .target(lockfile.path, crate::apply::TargetAction::Update)
-    .targets(
-        materialize::sync_mutation_root_paths(
-            &scoped_context,
-            &manifest,
-            target_scope(managed_skill.scope),
-        )?,
-        crate::apply::TargetAction::Replace,
-    )
-    .target(stored_root, crate::apply::TargetAction::Replace)
-    .seal();
+}
+
+/// Move one import to an explicitly named revision inside one guarded
+/// transaction.
+///
+/// Both handlers resolve their target revision and check it out while no
+/// transaction is open, then hand the checkout here. The guarded closure
+/// re-reads the install record under the lock, and the plan verification
+/// re-checks the pre-state, so a workspace that moved underneath the checkout
+/// refuses before anything changes.
+fn run_guarded_revision_move(
+    context: &AppContext,
+    skill_name: &str,
+    managed_skill: &ManagedSkillRef,
+    prestate: RevisionMovePrestate,
+    revision_move: RevisionMove<'_>,
+) -> Result<AppResponse, AppError> {
+    let RevisionMove {
+        kind,
+        requested_reference,
+        checked_out,
+        recorded_effective_version,
+    } = revision_move;
+    let RevisionMovePrestate {
+        manifest,
+        lockfile,
+        install_record: _,
+        expected,
+        scoped_context,
+        stored_root,
+    } = prestate;
+    let plan = crate::apply::MutationPlanBuilder::new(kind.operation(), &context.working_directory)
+        .skill(managed_skill.clone())
+        .expect_import(expected)
+        .propose(crate::apply::ProposedImport {
+            import_id: managed_skill.skill_id.clone(),
+            revision: Some(requested_reference.to_string()),
+            bundle_digest: None,
+            bundle_policy: crate::apply::BundlePolicy::Recompute,
+            summary: match kind {
+                RevisionMoveKind::Pin => format!(
+                    "pin '{}' to '{}'",
+                    managed_skill.skill_id, requested_reference
+                ),
+                RevisionMoveKind::Rollback => format!(
+                    "roll '{}' back to '{}'",
+                    managed_skill.skill_id, requested_reference
+                ),
+            },
+        })
+        .target(manifest.path.clone(), crate::apply::TargetAction::Update)
+        .target(lockfile.path, crate::apply::TargetAction::Update)
+        .targets(
+            materialize::sync_mutation_root_paths(
+                &scoped_context,
+                &manifest,
+                TargetScope::from(managed_skill.scope),
+            )?,
+            crate::apply::TargetAction::Replace,
+        )
+        .target(stored_root, crate::apply::TargetAction::Replace)
+        .seal();
 
     crate::apply::run_guarded(&plan, context, |transaction| {
         transaction.track_state_database()?;
         let mut manifest = WorkspaceManifest::load_from_workspace(&context.working_directory)?;
         let mut lockfile = WorkspaceLockfile::load_from_workspace(&context.working_directory)?;
         let mut store = LocalStateStore::open_default_for(&context.working_directory)?;
-        let install_record = store.install_record(&managed_skill)?.ok_or_else(|| {
-            AppError::ResolutionValidation {
-                message: format!(
-                    "skill '{}' does not have an installed state record",
-                    request.skill
-                ),
-            }
-        })?;
+        let install_record =
+            store
+                .install_record(managed_skill)?
+                .ok_or_else(|| AppError::ResolutionValidation {
+                    message: format!(
+                        "skill '{skill_name}' does not have an installed state record"
+                    ),
+                })?;
         ensure_pin_supported(&install_record)?;
 
-        // The recorded effective version pairs the target revision with the
-        // overlay that existed when it was recorded. An overlay that changed
-        // since then recomputes to a new effective version, so the move keeps
-        // the current overlay and records that new effective version, exactly
-        // as `pin` does for the same revision.
-        let target = resolve_recorded_version(&store, &managed_skill, &install_record, &request)?;
-        let checked_out =
-            checkout_git_revision(&install_record.source_url, &target.resolved_revision)?;
-
-        // A rollback is a revision move an update apply could perform, so the
-        // same trust gate decides it. The refusal names the review and the
-        // fork, so a gated rollback keeps its recovery path instead of
-        // dead-ending the workspace on the applied revision.
+        // A revision move could run as an update apply, so the same trust
+        // gate decides it. The refusal names the review and the fork that let
+        // an explicit revision move through, so a gated move keeps its
+        // recovery path instead of dead-ending the workspace.
         crate::apply::ensure_revision_apply_is_allowed(
             context,
             &store,
@@ -859,17 +871,16 @@ pub fn handle_rollback(
             &install_record,
             &checked_out.resolved_revision,
             &checked_out.root,
-            crate::error::TrustGateOperation::Rollback,
+            kind.gate(),
         )?;
-
         let outcome = crate::apply::apply_import_revision(
             context,
             transaction,
             &mut manifest,
             &mut lockfile,
-            &managed_skill,
+            managed_skill,
             &crate::apply::RevisionTarget {
-                manifest_reference: Some(&request.version_or_commit),
+                manifest_reference: Some(requested_reference),
                 resolved_revision: &checked_out.resolved_revision,
                 source_root: &checked_out.root,
                 discovery: None,
@@ -881,10 +892,10 @@ pub fn handle_rollback(
 
         let updated_install = InstallRecord {
             resolved_revision: outcome.resolved_revision.clone(),
-            // A rollback target names one recorded revision, so the move
-            // observes nothing upstream.
+            // The move names one revision explicitly, so it observes nothing
+            // upstream and no upstream revision is recorded for it.
             upstream_revision: crate::source::observed_upstream_revision(
-                Some(&request.version_or_commit),
+                Some(requested_reference),
                 &outcome.resolved_revision,
             ),
             content_hash: outcome.content_hash.clone(),
@@ -897,46 +908,78 @@ pub fn handle_rollback(
         };
         let pin_record = PinRecord {
             skill: managed_skill.clone(),
-            requested_reference: request.version_or_commit.clone(),
+            requested_reference: requested_reference.to_string(),
             resolved_revision: outcome.resolved_revision.clone(),
             effective_version_hash: Some(outcome.effective_version_hash.clone()),
             pinned_at: timestamp.clone(),
         };
-        let rollback_record = RollbackRecord {
-            id: None,
-            skill: managed_skill.clone(),
-            rolled_back_at: timestamp.clone(),
-            from_reference: install_record.resolved_revision,
-            to_reference: request.version_or_commit.clone(),
+        // A rollback also records what the import moved from, which is the
+        // revision the guarded closure re-read, not the one the plan was built
+        // against.
+        let rollback_record = match kind {
+            RevisionMoveKind::Rollback => Some(RollbackRecord {
+                id: None,
+                skill: managed_skill.clone(),
+                rolled_back_at: timestamp.clone(),
+                from_reference: install_record.resolved_revision,
+                to_reference: requested_reference.to_string(),
+            }),
+            RevisionMoveKind::Pin => None,
         };
 
         store.upsert_install_record(&updated_install)?;
-        store.upsert_pin_record(&pin_record)?;
-        materialize::refresh_projection_state_for_scope(
-            &mut store,
-            context,
-            managed_skill.scope,
-            &sync_report,
-            &timestamp,
-            |ledger| ledger.record_rollback(&rollback_record).map(|_| ()),
-        )?;
+        if rollback_record.is_some() {
+            store.upsert_pin_record(&pin_record)?;
+        }
+        match &rollback_record {
+            Some(rollback_record) => {
+                materialize::refresh_projection_state_for_scope(
+                    &mut store,
+                    context,
+                    managed_skill.scope,
+                    &sync_report,
+                    &timestamp,
+                    |ledger| ledger.record_rollback(rollback_record).map(|_| ()),
+                )?;
+            }
+            None => {
+                materialize::refresh_projection_state_for_scope(
+                    &mut store,
+                    context,
+                    managed_skill.scope,
+                    &sync_report,
+                    &timestamp,
+                    |ledger| ledger.record_pin(&pin_record).map(|_| ()),
+                )?;
+            }
+        }
 
-        let mut response = AppResponse::success("rollback")
+        let mut data = json!({
+            "skill": skill_name,
+            "scope": managed_skill.scope.as_str(),
+            "resolved_revision": outcome.resolved_revision,
+            "effective_version_hash": outcome.effective_version_hash,
+            "bundle": outcome.bundle,
+            "diff": outcome.diff,
+            "projection": sync_report,
+        });
+        match kind {
+            RevisionMoveKind::Pin => {
+                data["requested_reference"] = json!(requested_reference);
+            }
+            RevisionMoveKind::Rollback => {
+                data["requested_version"] = json!(requested_reference);
+                data["recorded_effective_version"] = json!(recorded_effective_version);
+            }
+        }
+        let mut response = AppResponse::success(kind.command())
             .with_summary(format!(
-                "Rolled back {} to {}",
-                request.skill, outcome.resolved_revision
+                "{} {} to {}",
+                kind.summary_verb(),
+                skill_name,
+                outcome.resolved_revision
             ))
-            .with_data(json!({
-                "skill": request.skill,
-                "scope": managed_skill.scope.as_str(),
-                "requested_version": request.version_or_commit,
-                "resolved_revision": outcome.resolved_revision,
-                "recorded_effective_version": target.effective_version_hash,
-                "effective_version_hash": outcome.effective_version_hash,
-                "bundle": outcome.bundle,
-                "diff": outcome.diff,
-                "projection": sync_report,
-            }));
+            .with_data(data);
         for warning in &sync_report.warnings {
             response = response.with_warning(warning.clone());
         }
@@ -954,6 +997,10 @@ pub fn handle_rollback(
 /// `explain` and `path` resolve the same skills, and the README lists
 /// `history` among the four commands to remember, so the commands must not
 /// disagree about a canonical skill.
+///
+/// A scope selector without a skill name filters the listing, the same way
+/// `list` and the TUI history panel filter it, so a ledger with rows in both
+/// scopes answers with the requested scope only.
 pub fn handle_history(
     context: &AppContext,
     request: HistoryRequest,
@@ -983,7 +1030,16 @@ pub fn handle_history(
         }
         None => (HistoryQuery::default(), None),
     };
-    let entries = store.history_entries(&query)?;
+    let mut entries = store.history_entries(&query)?;
+
+    // The ledger returns both scopes' rows when no skill is named, so the
+    // requested scope narrows the listing the same way the TUI history panel
+    // does. Scope-less events stay, because they belong to neither scope.
+    if filter.is_none()
+        && let Some(scope) = context.selector.scope.map(cli_scope)
+    {
+        entries.retain(|entry| entry.scope.is_none_or(|entry_scope| entry_scope == scope));
+    }
 
     let summary = match &filter {
         Some(resolved) if entries.is_empty() => {
@@ -1124,7 +1180,7 @@ fn canonical_history_skill(
     let Some(canonical_root) = skill::canonical_local_root(context, &manifest, skill_name) else {
         return Err(history_refusal(context, &manifest, skill_name));
     };
-    if crate::resolver::is_generated_projection_root(&canonical_root)? {
+    if materialize::is_skillctl_generated_directory(&canonical_root)? {
         // The directory holds a generated copy of some install, not a skill
         // someone authored, so the ledger-scope refusal stays.
         return Err(AppError::ResolutionValidation {
@@ -1213,13 +1269,6 @@ fn cli_scope(scope: Scope) -> ManagedScope {
     }
 }
 
-fn target_scope(scope: ManagedScope) -> TargetScope {
-    match scope {
-        ManagedScope::Workspace => TargetScope::Workspace,
-        ManagedScope::User => TargetScope::User,
-    }
-}
-
 pub(crate) fn context_for_scope(context: &AppContext, scope: ManagedScope) -> AppContext {
     let mut scoped = context.clone();
     scoped.selector.scope = Some(match scope {
@@ -1248,39 +1297,6 @@ impl RecordedVersion {
         self.requested_reference.as_deref() == Some(target)
             || self.resolved_revision == target
             || self.effective_version_hash.as_deref() == Some(target)
-    }
-}
-
-pub(crate) fn resolve_installed_skill(
-    store: &LocalStateStore,
-    skill: &str,
-    scope: Option<Scope>,
-) -> Result<ManagedSkillRef, AppError> {
-    let scopes = match scope {
-        Some(Scope::Workspace) => vec![ManagedScope::Workspace],
-        Some(Scope::User) => vec![ManagedScope::User],
-        None => vec![ManagedScope::Workspace, ManagedScope::User],
-    };
-    let mut matches = Vec::new();
-
-    for managed_scope in scopes {
-        let candidate = ManagedSkillRef::new(managed_scope, skill);
-        if store.install_record(&candidate)?.is_some() {
-            matches.push(candidate);
-        }
-    }
-
-    match matches.len() {
-        1 => Ok(matches.remove(0)),
-        0 => Err(AppError::ResolutionValidation {
-            message: format!("skill '{}' is not installed", skill),
-        }),
-        _ => Err(AppError::ResolutionValidation {
-            message: format!(
-                "skill '{}' exists in multiple scopes; re-run with --scope",
-                skill
-            ),
-        }),
     }
 }
 
@@ -1339,7 +1355,6 @@ pub(crate) fn checkout_git_revision(
         ],
         None,
         "clone pinned git source",
-        &checkout_path,
     )?;
     run_git(
         &[
@@ -1349,13 +1364,11 @@ pub(crate) fn checkout_git_revision(
         ],
         Some(&checkout_path),
         "checkout pinned git revision",
-        &checkout_path,
     )?;
     let resolved_revision = run_git_capture(
         &[OsStr::new("rev-parse"), OsStr::new("HEAD")],
         Some(&checkout_path),
         "resolve pinned git revision",
-        &checkout_path,
     )?;
 
     Ok(CheckedOutSource {
@@ -1369,32 +1382,35 @@ fn run_git(
     args: &[&OsStr],
     current_dir: Option<&Path>,
     action: &'static str,
-    path: &Path,
 ) -> Result<(), AppError> {
-    run_git_capture(args, current_dir, action, path).map(|_| ())
+    run_git_capture(args, current_dir, action).map(|_| ())
 }
 
+/// Run one git subprocess in a pinned checkout and capture standard output.
+///
+/// A spawn failure is reported against the `git` binary itself, matching every
+/// other git subprocess the crate runs, instead of blaming the checkout path.
 fn run_git_capture(
     args: &[&OsStr],
     current_dir: Option<&Path>,
     action: &'static str,
-    path: &Path,
 ) -> Result<String, AppError> {
-    let mut command = Command::new("git");
-    command.args(args);
+    // The shared builder applies the controlled git environment (no prompts,
+    // no inherited git configuration), so pinned checkouts observe the same
+    // rules as every other git subprocess the crate runs.
+    let mut command = crate::source::git_command(args);
     if let Some(current_dir) = current_dir {
         command.current_dir(current_dir);
     }
 
     let output = command
         .output()
-        .map_err(|source| AppError::FilesystemOperation {
-            action,
-            path: path.to_path_buf(),
+        .map_err(|source| AppError::ExternalCommand {
+            command: "git".to_string(),
             source,
         })?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr = crate::source::bounded_command_stderr(&output.stderr);
         let detail = if stderr.is_empty() {
             "git command returned a non-zero exit status".to_string()
         } else {
@@ -1479,7 +1495,7 @@ fn history_string(details: &HistoryDetails, key: &str) -> Option<String> {
 fn install_details(record: &InstallRecord, trust: Option<&SkillTrust>) -> HistoryDetails {
     let mut details = BTreeMap::new();
     details.insert("scope".to_string(), json!(record.skill.scope.as_str()));
-    details.insert("source_kind".to_string(), json!(record_source_kind(record)));
+    details.insert("source_kind".to_string(), json!(record.source_kind.label()));
     details.insert("source_url".to_string(), json!(record.source_url));
     details.insert("source_subpath".to_string(), json!(record.source_subpath));
     details.insert(
@@ -1612,15 +1628,6 @@ fn cleanup_summary(action: &str, skill: Option<&ManagedSkillRef>, path: &str) ->
     match skill {
         Some(skill) => format!("{action} {} at {}", skill.skill_id, path),
         None => format!("{action} generated state at {}", path),
-    }
-}
-
-fn record_source_kind(record: &InstallRecord) -> &'static str {
-    match record.source_kind {
-        crate::source::SourceKind::Git => "git",
-        crate::source::SourceKind::LocalPath => "local-path",
-        crate::source::SourceKind::Archive => "archive",
-        crate::source::SourceKind::WellKnown => "well-known",
     }
 }
 

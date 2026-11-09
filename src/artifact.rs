@@ -55,10 +55,8 @@ pub struct ArtifactStore {
 impl ArtifactStore {
     /// Open the default store under the skillctl home directory.
     pub fn open_default() -> Result<Self, AppError> {
-        let home = std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .map(PathBuf::from)
-            .ok_or(AppError::HomeDirectoryUnavailable)?;
+        let home =
+            crate::state::resolve_home_directory().ok_or(AppError::HomeDirectoryUnavailable)?;
         Ok(Self::open_at(home.join(ARTIFACTS_STORE_RELATIVE_PATH)))
     }
 
@@ -85,11 +83,6 @@ impl ArtifactStore {
     /// Stored manifest path of one artifact.
     pub fn manifest_path(&self, digest: &str) -> Result<PathBuf, AppError> {
         Ok(self.artifact_dir(digest)?.join(ARTIFACT_MANIFEST_FILE))
-    }
-
-    /// Whether an artifact directory exists for one digest.
-    pub fn exists(&self, digest: &str) -> Result<bool, AppError> {
-        Ok(self.artifact_dir(digest)?.exists())
     }
 
     /// Load and verify the stored artifact for one digest.
@@ -242,32 +235,6 @@ impl ArtifactStore {
         Ok(())
     }
 
-    /// List the digests currently retained in the store.
-    pub fn retained_digests(&self) -> Result<Vec<String>, AppError> {
-        if !self.root.exists() {
-            return Ok(Vec::new());
-        }
-        let mut digests = Vec::new();
-        for entry in fs::read_dir(&self.root).map_err(|source| AppError::FilesystemOperation {
-            action: "read artifact store root",
-            path: self.root.clone(),
-            source,
-        })? {
-            let entry = entry.map_err(|source| AppError::FilesystemOperation {
-                action: "read artifact store entry",
-                path: self.root.clone(),
-                source,
-            })?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') || name.starts_with("tmp") {
-                continue;
-            }
-            digests.push(format!("{}{name}", crate::bundle::BUNDLE_DIGEST_PREFIX));
-        }
-        digests.sort();
-        Ok(digests)
-    }
-
     fn validation(&self, message: impl Into<String>) -> AppError {
         AppError::ArtifactValidation {
             path: self.root.clone(),
@@ -327,7 +294,13 @@ mod tests {
         let (manifest, written) = store.store(&tree).expect("artifact stored");
         assert_eq!(written, ArtifactWrite::Created);
         let digest = manifest.digest();
-        assert!(store.exists(&digest).expect("existence checked"));
+        assert!(
+            store
+                .artifact_dir(&digest)
+                .expect("artifact directory resolves")
+                .exists(),
+            "the artifact directory is retained"
+        );
 
         let (_, written_again) = store.store(&tree).expect("artifact stored again");
         assert_eq!(written_again, ArtifactWrite::AlreadyPresent);
@@ -380,9 +353,12 @@ mod tests {
         );
 
         let moved_store = ArtifactStore::open_at(fixture.home.join(".skillctl/store/artifacts"));
-        assert_eq!(
-            moved_store.retained_digests().expect("digests listed"),
-            vec![digest]
+        assert!(
+            moved_store
+                .verify(&digest)
+                .expect("the moved store retains the artifact")
+                .is_some(),
+            "the artifact stays retained across store roots"
         );
     }
 }
