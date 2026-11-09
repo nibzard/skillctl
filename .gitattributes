@@ -1,0 +1,5 @@
+# Tests hash committed fixtures byte-for-byte and release packaging
+# archives assets deterministically, so git must never convert line
+# endings or encoding for these trees on any platform.
+tests/fixtures/** -text
+assets/** -text
