@@ -478,6 +478,19 @@ pub fn portable(path: &Path) -> String {
     path.display().to_string().replace('\\', "/")
 }
 
+/// Expected spelling of one clap usage line without the binary name.
+///
+/// clap prefixes a usage line with the invoked executable's file name, which
+/// carries the `.exe` suffix on Windows, so a test asserts the full line
+/// through this helper instead of hard-coding `skillctl`.
+pub fn usage(command_line: &str) -> String {
+    if cfg!(windows) {
+        format!("Usage: skillctl.exe {command_line}")
+    } else {
+        format!("Usage: skillctl {command_line}")
+    }
+}
+
 /// Resolve a fixture path to the spelling a child process observes.
 ///
 /// `std::env::temp_dir` may spell its result through a symlink: macOS reports

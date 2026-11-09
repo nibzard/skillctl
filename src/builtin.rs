@@ -633,7 +633,7 @@ fn collect_projected_files(
             path,
             source,
         })?;
-        files.insert(next_relative.to_string_lossy().into_owned(), bytes);
+        files.insert(crate::planner::portable_path(&next_relative), bytes);
     }
 
     Ok(skipped_unexpected)

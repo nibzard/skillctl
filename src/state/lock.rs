@@ -9,7 +9,6 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::Write as _,
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
@@ -129,7 +128,7 @@ pub(crate) fn acquire(
         }
     }
 
-    record_holder(&file, purpose);
+    record_holder(purpose, &lock_path);
 
     // A registry entry exists only while its file holds the flock: every
     // entry is inserted right after the inserting call won `try_lock`, and
@@ -233,16 +232,36 @@ fn open_lock_file(lock_path: &Path) -> Result<File, AppError> {
 
 /// Describe the current holder so a timeout is actionable.
 fn read_holder(lock_path: &Path) -> String {
-    fs::read_to_string(lock_path)
+    fs::read_to_string(holder_path_for(lock_path))
         .map(|contents| contents.trim().to_string())
         .ok()
         .filter(|contents| !contents.is_empty())
         .unwrap_or_else(|| "an unknown process".to_string())
 }
 
-fn record_holder(mut file: &File, purpose: &'static str) {
-    use std::io::Seek as _;
+/// Path of the sidecar file that reports who holds one coordination lock.
+///
+/// The holder line cannot live inside the lock file itself. The lock covers
+/// the whole file, and on Windows a byte-range lock is enforced against every
+/// other handle: while one process holds the lock, no other process can read
+/// the locked file, so the holder line would be unreadable exactly when it is
+/// wanted — a lock timeout could then only report "an unknown process". Unix
+/// locks are advisory and would allow the read, but the holder line lives in
+/// the sidecar on every platform so one spelling of the mechanism remains.
+fn holder_path_for(lock_path: &Path) -> PathBuf {
+    let mut holder_name = lock_path.as_os_str().to_os_string();
+    holder_name.push(".holder");
+    PathBuf::from(holder_name)
+}
 
+/// Record who holds the lock, so a timeout names its holder.
+///
+/// Best-effort diagnostics: a holder line that cannot be written must not
+/// fail the operation that just won the lock. Only the lock holder writes
+/// the sidecar, and one holder exists at a time, so the line never
+/// interleaves. It survives the release, exactly as the previous holder line
+/// inside the lock file did.
+fn record_holder(purpose: &'static str, lock_path: &Path) {
     let holder = format!(
         "pid={} purpose={} acquired_at={}",
         std::process::id(),
@@ -250,11 +269,7 @@ fn record_holder(mut file: &File, purpose: &'static str) {
         crate::state::journal::coarse_timestamp()
     );
 
-    let _ = file.set_len(0);
-    let _ = file.seek(std::io::SeekFrom::Start(0));
-    let _ = file.write_all(holder.as_bytes());
-    let _ = file.write_all(b"\n");
-    let _ = file.sync_all();
+    let _ = fs::write(holder_path_for(lock_path), format!("{holder}\n"));
 }
 
 fn configured_timeout() -> Duration {

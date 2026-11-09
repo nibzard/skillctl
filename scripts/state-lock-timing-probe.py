@@ -5,8 +5,8 @@
 cannot_erase_committed_history` needs a child that parks on the coordination
 lock. Two signals look equivalent but are not:
 
-- the holder line in `~/.skillctl/state.db.lock` appears at the child's first
-  coordinated transaction, and
+- the holder line in `~/.skillctl/state.db.lock.holder` appears at the child's
+  first coordinated transaction, and
 - the `after-state` step in the child's install journal appears when the child
   parks.
 
@@ -123,6 +123,7 @@ def measure_once(binary: str) -> dict[str, object]:
 
         state_root = home / ".skillctl"
         lock_file = state_root / "state.db.lock"
+        holder_file = state_root / "state.db.lock.holder"
         sentinel = base / "release-b"
         env = dict(os.environ)
         env.update(
@@ -156,7 +157,7 @@ def measure_once(binary: str) -> dict[str, object]:
         while elapsed_ms() < 120_000:
             if holder_ms is None:
                 try:
-                    if f"pid={child.pid}" in lock_file.read_text(encoding="utf-8"):
+                    if f"pid={child.pid}" in holder_file.read_text(encoding="utf-8"):
                         holder_ms = elapsed_ms()
                 except (FileNotFoundError, NotADirectoryError):
                     pass

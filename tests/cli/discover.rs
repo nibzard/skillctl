@@ -428,9 +428,7 @@ fn discover_help_documents_usage_and_the_read_only_contract() {
         .arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "Usage: skillctl discover [OPTIONS] <URL>",
-        ))
+        .stdout(predicate::str::contains(usage("discover [OPTIONS] <URL>")))
         .stdout(predicate::str::contains(
             "skillctl discover https://example.com",
         ))

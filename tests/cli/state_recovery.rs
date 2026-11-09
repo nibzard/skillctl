@@ -220,6 +220,18 @@ fn capture_stream(path: &Path) -> std::process::Stdio {
     file.into()
 }
 
+/// Path of the holder line sidecar that belongs to one coordination lock.
+///
+/// The holder line lives beside the lock file, never inside it. On Windows
+/// the exclusive lock over the lock file is enforced against every other
+/// process's reads, so the locked file itself cannot answer who holds it
+/// while the holder parks.
+fn holder_line_path(lock_file: &Path) -> PathBuf {
+    let mut holder_name = lock_file.as_os_str().to_os_string();
+    holder_name.push(".holder");
+    PathBuf::from(holder_name)
+}
+
 /// Wait until the held child parks at the boundary this test needs.
 ///
 /// The lock file cannot prove that. One command runs several coordinated
@@ -243,7 +255,7 @@ fn wait_for_hold_boundary(
     let started = std::time::Instant::now();
     loop {
         if install_journal_reached_after_state(state_root, child.id()) {
-            let contents = fs::read_to_string(lock_file).unwrap_or_default();
+            let contents = fs::read_to_string(holder_line_path(lock_file)).unwrap_or_default();
             assert!(
                 contents.contains(&format!("pid={}", child.id())),
                 "the parked process must hold the lock: {contents}; {}",

@@ -303,7 +303,8 @@ python3 scripts/state-lock-timing-probe.py --runs 10 --load
 ```
 
 `--load` starts two CPU spinners per core and stops them afterwards. The probe
-needs `fcntl`, so it runs on Unix only.
+needs `fcntl`, so it runs on Unix only. The holder-line signal reads
+`state.db.lock.holder`, the sidecar introduced on 2026-11-09 (next section).
 
 ## Open questions
 
@@ -321,3 +322,37 @@ needs `fcntl`, so it runs on Unix only.
 - Hold and failpoint boundaries: `src/lifecycle.rs`
 - Journal layout: `src/state/journal.rs`
 - Related tasks: T065 (Windows validation), T066 (lock granularity)
+
+## Task T065: the parked-child assertions on Windows
+
+Date: 2026-11-09
+
+The windows-latest CI leg failed the three parked-child tests
+(`a_live_lifecycle_writer_keeps_readers_available_and_is_not_reported_interrupted`,
+`a_second_process_waits_for_the_state_lock_and_cannot_erase_committed_history`,
+`pin_clones_the_pinned_source_before_it_waits_for_the_state_lock`) at the
+assertion that the parked process holds the lock, with the child's captured
+stdout and stderr empty — a child still parked, which prints nothing.
+
+Root cause: the holder line lived inside the locked file, and Windows
+byte-range locks are mandatory. `File::try_lock` on Windows is an exclusive
+`LockFileEx` over the whole file, and every other handle's read of the locked
+range fails with `ERROR_LOCK_VIOLATION` — the opposite of Unix, where flock is
+advisory and reads of a locked file succeed. So the journal poll proved the
+child parked (it reads the journal, not the lock), and the very next
+`fs::read_to_string(state.db.lock)` failed and fell back to empty text, so
+`pid=<child>` was never found. Production had the same defect: `read_holder`
+on a lock-timeout path could only report "an unknown process" on Windows.
+
+Fix: the holder line moved to a sidecar, `state.db.lock.holder`, which no
+lock covers. `record_holder` writes it on every outermost acquire,
+`read_holder` reads it, and the test asserts the pid through the same sidecar
+(`holder_line_path` in `tests/cli/state_recovery.rs`). The locked file stays
+empty, the flock still provides exclusion on every platform, and
+`scripts/state-lock-timing-probe.py` reads the sidecar for its holder signal.
+
+Verification: the parked child does not sit inside a SQLite transaction (the
+`after-state` checkpoint follows the state write), so the rest of each test —
+the blocked second process, the direct SQLite read, `doctor`'s live-operation
+probe, and the sentinel release — is lock-independent and platform-neutral.
+All 14 `state_recovery` tests pass on Linux with the sidecar.

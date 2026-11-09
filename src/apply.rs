@@ -1197,7 +1197,9 @@ fn read_projection_content_digest(dir: &Path) -> Result<Option<String>, AppError
 /// Hash the content of one projection directory, ignoring the metadata file.
 ///
 /// Only files and symlinks contribute, so the digest of a freshly materialized
-/// copy equals the digest of the plan that produced it.
+/// copy equals the digest of the plan that produced it. Symlink targets hash
+/// through the same canonical form the plan side uses, so one link hashes
+/// equally at both ends of the comparison.
 pub fn hash_projection_directory(dir: &Path) -> Result<String, AppError> {
     let mut entries = Vec::new();
     collect_projection_entries(dir, Path::new(""), &mut entries)?;
@@ -1223,7 +1225,7 @@ pub fn hash_projection_directory(dir: &Path) -> Result<String, AppError> {
             hasher.update(b"symlink\0");
             hasher.update(relative.to_string_lossy().as_bytes());
             hasher.update(b"\0");
-            hasher.update(target.to_string_lossy().as_bytes());
+            hasher.update(canonical_link_target_string(&target).as_bytes());
             hasher.update(b"\0");
             continue;
         }
@@ -1236,6 +1238,38 @@ pub fn hash_projection_directory(dir: &Path) -> Result<String, AppError> {
     }
 
     Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+/// Canonical string form of one projected symlink target, for digests.
+///
+/// The two digest functions must hash the same spelling of one link: the plan
+/// side hashes the source path it would link to, while a generated copy
+/// reports its target through `fs::read_link`. On Windows those spellings of
+/// one freshly created link differ. The target handed to
+/// `CreateSymbolicLinkW` is stored as given, and a projected source path is
+/// regularly a mixed-separator path such as `C:\ws\home\.skillctl/store/imports`
+/// because the import store root joins a literal `.skillctl/store/imports`
+/// string. `read_link` then answers with the reparse point's substitute name,
+/// which keeps a verbatim `\\?\` prefix whenever `GetFullPathNameW` normalizes
+/// the stored spelling — forward slashes are one trigger, a path past the
+/// 260-character legacy limit is another. Without canonicalization the two
+/// digests never agree, so a second sync always rematerializes a symlink
+/// projection and a digestless copy always reports as drift.
+///
+/// Canonical form: drop a verbatim `\??\` or `\\?\` prefix and render every
+/// separator as `/`. Other platforms keep the spelling unchanged, because a
+/// `\` inside a Unix file name is a legal character, not a separator.
+fn canonical_link_target_string(path: &Path) -> String {
+    if !cfg!(windows) {
+        return path.to_string_lossy().into_owned();
+    }
+
+    let text = path.to_string_lossy();
+    let stripped = text
+        .strip_prefix(r"\\?\")
+        .or_else(|| text.strip_prefix(r"\??\"))
+        .unwrap_or(text.as_ref());
+    stripped.replace('\\', "/")
 }
 
 /// Digest of the content a winner would materialize into a projection.
@@ -1260,7 +1294,7 @@ pub fn desired_projection_digest(
             hasher.update(b"symlink\0");
             hasher.update(relative.as_bytes());
             hasher.update(b"\0");
-            hasher.update(file.source_path.to_string_lossy().as_bytes());
+            hasher.update(canonical_link_target_string(&file.source_path).as_bytes());
             hasher.update(b"\0");
             continue;
         }
@@ -3108,7 +3142,7 @@ fn preserve_edits_as_overlay(
                 // effective content and nothing needs to move.
                 preservation
                     .preserved
-                    .push(relative.to_string_lossy().into_owned());
+                    .push(crate::planner::portable_path(&relative));
                 continue;
             }
             if base_contents.is_none()
@@ -3152,7 +3186,7 @@ fn preserve_edits_as_overlay(
         })?;
         preservation
             .preserved
-            .push(relative.to_string_lossy().into_owned());
+            .push(crate::planner::portable_path(&relative));
     }
 
     if !manifest.overrides.contains_key(&skill.skill_id) {
@@ -3173,7 +3207,7 @@ fn overlay_backup_label(skill: &ManagedSkillRef) -> String {
 fn quoted_relative_names(files: &[PathBuf]) -> String {
     files
         .iter()
-        .map(|file| format!("'{}'", file.to_string_lossy()))
+        .map(|file| format!("'{}'", crate::planner::portable_path(file)))
         .collect::<Vec<_>>()
         .join(", ")
 }

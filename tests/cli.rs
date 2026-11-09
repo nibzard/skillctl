@@ -21,7 +21,7 @@ mod support;
 
 pub use support::{
     MINIMAL_LOCKFILE, PathSnapshot, TestWorkspace, file_url, is_sqlite_database, portable,
-    snapshot_path,
+    snapshot_path, usage,
 };
 
 #[cfg(unix)]
